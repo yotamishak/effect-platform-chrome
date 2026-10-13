@@ -1,0 +1,65 @@
+{
+  "name": "effect-platform-chrome",
+  "version": "0.0.0",
+  "description": "Effect v4 platform integrations for Chrome Manifest V3 extensions",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yotamishak/effect-platform-chrome.git"
+  },
+  "homepage": "https://github.com/yotamishak/effect-platform-chrome#readme",
+  "bugs": {
+    "url": "https://github.com/yotamishak/effect-platform-chrome/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./internal": null,
+    "./internal/*": null,
+    "./*": {
+      "types": "./dist/*.d.ts",
+      "import": "./dist/*.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "prepare": "effect-tsgo patch --oxlint",
+    "lint": "oxlint src test vitest.config.ts --max-warnings=0",
+    "effect-solutions": "effect-solutions",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "effect": "^4.0.4"
+  },
+  "devDependencies": {
+    "@effect/tsgo": "0.51.1",
+    "@effect/vitest": "4.0.4",
+    "@oxlint/plugins": "1.87.0",
+    "@types/chrome": "0.3.5",
+    "@types/node": "24.19.2",
+    "effect": "4.0.4",
+    "effect-solutions": "0.5.3",
+    "oxlint": "1.87.0",
+    "oxlint-tsgolint": "7.0.2003",
+    "typescript": "7.0.2",
+    "vitest": "5.0.4"
+  }
+}

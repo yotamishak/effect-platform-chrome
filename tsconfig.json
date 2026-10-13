@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/@effect/tsgo/schema.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "moduleDetection": "force",
+    "rewriteRelativeImportExtensions": true,
+    "incremental": true,
+    "tsBuildInfoFile": "./node_modules/.cache/typecheck.tsbuildinfo",
+    "plugins": [{ "name": "@effect/language-service", "diagnostics": false }],
+    "lib": ["ES2022", "DOM", "ESNext.Disposable"],
+    "types": ["chrome", "node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": false,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"]
+}
