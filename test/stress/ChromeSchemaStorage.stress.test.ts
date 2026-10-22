@@ -371,9 +371,10 @@ describe("ChromeSchemaStorage stress", () => {
       expect(f.data("local").get(entry.storageKey)).toEqual({ version: 1, payload: "newer" })
       expect(f.counts.set).toBe(1)
     } else {
-      // Every migration still saw its snapshot; each writes the same current envelope.
+      // Write-backs in one context serialize their re-read and write: the first writes the
+      // current envelope, and every later re-read sees it instead of the migrated snapshot.
       expect(f.data("local").get(entry.storageKey)).toEqual({ version: 1, payload: "snapshot" })
-      expect(f.counts.set).toBe(readers)
+      expect(f.counts.set).toBe(1)
     }
 
     expect(f.counts.get).toBe(readers * 2)
@@ -407,5 +408,81 @@ describe("ChromeSchemaStorage stress", () => {
       results, new Map([...pending.thrown, ...rejected]), ChromeStorageError,
       (error) => `${error.area}:${error.operation}`
     )
+  }))
+
+  // Chrome applies storage calls in submission order and reads at submission. A write-back
+  // must therefore submit its write while storage still holds the snapshot it re-read; a
+  // same-context write submitted in between would be silently overwritten.
+  it.effect("never lets 512 write-backs overwrite 512 interleaved same-context writes, in seeded order", () => Effect.gen(function*() {
+    const next = seeded(4242)
+    const data = new Map<string, Items[string]>()
+    const violations: Array<unknown> = []
+    let migrated = 0
+
+    /** Settles after a seeded number of microtask hops, so completions interleave without sleeping. */
+    const settle = async () => {
+      for (let hop = next(6); hop > 0; hop--) await Promise.resolve()
+    }
+
+    const local: StorageAreaApi = {
+      get: async (keys) => {
+        const result: Items = {}
+
+        for (const key of Predicate.isString(keys) ? [keys] : []) {
+          if (data.has(key)) result[key] = data.get(key)
+        }
+
+        await settle()
+
+        return result
+      },
+      getBytesInUse: async () => 0,
+      set: async (items) => {
+        for (const [key, value] of Object.entries(items)) {
+          // SAFETY: this test writes only envelopes through the entries below.
+          const envelope = value as { readonly version: number; readonly payload: string }
+
+          if (envelope.version === 1) {
+            migrated++
+            const current = data.get(key)
+
+            if (!(Predicate.isObject(current) && "version" in current && current.version === 0 && "payload" in current && current.payload === envelope.payload)) {
+              violations.push({ current, written: envelope })
+            }
+          }
+
+          data.set(key, value)
+        }
+
+        await settle()
+      },
+      remove: async (keys) => {
+        for (const key of Array.isArray(keys) ? keys : [keys]) data.delete(key)
+        await settle()
+      },
+      clear: async () => { data.clear() }
+    }
+
+    const unused: StorageAreaApi = { ...local }
+    const service = make(makeStorage({ local, sync: unused, session: unused, managed: unused, onChanged: gatedEvent() }))
+    const total = 512
+
+    const current = service.entry({ ...entryOptions("contended"), migrations: [{ from: 0, run: (payload) => Effect.as(Effect.forEach(Array.from({ length: next(4) }), () => Effect.yieldNow, { discard: true }), payload) }] })
+
+    // A second descriptor of the same key, still on version 0, writes legacy envelopes.
+    const legacy = service.entry({ ...entryOptions("contended"), version: 0 })
+    yield* legacy.set("initial")
+
+    const operations = shuffle([
+      ...Array.from({ length: total }, () => Effect.asVoid(current.get({ writeBack: true }))),
+      ...Array.from({ length: total }, (_, index) => index % 8 === 0 ? legacy.remove : legacy.set(`user-${index}`))
+    ], next)
+
+    // A bounded window keeps write-backs and writes overlapping throughout the run.
+    yield* Effect.all(operations, { concurrency: 8 })
+    expect(violations).toEqual([])
+    // Both paths ran: some write-backs wrote, and some found a newer same-context write.
+    expect(migrated).toBeGreaterThan(0)
+    expect(migrated).toBeLessThan(total)
   }))
 })

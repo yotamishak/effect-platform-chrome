@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Predicate, Queue, Schema, Stream } from "effect"
+import { Context, Effect, Fiber, Layer, Option, Predicate, Queue, Schema, Semaphore, Stream } from "effect"
 import { attempter } from "./internal/api.js"
 import { ChromeStorage, ChromeStorageError, layerLive as storageLayerLive } from "./ChromeStorage.js"
 import type { AreaName, Changes, ChromeStorageService } from "./ChromeStorage.js"
@@ -66,6 +66,9 @@ export class ChromeSchemaStorage extends Context.Service<ChromeSchemaStorage, Ch
 ) {}
 
 const Envelope = Schema.Struct({ version: Schema.Int, payload: Schema.Unknown })
+
+/** Exactly `{ version, payload }`: data with extra fields is foreign, not an envelope. */
+const decodeEnvelope = Schema.decodeUnknownEffect(Envelope, { onExcessProperty: "error" })
 
 const areas: ReadonlySet<string> = new Set<AreaName>(["local", "sync", "session", "managed"])
 
@@ -136,8 +139,34 @@ const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Json))
  * Observation registers on its `changeEvent` synchronously, before the initial read.
  */
 export const make = (storage: ChromeStorageService): ChromeSchemaStorageService => {
+  /**
+   * One mutex per area and physical key, shared by every descriptor of this service and
+   * dropped once unused. Chrome applies storage calls in submission order, so a write-back
+   * holds it from its re-read until its write is submitted, and `set`/`remove` hold it only
+   * while submitting. A write from this context therefore lands either before the re-read,
+   * which then sees it, or after the write-back; it is never silently overwritten.
+   */
+  const locks = new Map<string, { readonly semaphore: Semaphore.Semaphore; users: number }>()
+
+  const exclusive = (lockKey: string) => <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> => Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const lock = locks.get(lockKey) ?? { semaphore: Semaphore.makeUnsafe(1), users: 0 }
+      lock.users++
+      locks.set(lockKey, lock)
+
+      return lock
+    }),
+    (lock) => lock.semaphore.withPermit(effect),
+    (lock) => Effect.sync(() => {
+      lock.users--
+
+      if (lock.users === 0) locks.delete(lockKey)
+    })
+  )
+
   const entry = <S extends Schema.Constraint, E = never, R = never>(options: EntryOptions<S, E, R>): Entry<S, E, R> => {
     const key = storageKey(options.namespace, options.key)
+    const locked = exclusive(JSON.stringify([options.area, key]))
     // Undefined only for an area name the types rule out; `configuration` reports it.
     const area = areas.has(options.area) ? storage[options.area] : undefined
     const writable = options.area !== "managed" && areas.has(options.area) ? storage[options.area] : undefined
@@ -178,13 +207,12 @@ export const make = (storage: ChromeStorageService): ChromeSchemaStorageService 
       return yield* decodeJson(yield* validJson(operation, encoded))
     })
 
-    const write = Effect.fnUntraced(function*(operation: Operation, value: S["Type"]) {
-      yield* configuration(operation)
-
-      if (writable === undefined) return yield* error(operation, "readOnly", "Managed storage is read-only")
-      const payload = yield* encode(operation, value)
-      yield* writable.set({ [key]: { version: options.version, payload } })
-    })
+    /**
+     * Submits a Chrome write under the lock and awaits it outside, so plain writes stay
+     * concurrent. The child starts immediately, which runs the call synchronously to Chrome.
+     */
+    const submit = (call: Effect.Effect<void, ChromeStorageError>) =>
+      Effect.flatMap(locked(Effect.forkChild(call, { startImmediately: true })), Fiber.join)
 
     /**
      * A comparable form of a raw stored envelope, `None` when it is not a valid envelope.
@@ -192,24 +220,30 @@ export const make = (storage: ChromeStorageService): ChromeSchemaStorageService 
      */
     // The raw Chrome storage value is an untrusted I/O boundary.
     // oxlint-disable-next-line anti-slop/no-unknown-parameters
-    const fingerprint = (operation: Operation, raw: unknown) => Schema.decodeUnknownEffect(Envelope)(raw).pipe(
+    const fingerprint = (operation: Operation, raw: unknown) => decodeEnvelope(raw).pipe(
       Effect.flatMap((envelope) => Effect.map(validJson(operation, envelope.payload), (text) => `${envelope.version}:${text}`)),
       Effect.option
     )
 
     /**
      * Writes a migrated value only if the entry still holds the snapshot that was migrated.
-     * A concurrent write or removal wins; the remaining window between this read and the
-     * write cannot be closed, because Chrome storage has no compare-and-swap.
+     * A concurrent write or removal wins. Writers in this context wait for the lock; a
+     * write from another context between this read and the write cannot be excluded,
+     * because Chrome storage has no compare-and-swap.
      */
     const writeBack = Effect.fnUntraced(function*(operation: Operation, snapshot: string, value: S["Type"]) {
       if (writable === undefined) return yield* error(operation, "readOnly", "Managed storage cannot write migrations")
-      const items = yield* writable.get(key)
+      // Encoded before taking the lock, which then covers only storage calls.
+      const payload = yield* encode(operation, value)
 
-      if (!Object.hasOwn(items, key)) return
-      const current = yield* fingerprint(operation, items[key])
+      yield* locked(Effect.gen(function*() {
+        const items = yield* writable.get(key)
 
-      if (Option.isSome(current) && current.value === snapshot) yield* write(operation, value)
+        if (!Object.hasOwn(items, key)) return
+        const current = yield* fingerprint(operation, items[key])
+
+        if (Option.isSome(current) && current.value === snapshot) yield* writable.set({ [key]: { version: options.version, payload } })
+      }))
     })
 
     // The raw Chrome event / storage value is an untrusted I/O boundary.
@@ -223,7 +257,7 @@ export const make = (storage: ChromeStorageService): ChromeSchemaStorageService 
         return Option.some(yield* Schema.decodeEffect(options.schema)(payload))
       }
 
-      const envelope = yield* Schema.decodeUnknownEffect(Envelope)(raw).pipe(
+      const envelope = yield* decodeEnvelope(raw).pipe(
         Effect.mapError((cause) => new ChromeSchemaStorageError({ operation, key, reason: "envelope", cause }))
       )
 
@@ -259,13 +293,19 @@ export const make = (storage: ChromeStorageService): ChromeSchemaStorageService 
 
     const get = (readOptions?: ReadOptions) => read("get", readOptions?.writeBack ?? false)
 
-    const set = (value: S["Type"]) => write("set", value)
+    const set = Effect.fnUntraced(function*(value: S["Type"]) {
+      yield* configuration("set")
+
+      if (writable === undefined) return yield* error("set", "readOnly", "Managed storage is read-only")
+      const payload = yield* encode("set", value)
+      yield* submit(writable.set({ [key]: { version: options.version, payload } }))
+    })
 
     const remove = Effect.gen(function*() {
       yield* configuration("remove")
 
       if (writable === undefined) return yield* error("remove", "readOnly", "Managed storage is read-only")
-      yield* writable.remove(key)
+      yield* submit(writable.remove(key))
     })
 
     const observe = Stream.callback<Option.Option<S["Type"]>, EntryError | E, R | S["DecodingServices"] | S["EncodingServices"]>((output) => Effect.gen(function*() {

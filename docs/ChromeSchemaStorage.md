@@ -70,6 +70,9 @@ An entry stores exactly this format:
 { "version": 1, "payload": { "theme": "dark" } }
 ```
 
+An object with any other own field besides `version` and `payload` is foreign data, not
+an envelope, and fails with `envelope`.
+
 - `get({ writeBack?: boolean })`: returns `Effect<Option<schema.Type>>`.
   Omitted `writeBack` is `false`.
 - `set(value)`: schema-encodes and JSON-validates before writing the current envelope.
@@ -130,12 +133,20 @@ Migration write-back is a read/transform/check/write, not a transaction. Before 
 it re-reads the entry and writes only if the stored envelope still has the migrated
 snapshot's version and JSON payload. A write, replacement, corruption, or removal by
 another context while the migration ran therefore wins: the read still returns the
-migrated snapshot, and nothing is written (a removed entry is not resurrected). Chrome
-storage has no compare-and-swap, so a write landing between that re-read and the
-write-back can still be overwritten; the window is two storage calls, not the whole
-migration. Concurrent write-back readers of the same snapshot each write the same
-current envelope. Migrations should be deterministic, repeatable, and preferably free
-of side effects. Use an application-level single writer if any lost write is
+migrated snapshot, and nothing is written (a removed entry is not resurrected).
+
+Within one service (one JS context), entries with the same area and physical key share a
+lock. Chrome applies storage calls in submission order, so a write-back holds the lock
+from submitting its re-read until submitting its write, and `set`/`remove` hold it only
+while submitting their call (they still run concurrently with each other). A `set` or
+`remove` from this context therefore lands either before the re-read, which then sees it,
+or after the write-back; it is never overwritten. Concurrent write-back readers of the
+same snapshot in one context write once: later re-reads see the current envelope.
+Chrome storage has no compare-and-swap, so a write from **another context** landing
+between the re-read and the write-back can still be overwritten; the window is two
+storage calls, not the whole migration. Raw `ChromeStorage` writes, and a second
+`make`/layer over the same storage, do not take this lock. Migrations should be
+deterministic, repeatable, and preferably free of side effects. Use an application-level single writer if any lost write is
 unacceptable. The default `get()` and `observe` migrate only their captured snapshots
 and never write, so a newer concurrent write is preserved, although the returned
 snapshot may already be stale.
@@ -190,8 +201,9 @@ dropped, with only a current failure ending the stream; 512 observers interrupte
 seeded order before starting, during the initial read, default, or migration, while
 idle, and while migrating a change, ending with every listener removed and no writes;
 2,048 observed entries through a clear-like deletion and a migrating change; 1,024
-concurrent write-back migrations of one envelope with and without a concurrent writer;
-and 1,536 concurrent `get`/`set`/`remove` calls with interleaved rejections and
+concurrent write-back migrations of one envelope with and without a concurrent writer
+(one write either way); 512 write-backs interleaved in seeded order with 512 same-context
+legacy writes and removals, none ever overwritten; and 1,536 concurrent `get`/`set`/`remove` calls with interleaved rejections and
 synchronous throws, each reported with its area and operation. These are bounded mocked
 races, not browser quota, heap, cross-process scheduling, or atomicity benchmarks.
 

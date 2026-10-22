@@ -1,7 +1,7 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
 import { describe, expect, it, vi } from "@effect/vitest"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, SchemaTransformation, Stream } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Schema, SchemaTransformation, Stream } from "effect"
 import { ChromeStorage, ChromeStorageError, make as makeStorage } from "../src/ChromeStorage.js"
 import type { AreaName, Items } from "../src/ChromeStorage.js"
 import { ChromeSchemaStorage, ChromeSchemaStorageError, layer, layerLive, make, storageKey } from "../src/ChromeSchemaStorage.js"
@@ -430,6 +430,32 @@ describe("ChromeSchemaStorage", () => {
     }
   }))
 
+  it.effect("rejects an envelope with extra fields in reads, observation and write-back re-reads", () => Effect.gen(function*() {
+    const f = fixture()
+    // Legacy or foreign data that merely contains `version` and `payload` is not an envelope.
+    const foreign = { version: 1, payload: "dark", savedAt: 1 }
+    const entry = f.service.entry(options)
+    f.api.local.data[entry.storageKey] = foreign
+    expect(yield* Effect.flip(entry.get())).toMatchObject({ operation: "get", reason: "envelope" })
+    expect(yield* Effect.flip(Stream.runDrain(entry.observe))).toMatchObject({ operation: "observe", reason: "envelope" })
+    expect(f.listeners.size).toBe(0)
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+
+    const migrating = f.service.entry({ ...options, migrations: [{ from: 0, run: (payload) => Effect.as(Effect.andThen(Deferred.succeed(started, undefined), Deferred.await(release)), payload) }] })
+
+    f.api.local.data[entry.storageKey] = { version: 0, payload: "old" }
+    const read = yield* Effect.forkScoped(migrating.get({ writeBack: true }))
+    yield* Deferred.await(started)
+    // Another writer decorates the same snapshot: write-back must not erase its field.
+    const decorated = { version: 0, payload: "old", owner: "other" }
+    f.api.local.data[entry.storageKey] = decorated
+    yield* Deferred.succeed(release, undefined)
+    expect(yield* Fiber.join(read)).toEqual(Option.some("old"))
+    expect(f.api.local.data[entry.storageKey]).toBe(decorated)
+    expect(f.api.local.set).not.toHaveBeenCalled()
+  }))
+
   it.effect("preserves Chrome write/read/remove failures and does not report a successful migration write", () => Effect.gen(function*() {
     const f = fixture()
     const cause = new Error("quota")
@@ -560,6 +586,63 @@ describe("ChromeSchemaStorage", () => {
     yield* Fiber.interrupt(first)
     expect(f.listeners.size).toBe(1)
     yield* Fiber.interrupt(second)
+    expect(f.listeners.size).toBe(0)
+  }))
+
+  it.effect("gives each reader and observer its own copy, never Chrome's shared event or stored object", () => Effect.gen(function*() {
+    const f = fixture()
+    const entry = f.service.entry({ ...options, schema: Schema.Array(Schema.String) })
+    const stored = { version: 1, payload: ["stored"] }
+    f.api.local.data[entry.storageKey] = stored
+    const read = Option.getOrThrow(yield* entry.get())
+    expect(read).not.toBe(stored.payload)
+    const ready = [yield* Deferred.make<void>(), yield* Deferred.make<void>()]
+
+    const observer = (index: number) => Stream.tap(entry.observe, (value) => Effect.gen(function*() {
+      // A consumer that mutates what it received must not affect anyone else.
+      if (Option.isSome(value)) {
+        // SAFETY: decoding yields a fresh mutable array; this test mutates it on purpose.
+        const received = value.value as Array<string>
+        received.push(`mutated by ${index}`)
+      }
+
+      yield* Deferred.succeed(ready[index]!, undefined)
+    }))
+
+    const fibers = yield* Effect.forEach([0, 1], (index) => Effect.forkScoped(Stream.runCollect(Stream.take(observer(index), 2))))
+    yield* Effect.forEach(ready, Deferred.await)
+    // Chrome hands the same change object to every listener in a context.
+    const change = { newValue: { version: 1, payload: ["event"] } }
+    f.emit(entry.storageKey, change)
+    const [first, second] = yield* Effect.forEach(fibers, Fiber.join)
+    expect(first).toEqual([Option.some(["stored", "mutated by 0"]), Option.some(["event", "mutated by 0"])])
+    expect(second).toEqual([Option.some(["stored", "mutated by 1"]), Option.some(["event", "mutated by 1"])])
+    expect(change.newValue.payload).toEqual(["event"])
+    expect(stored.payload).toEqual(["stored"])
+  }))
+
+  it.effect("re-subscribes after a current failure with one fresh listener and a fresh initial read", () => Effect.gen(function*() {
+    const f = fixture()
+    const entry = f.service.entry(options)
+    f.api.local.data[entry.storageKey] = { version: 1, payload: "first" }
+    const emitted = [yield* Deferred.make<void>(), yield* Deferred.make<void>()]
+    let count = 0
+
+    const stream = Stream.tap(Stream.retry(entry.observe, Schedule.recurs(1)), () => Effect.gen(function*() {
+      const reached = emitted[count++]
+
+      if (reached !== undefined) yield* Deferred.succeed(reached, undefined)
+    }))
+
+    const fiber = yield* Effect.forkScoped(Stream.runCollect(Stream.take(stream, 3)))
+    yield* Deferred.await(emitted[0]!)
+    f.api.local.data[entry.storageKey] = { version: 1, payload: "second" }
+    f.emit(entry.storageKey, { newValue: { version: 1, payload: 42 } })
+    yield* Deferred.await(emitted[1]!)
+    expect(f.listeners.size).toBe(1)
+    f.emit(entry.storageKey, { newValue: { version: 1, payload: "third" } })
+    expect(yield* Fiber.join(fiber)).toEqual([Option.some("first"), Option.some("second"), Option.some("third")])
+    expect(f.api.onChanged.addListener).toHaveBeenCalledTimes(2)
     expect(f.listeners.size).toBe(0)
   }))
 
@@ -834,6 +917,69 @@ describe("ChromeSchemaStorage write-back races", () => {
     reread.open()
     expect(f.api.local.set).not.toHaveBeenCalled()
     expect(f.api.local.data[entry.storageKey]).toEqual({ version: 0, payload: "old" })
+  }))
+
+  /**
+   * Chrome reads at submission, so the write-back re-read returns the snapshot of its call
+   * and only resolves when `reread` opens. A same-context write submitted meanwhile must not
+   * be overwritten by the write-back that follows.
+   */
+  it.effect.each([
+    { name: "set", expected: { version: 1, payload: "newer" } },
+    { name: "remove", expected: undefined }
+  ] as const)("a same-context $name submitted during a write-back re-read wins", ({ name, expected }) => Effect.gen(function*() {
+    const f = fixture()
+    const entry = f.service.entry({ ...options, migrations: [{ from: 0, run: Effect.succeed }] })
+    // A second descriptor for the same entry shares the same physical key.
+    const writer = f.service.entry({ ...options })
+    f.api.local.data[entry.storageKey] = { version: 0, payload: "old" }
+    const rereading = gate()
+    const reread = gate()
+    f.api.local.get.mockImplementationOnce(async () => ({ ...f.api.local.data }))
+    f.api.local.get.mockImplementationOnce(async () => {
+      const snapshot = { ...f.api.local.data }
+      rereading.open()
+      await reread.promise
+
+      return snapshot
+    })
+    const read = yield* Effect.forkScoped(entry.get({ writeBack: true }))
+    yield* Effect.promise(() => rereading.promise)
+    const write = yield* Effect.forkScoped(name === "set" ? writer.set("newer") : writer.remove, { startImmediately: true })
+    reread.open()
+    expect(yield* Fiber.join(read)).toEqual(Option.some("old"))
+    yield* Fiber.join(write)
+    expect(f.api.local.data[entry.storageKey]).toEqual(expected)
+  }))
+
+  it.effect("a queued write interrupted behind a write-back submits nothing, and a failed re-read releases the key", () => Effect.gen(function*() {
+    const f = fixture()
+    const entry = f.service.entry({ ...options, migrations: [{ from: 0, run: Effect.succeed }] })
+    f.api.local.data[entry.storageKey] = { version: 0, payload: "old" }
+    const cause = new Error("re-read failed")
+    const rereading = gate()
+    const reread = gate()
+    f.api.local.get.mockImplementationOnce(async () => ({ ...f.api.local.data }))
+    f.api.local.get.mockImplementationOnce(async () => {
+      rereading.open()
+      await reread.promise
+
+      throw cause
+    })
+    const read = yield* Effect.forkScoped(entry.get({ writeBack: true }))
+    yield* Effect.promise(() => rereading.promise)
+    const interrupted = yield* Effect.forkScoped(entry.set("interrupted"), { startImmediately: true })
+    const queued = yield* Effect.forkScoped(entry.remove, { startImmediately: true })
+    yield* Fiber.interrupt(interrupted)
+    expect(f.api.local.set).not.toHaveBeenCalled()
+    expect(f.api.local.remove).not.toHaveBeenCalled()
+    reread.open()
+    expect(yield* Effect.flip(Fiber.join(read))).toMatchObject({ operation: "get", cause })
+    yield* Fiber.join(queued)
+    expect(f.api.local.set).not.toHaveBeenCalled()
+    expect(Object.hasOwn(f.api.local.data, entry.storageKey)).toBe(false)
+    yield* entry.set("after")
+    expect(f.api.local.data[entry.storageKey]).toEqual({ version: 1, payload: "after" })
   }))
 })
 
