@@ -7,7 +7,8 @@
     "dev": "wxt -b chrome",
     "build": "wxt build -b chrome",
     "typecheck": "wxt prepare && tsc --noEmit",
-    "postinstall": "wxt prepare"
+    "postinstall": "wxt prepare",
+    "limits": "node scripts/run-limits.mjs"
   },
   "dependencies": {
     "effect": "4.0.4",
@@ -15,6 +16,7 @@
   },
   "devDependencies": {
     "@types/chrome": "0.3.5",
+    "playwright": "1.58.2",
     "typescript": "7.0.2",
     "wxt": "0.21.4"
   }

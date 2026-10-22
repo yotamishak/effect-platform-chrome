@@ -10,8 +10,13 @@ export default defineConfig({
   manifest: {
     name: "Effect Chrome: all integrations",
     description: "Vanilla WXT demo of Effect Chrome services and MV3 lifecycle handling",
-    permissions: ["storage", "alarms", "tabs", "scripting"],
+    permissions: ["storage", "alarms", "tabs", "scripting", "identity", "webNavigation", "cookies", "notifications", "activeTab"],
+    // The limits runner sets and evicts cookies only on this reserved test host.
+    host_permissions: ["https://limits.effect-platform-chrome.test/*"],
     optional_host_permissions: ["https://example.com/*"],
+    // Lets example.com open the popup page in a tab, so browser automation that cannot type
+    // chrome-extension:// URLs can still reach the stress and limits runners.
+    web_accessible_resources: [{ resources: ["popup.html", "chunks/*", "assets/*"], matches: ["https://example.com/*"] }],
     minimum_chrome_version: "120"
   }
 })
