@@ -1,6 +1,6 @@
 import { Context, Effect, Layer, Schema, Stream } from "effect"
 import { decodeResponse, type ChromeMessageError } from "./ChromeMessage.js"
-import { attempter } from "./internal/api.js"
+import { attempter, invoker } from "./internal/api.js"
 import { observe } from "./internal/event.js"
 
 export class ChromeRuntimeError extends Schema.TaggedError<ChromeRuntimeError>()(
@@ -18,8 +18,24 @@ export interface RuntimeApi {
     message: unknown,
     options?: chrome.runtime.MessageOptions
   ): Promise<unknown>
+  getContexts(filter: chrome.runtime.ContextFilter): Promise<Array<chrome.runtime.ExtensionContext>>
+  openOptionsPage(): Promise<void>
+  reload(): void
+  setUninstallURL(url: string): Promise<void>
+  getPlatformInfo(): Promise<chrome.runtime.PlatformInfo>
+  requestUpdateCheck(): Promise<chrome.runtime.RequestUpdateCheckResult>
   readonly onInstalled: Pick<typeof chrome.runtime.onInstalled, "addListener" | "removeListener">
   readonly onStartup: Pick<typeof chrome.runtime.onStartup, "addListener" | "removeListener">
+  readonly onUpdateAvailable: Pick<typeof chrome.runtime.onUpdateAvailable, "addListener" | "removeListener">
+  readonly onSuspend: Pick<typeof chrome.runtime.onSuspend, "addListener" | "removeListener">
+  readonly onMessageExternal: Pick<typeof chrome.runtime.onMessageExternal, "addListener" | "removeListener">
+  readonly onConnectExternal: Pick<typeof chrome.runtime.onConnectExternal, "addListener" | "removeListener">
+}
+
+/** A message from another extension or an externally connectable web page. */
+export interface ExternalMessage {
+  readonly message: unknown
+  readonly sender: chrome.runtime.MessageSender
 }
 
 export interface SendMessageOptions {
@@ -64,11 +80,59 @@ export interface ChromeRuntime {
    */
   readonly onInstalled: Stream.Stream<chrome.runtime.InstalledDetails, ChromeRuntimeError>
   readonly onStartup: Stream.Stream<void, ChromeRuntimeError>
+  /**
+   * The extension contexts (service worker, tabs, popups, offscreen documents, side panels)
+   * matching every given filter field; `{}` matches all of them. Chrome 116+ in MV3.
+   */
+  readonly getContexts: (
+    filter: chrome.runtime.ContextFilter
+  ) => Effect.Effect<Array<chrome.runtime.ExtensionContext>, ChromeRuntimeError>
+  /** Opens the options page, or focuses it if already open. Fails when the manifest declares none. */
+  readonly openOptionsPage: Effect.Effect<void, ChromeRuntimeError>
+  /**
+   * Restarts the extension, applying a pending update. Every extension context is torn
+   * down, the calling one included, so nothing after this Effect is guaranteed to run.
+   */
+  readonly reload: Effect.Effect<void, ChromeRuntimeError>
+  /** The URL Chrome opens after uninstall; an empty string clears it. Chrome caps it at 1023 characters. */
+  readonly setUninstallURL: (url: string) => Effect.Effect<void, ChromeRuntimeError>
+  readonly getPlatformInfo: Effect.Effect<chrome.runtime.PlatformInfo, ChromeRuntimeError>
+  /**
+   * Asks the update server for a new version. Chrome throttles frequent checks (status
+   * `"throttled"`); an available update installs on the next idle restart or `reload`.
+   */
+  readonly requestUpdateCheck: Effect.Effect<chrome.runtime.RequestUpdateCheckResult, ChromeRuntimeError>
+  /** An update was downloaded and waits for the extension to go idle or `reload`. Observational, like `onInstalled`. */
+  readonly onUpdateAvailable: Stream.Stream<chrome.runtime.UpdateAvailableDetails, ChromeRuntimeError>
+  /**
+   * The context is about to unload. Observational, like `onInstalled`; asynchronous work
+   * started from here is not guaranteed to finish before Chrome stops the worker.
+   */
+  readonly onSuspend: Stream.Stream<void, ChromeRuntimeError>
+  /**
+   * Messages from other extensions or externally connectable pages, with their sender.
+   * Observational only: this stream never answers, leaving the response channel to other
+   * listeners. Answering an external message needs a native `runtime.onMessageExternal`
+   * listener registered synchronously at worker startup that calls `sendResponse`
+   * (returning true to answer asynchronously); `ChromeServiceWorker.listen` handlers cannot
+   * reply either. Check `sender.id` / `sender.origin` before trusting a message.
+   */
+  readonly onMessageExternal: Stream.Stream<ExternalMessage, ChromeRuntimeError>
+  /**
+   * Ports opened by other extensions or externally connectable pages. Observational, like
+   * `onInstalled`; to wake the worker for them use `ChromeServiceWorker.listen`. Wrap a port
+   * with `ChromePort.adopt` to message over it; its `sender` is untrusted until checked.
+   */
+  readonly onConnectExternal: Stream.Stream<chrome.runtime.Port, ChromeRuntimeError>
 }
 
 export const ChromeRuntime = Context.Service<ChromeRuntime>("effect-platform-chrome/ChromeRuntime")
 
 const attempt = attempter((operation, cause) => new ChromeRuntimeError({ operation, cause }))
+
+const invoke = invoker((operation, cause) => new ChromeRuntimeError({ operation, cause }))
+
+const eventError = (operation: string) => (cause: unknown) => new ChromeRuntimeError({ operation, cause })
 
 /** Creates a service without accessing browser globals or registering listeners. */
 export const make = (runtime: RuntimeApi): ChromeRuntime => {
@@ -104,6 +168,19 @@ export const make = (runtime: RuntimeApi): ChromeRuntime => {
   const onStartup = observe(() => runtime.onStartup, () => undefined,
     (cause) => new ChromeRuntimeError({ operation: "onStartup.addListener", cause }))
 
+  const onUpdateAvailable = observe(() => runtime.onUpdateAvailable,
+    (details: chrome.runtime.UpdateAvailableDetails) => details, eventError("onUpdateAvailable.addListener"))
+
+  const onSuspend = observe(() => runtime.onSuspend, () => undefined, eventError("onSuspend.addListener"))
+
+  // The listener returns nothing, so it never claims the response channel.
+  const onMessageExternal = observe(() => runtime.onMessageExternal,
+    (message: unknown, sender: chrome.runtime.MessageSender): ExternalMessage => ({ message, sender }),
+    eventError("onMessageExternal.addListener"))
+
+  const onConnectExternal = observe(() => runtime.onConnectExternal, (port: chrome.runtime.Port) => port,
+    eventError("onConnectExternal.addListener"))
+
   return ChromeRuntime.of({
     id: attempt("id", () => runtime.id),
     getManifest: attempt("getManifest", () => runtime.getManifest()),
@@ -112,7 +189,17 @@ export const make = (runtime: RuntimeApi): ChromeRuntime => {
     sendMessageSchema,
     request,
     onInstalled,
-    onStartup
+    onStartup,
+    getContexts: (filter) => invoke("getContexts", () => runtime.getContexts(filter)),
+    openOptionsPage: invoke("openOptionsPage", () => runtime.openOptionsPage()),
+    reload: attempt("reload", () => runtime.reload()),
+    setUninstallURL: (url) => invoke("setUninstallURL", () => runtime.setUninstallURL(url)),
+    getPlatformInfo: invoke("getPlatformInfo", () => runtime.getPlatformInfo()),
+    requestUpdateCheck: invoke("requestUpdateCheck", () => runtime.requestUpdateCheck()),
+    onUpdateAvailable,
+    onSuspend,
+    onMessageExternal,
+    onConnectExternal
   })
 }
 

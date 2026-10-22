@@ -4,6 +4,7 @@ import { Effect, Fiber, Schema, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeMessageError, fail, succeed } from "../src/ChromeMessage.js"
 import { ChromeRuntime, ChromeRuntimeError, layer, make, type RuntimeApi } from "../src/ChromeRuntime.js"
+import { makePortPair } from "../src/testing/Port.js"
 
 const event = <A extends ReadonlyArray<unknown>>() => {
   const listeners = new Set<(...args: A) => void>()
@@ -22,13 +23,27 @@ const event = <A extends ReadonlyArray<unknown>>() => {
   }
 }
 
+const context: chrome.runtime.ExtensionContext = {
+  contextId: "worker", contextType: "BACKGROUND", frameId: -1, incognito: false, tabId: -1, windowId: -1
+}
+
 const fake = () => ({
   id: "extension-id",
   getManifest: vi.fn<RuntimeApi["getManifest"]>(() => ({ manifest_version: 3, name: "Test", version: "1.0.0" })),
   getURL: vi.fn((path: string) => `chrome-extension://extension-id/${path}`),
   sendMessage: vi.fn<RuntimeApi["sendMessage"]>(async () => ({ ok: true })),
+  getContexts: vi.fn<RuntimeApi["getContexts"]>(async () => [context]),
+  openOptionsPage: vi.fn<RuntimeApi["openOptionsPage"]>(async () => undefined),
+  reload: vi.fn<RuntimeApi["reload"]>(() => undefined),
+  setUninstallURL: vi.fn<RuntimeApi["setUninstallURL"]>(async () => undefined),
+  getPlatformInfo: vi.fn<RuntimeApi["getPlatformInfo"]>(async () => ({ os: "mac", arch: "arm64" })),
+  requestUpdateCheck: vi.fn<RuntimeApi["requestUpdateCheck"]>(async () => ({ status: "update_available", version: "2.0.0" })),
   onInstalled: event<[chrome.runtime.InstalledDetails]>(),
-  onStartup: event<[]>()
+  onStartup: event<[]>(),
+  onUpdateAvailable: event<[chrome.runtime.UpdateAvailableDetails]>(),
+  onSuspend: event<[]>(),
+  onMessageExternal: event<[unknown, chrome.runtime.MessageSender, () => void]>(),
+  onConnectExternal: event<[chrome.runtime.Port]>()
 })
 
 describe("ChromeRuntime", () => {
@@ -346,5 +361,116 @@ describe("ChromeRuntime", () => {
       operation: "onStartup.addListener", cause
     })
     expect(runtime.onStartup.removeListener).toHaveBeenCalledOnce()
+  }))
+
+  it.effect("calls the extension-management APIs lazily with the API receiver", () => Effect.gen(function*() {
+    const runtime = fake()
+    const service = make(runtime)
+    const filter: chrome.runtime.ContextFilter = { contextTypes: ["BACKGROUND"] }
+    const reload = service.reload
+    expect(runtime.reload).not.toHaveBeenCalled()
+    yield* reload
+    expect(runtime.reload).toHaveBeenCalledOnce()
+    expect(runtime.reload.mock.contexts[0]).toBe(runtime)
+    expect(yield* service.getContexts(filter)).toEqual([context])
+    expect(runtime.getContexts).toHaveBeenCalledExactlyOnceWith(filter)
+    yield* service.openOptionsPage
+    yield* service.openOptionsPage
+    expect(runtime.openOptionsPage).toHaveBeenCalledTimes(2)
+    yield* service.setUninstallURL("https://example.com/goodbye")
+    expect(runtime.setUninstallURL).toHaveBeenCalledExactlyOnceWith("https://example.com/goodbye")
+    expect(yield* service.getPlatformInfo).toEqual({ os: "mac", arch: "arm64" })
+    expect(yield* service.requestUpdateCheck).toEqual({ status: "update_available", version: "2.0.0" })
+    expect(runtime.getContexts.mock.contexts[0]).toBe(runtime)
+  }))
+
+  it.effect("tags extension-management rejections and throws with their operation", () => Effect.gen(function*() {
+    const runtime = fake()
+    const service = make(runtime)
+    const cause = new Error("Could not create an options page.")
+    runtime.getContexts.mockRejectedValueOnce(cause)
+    runtime.openOptionsPage.mockRejectedValueOnce(cause)
+    runtime.reload.mockImplementationOnce(() => { throw cause })
+    runtime.setUninstallURL.mockRejectedValueOnce(cause)
+    runtime.getPlatformInfo.mockImplementationOnce(() => { throw cause })
+    runtime.requestUpdateCheck.mockRejectedValueOnce(cause)
+
+    const failures = [
+      ["getContexts", service.getContexts({})],
+      ["openOptionsPage", service.openOptionsPage],
+      ["reload", service.reload],
+      ["setUninstallURL", service.setUninstallURL("")],
+      ["getPlatformInfo", service.getPlatformInfo],
+      ["requestUpdateCheck", service.requestUpdateCheck]
+    ] as const
+
+    for (const [operation, effect] of failures) {
+      const error = yield* Effect.flip(Effect.asVoid(effect))
+      expect(error).toBeInstanceOf(ChromeRuntimeError)
+      expect(error).toMatchObject({ operation, cause })
+    }
+  }))
+
+  it.effect("streams update, suspend, external message and external connection events while consumed", () => Effect.gen(function*() {
+    const runtime = fake()
+    const service = make(runtime)
+    const sender: chrome.runtime.MessageSender = { id: "peer-extension", origin: "chrome-extension://peer-extension" }
+    const sendResponse = vi.fn()
+    const port = makePortPair("external").left.port
+
+    const updates = yield* Effect.forkScoped(Stream.runCollect(Stream.take(service.onUpdateAvailable, 1)))
+    const suspends = yield* Effect.forkScoped(Stream.runCollect(Stream.take(service.onSuspend, 2)))
+    const messages = yield* Effect.forkScoped(Stream.runCollect(Stream.take(service.onMessageExternal, 1)))
+    const connections = yield* Effect.forkScoped(Stream.runCollect(Stream.take(service.onConnectExternal, 1)))
+    yield* Effect.promise(() => Promise.all([
+      runtime.onUpdateAvailable.ready, runtime.onSuspend.ready, runtime.onMessageExternal.ready, runtime.onConnectExternal.ready
+    ]))
+
+    runtime.onUpdateAvailable.emit({ version: "2.0.0" })
+    runtime.onSuspend.emit()
+    runtime.onSuspend.emit()
+    runtime.onMessageExternal.emit({ ping: 1 }, sender, sendResponse)
+    runtime.onConnectExternal.emit(port)
+
+    expect(yield* Fiber.join(updates)).toEqual([{ version: "2.0.0" }])
+    expect(yield* Fiber.join(suspends)).toEqual([undefined, undefined])
+    expect(yield* Fiber.join(messages)).toEqual([{ message: { ping: 1 }, sender }])
+    expect((yield* Fiber.join(connections))[0]).toBe(port)
+    expect(sendResponse).not.toHaveBeenCalled()
+
+    for (const source of [runtime.onUpdateAvailable, runtime.onSuspend, runtime.onMessageExternal, runtime.onConnectExternal]) {
+      expect(source.listeners.size).toBe(0)
+      expect(source.removeListener).toHaveBeenCalledOnce()
+    }
+  }))
+
+  it.effect("the external message listener never claims the response channel", () => Effect.gen(function*() {
+    const runtime = fake()
+    const fiber = yield* Effect.forkScoped(Stream.runDrain(make(runtime).onMessageExternal))
+    yield* Effect.promise(() => runtime.onMessageExternal.ready)
+    const [listener] = runtime.onMessageExternal.listeners
+    expect(listener?.("message", {}, () => undefined)).toBeUndefined()
+    yield* Fiber.interrupt(fiber)
+    expect(runtime.onMessageExternal.listeners.size).toBe(0)
+  }))
+
+  it.effect("tags and cleans up failed registrations of the new event streams", () => Effect.gen(function*() {
+    const runtime = fake()
+    const service = make(runtime)
+    const cause = new Error("registration failed")
+
+    const streams = [
+      ["onUpdateAvailable.addListener", runtime.onUpdateAvailable, Stream.runDrain(service.onUpdateAvailable)],
+      ["onSuspend.addListener", runtime.onSuspend, Stream.runDrain(service.onSuspend)],
+      ["onMessageExternal.addListener", runtime.onMessageExternal, Stream.runDrain(service.onMessageExternal)],
+      ["onConnectExternal.addListener", runtime.onConnectExternal, Stream.runDrain(service.onConnectExternal)]
+    ] as const
+
+    for (const [operation, source, drain] of streams) {
+      source.addListener.mockImplementationOnce(() => { throw cause })
+      expect(yield* Effect.flip(drain)).toMatchObject({ operation, cause })
+      expect(source.removeListener).toHaveBeenCalledOnce()
+      expect(source.listeners.size).toBe(0)
+    }
   }))
 })
