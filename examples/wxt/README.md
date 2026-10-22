@@ -1,4 +1,4 @@
-# WXT example: all twelve Chrome integrations
+# WXT example: all seventeen Chrome integrations
 
 Vanilla TypeScript, WXT **0.21.4**, Effect **4.0.4**, Chrome Manifest V3.
 The popup is example UI, not a library UI abstraction. No Action, SidePanel,
@@ -74,6 +74,54 @@ and **do not prove absence or presence of leaks**. Existing raw storage-change
 logging remains active and its display is capped at 24,000 characters. Browser
 stress is explicitly opt-in, not a build-time test or a benchmark guarantee.
 
+### Limits runner
+
+**Run limits** (or `await window.effectChromeLimits.run({ notifications, only })`) drives
+every module to the Chrome limit it meets in practice and reports, per stage, what it
+observed: counts, timings and Chrome's own refusal text. Stages are independent; a failing
+stage does not stop the rest. Open the popup from the toolbar button (or
+`chrome-extension://<id>/popup.html` in a tab) and keep it in front: Chrome throttles a
+hidden page's timers, and the timing checks only bound them loosely.
+
+It opens two background tabs on `https://example.com/?effect-limits=…`, where
+`entrypoints/limits.content.ts` builds a frame tree (four serving frames, one that listens
+on `onConnect` but never serves, one with no listener), and closes them at the end. Web
+pages are needed because `webNavigation` does not report extension pages. Everything it
+writes (storage keys, cookies on the reserved `limits.effect-platform-chrome.test` host,
+alarms, KV keys) uses its own names and is removed when the stage ends.
+
+| Stage | Limit it meets |
+| --- | --- |
+| `webNavigation.getAllFrames` ×2000 | 7 frames per call, 64 concurrent |
+| `tabs.connect` RPC fan-out, port churn | 2000 echoes over five frames; 300 connect/disconnect cycles |
+| `readyTimeout` | a port only another listener received: fails after the timeout, never sooner |
+| No listener | a port to a frame without `onConnect` fails at once |
+| `onHistoryStateUpdated` paced and burst | every update Chrome applied arrives, in order. Chrome caps history updates at about 200 per 10 s per frame and ignores the rest |
+| `onCommitted` | 50 sequential navigations |
+| Cookies | 120 set/read/removed; 400 on one host, where Chrome evicts the oldest past its per-domain cap |
+| Identity | 10,000 redirect URLs; failed non-interactive flows as typed errors |
+| Windows | 4000 reads |
+| `captureVisibleTab` | Chrome's per-second capture quota (needs `activeTab`: toolbar button only) |
+| Storage access levels | 800 alternations, then Chrome's defaults restored |
+| `finishAccepted` | 40 callers disconnect mid-call: the wrapped handler finishes, the plain one is interrupted |
+| Notifications (opt-in) | 50 create/clear and 200 updates of one id; shows real OS notifications |
+| Storage quotas | `local` and `session` refuse writes past 10 MB; `sync` refuses an item over 8 KB without writing |
+| Key-value store | 2000 keys, then a 4 MB binary value |
+| Alarms | Chrome keeps at most 500 per extension and refuses the rest |
+| Runtime messaging | 10,000 concurrent `sendMessage` round trips through `ChromeServiceWorker` |
+| Ports | 50 ports × 200 echoes in windows of 20; a 2000-message blast that overruns the 64-message sliding buffers |
+| RPC | 2048 concurrent calls on one port; a frame just under 1 MiB round-trips, one over is refused before sending |
+| Schema storage | 256 subscribers follow 100 writes to one entry |
+| Permissions, scripting | 5000 `contains`; 100 injections into all 7 frames (needs the example.com grant) |
+
+Two stages skip rather than fail where Chrome withholds what they need: capture without an
+`activeTab` grant, and scripting without the optional example.com access.
+
+`npm run build && npm run limits` runs it headlessly (add `-- --stress` for the original
+stress runner too) and exits non-zero on a failed stage. That run serves example.com
+locally, and Playwright's `--disable-ipc-flooding-protection` lifts Chrome's history cap,
+so a real profile is still the reference for the history stages.
+
 ### Popup ↔ background ↔ content
 
 - Popup → background: `ChromeRuntime.sendMessageSchema`, decoded by the
@@ -129,6 +177,11 @@ ports. Observational stream buffers are bounded and sliding, not durable logs.
 - `alarms`: one-shot demo alarm and wake event.
 - `tabs`: tab title/URL queries and selecting an example.com message target.
 - `scripting`: explicit function injection into the active example.com tab.
+- `identity`, `webNavigation`, `cookies`, `notifications`, `activeTab`: the limits runner's
+  modules. Cookies are set only on the reserved `limits.effect-platform-chrome.test` host,
+  the one required host permission.
+- `web_accessible_resources`: the popup page and its chunks, for example.com only, so
+  automation that cannot type `chrome-extension://` URLs can open the runners from there.
 - Optional host permission: **only** `https://example.com/*`, requested only
   through the user button. Inspect **Contains / getAll** before/after the request.
 - Content script injection matches **only** `https://example.com/*`; no

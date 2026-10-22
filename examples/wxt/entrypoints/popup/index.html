@@ -49,6 +49,11 @@
       <button id="stress">Run 100 / 1000 / 5000 RPC + local churn</button><button id="stress-cancel">Cancel stress</button>
       <p>Keep popup open. Local-only isolated keys; five-minute deadline. Heap readings are approximate, not leak proof. ChromeTesting fixtures are development-only; see README.</p>
     </section>
+    <section><h2>New-module limits</h2>
+      <button id="limits">Run limits: frames, tab RPC, readyTimeout, finishAccepted, cookies, capture, identity, windows, access levels</button>
+      <label><input type="checkbox" id="limits-notifications"> include notifications (shows and clears real OS notifications)</label>
+      <p>Opens two background tabs of this extension and closes them afterwards. Cookies are set only on a reserved <code>.test</code> host. See README.</p>
+    </section>
     <pre id="output" aria-live="polite"></pre><button id="clear-output">Clear output</button>
     <script type="module" src="./main.ts"></script>
   </body>

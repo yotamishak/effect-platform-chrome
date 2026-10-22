@@ -9,6 +9,7 @@ import * as ChromeAlarms from "effect-platform-chrome/ChromeAlarms"
 import { alarmName, channel, Request, Response, storageKey } from "../../shared/protocol"
 import "./style.css"
 import { installAdvanced } from "./advanced.js"
+import { installLimits } from "./limits.js"
 
 const runtime = ManagedRuntime.make(Layer.mergeAll(
   ChromeStorage.layer, ChromeRuntime.layer, ChromePort.layerLive,
@@ -169,3 +170,4 @@ window.addEventListener("pagehide", () => {
 }, { once: true })
 log("Ready", "Use the buttons above; streams remain active only while this popup is open.")
 installAdvanced(log, value)
+installLimits(log)

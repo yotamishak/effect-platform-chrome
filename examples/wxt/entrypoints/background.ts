@@ -4,6 +4,7 @@ import { ChromePort } from "effect-platform-chrome/ChromePort"
 import * as ChromeServiceWorker from "effect-platform-chrome/ChromeServiceWorker"
 import * as ChromeRpc from "effect-platform-chrome/ChromeRpc"
 import { DemoRejected, DemoRpc, rpcChannel } from "../shared/rpc.js"
+import { finishPort, plainPort, workPrefix, WorkRpc } from "../shared/limits.js"
 import { defineBackground } from "wxt/utils/define-background"
 import { alarmKey, alarmName, channel, lifecycleKey, Request, workerKey } from "../shared/protocol"
 
@@ -13,6 +14,16 @@ export default defineBackground(() => {
     const storage = yield* ChromeStorage.ChromeStorage
     yield* storage.local.set({ [lifecycleKey]: { event, at: new Date().toISOString(), bootId } })
   })
+
+  // Marks the call accepted, works for a while, then marks it finished. The runner
+  // disconnects between the two marks.
+  const work = ({ id, millis }: { readonly id: string; readonly millis: number }) => Effect.gen(function*() {
+    const storage = yield* ChromeStorage.ChromeStorage
+    yield* storage.local.set({ [`${workPrefix}started/${id}`]: Date.now() })
+    yield* Effect.sleep(millis)
+    yield* storage.local.set({ [`${workPrefix}finished/${id}`]: Date.now() })
+    return id
+  }).pipe(Effect.orDie)
 
   // WXT invokes this main callback synchronously when its generated worker
   // loads. Never await initialization before start: all wake listeners must
@@ -49,6 +60,14 @@ export default defineBackground(() => {
           Numbers: () => Stream.range(0, 9999).pipe(Stream.rechunk(1))
         }))
       )
+      // Limits runner: the same Work handler, with and without finishAccepted. A
+      // caller that disconnects mid-call interrupts only the plain one.
+      if (native.name === finishPort || native.name === plainPort) {
+        const handlers = { Work: work }
+        return ChromeRpc.serve(chrome.runtime, native, "owned", WorkRpc).pipe(Effect.provide(
+          WorkRpc.toLayer(native.name === finishPort ? ChromeRpc.finishAccepted(handlers) : handlers)
+        ))
+      }
       if (native.name !== channel) return Effect.void
       return Effect.scoped(Effect.gen(function*() {
         const ports = yield* ChromePort
