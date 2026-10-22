@@ -2,7 +2,7 @@
 /* oxlint-disable effecttsgo/unstable-api-usage */
 import { Effect, Fiber, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
-import { ChromeStorage, ChromeStorageError, changeBufferSize, layer, make } from "../src/ChromeStorage.js"
+import { ChromeStorage, ChromeStorageError, changeBufferSize, layer, layerLive, make } from "../src/ChromeStorage.js"
 import * as ChromeStorageModule from "../src/ChromeStorage.js"
 import { makeStorage } from "../src/testing/Storage.js"
 
@@ -41,7 +41,7 @@ describe("ChromeStorage", () => {
     vi.stubGlobal("chrome", undefined)
     expect(yield* Effect.promise(() => import("../src/ChromeStorage.js"))).toBeDefined()
 
-    const failure = yield* ChromeStorage.pipe(Effect.provide(layer), Effect.flip)
+    const failure = yield* ChromeStorage.pipe(Effect.provide(layerLive), Effect.flip)
 
     expect(failure).toBeInstanceOf(ChromeStorageError)
     expect(failure.operation).toBe("initialize")
@@ -52,7 +52,7 @@ describe("ChromeStorage", () => {
       const storage = yield* ChromeStorage
 
       return yield* storage.local.get()
-    }).pipe(Effect.provide(layer))
+    }).pipe(Effect.provide(layerLive))
 
     expect(result).toEqual({ key: "value" })
   }))
@@ -131,7 +131,7 @@ describe("ChromeStorage", () => {
     const cause = new Error("unavailable")
     f.raw.onChanged.addListener.mockImplementationOnce(() => { throw cause })
     const error = yield* Stream.runCollect(make(f.api).onChanged).pipe(Effect.flip)
-    expect(error).toMatchObject({ operation: "onChanged.addListener", area: "all", cause })
+    expect(error).toMatchObject({ operation: "onChanged", area: "all", cause })
     expect(f.listeners.size).toBe(0)
   }))
 
@@ -279,8 +279,30 @@ describe("ChromeStorage", () => {
     expect(yield* Effect.flip(storage.local.setAccessLevel("TRUSTED_AND_UNTRUSTED_CONTEXTS"))).toMatchObject({ cause })
   }))
 
-  it("names the live layer layerLive, as the other modules do", () => {
-    expect(ChromeStorageModule.layerLive).toBe(layer)
+  it.effect("provides an injected API through layer without a global", () => Effect.gen(function*() {
+    const f = fixture()
+    vi.stubGlobal("chrome", undefined)
+    const result = yield* Effect.flatMap(ChromeStorage, (storage) => storage.sync.get("key")).pipe(Effect.provide(layer(f.api)))
+    expect(result).toEqual({ key: "value" })
+    expect(f.raw.sync.get).toHaveBeenCalledExactlyOnceWith("key")
+  }))
+
+  // A synchronous native-event boundary: no Effect runs here.
+  it("exposes the wrapped API's native change event, read only when a listener is added", () => {
+    const f = fixture()
+    const storage = make(f.api)
+    expect(f.raw.onChanged.addListener).not.toHaveBeenCalled()
+    const received: Array<[ChromeStorageModule.Changes, chrome.storage.AreaName]> = []
+
+    const listener = (changes: ChromeStorageModule.Changes, area: chrome.storage.AreaName) => { received.push([changes, area]) }
+
+    storage.changeEvent.addListener(listener)
+    expect(f.raw.onChanged.addListener).toHaveBeenCalledExactlyOnceWith(listener)
+    f.emit({ key: { newValue: 1 } }, "sync")
+    expect(received).toEqual([[{ key: { newValue: 1 } }, "sync"]])
+    storage.changeEvent.removeListener(listener)
+    expect(f.raw.onChanged.removeListener).toHaveBeenCalledExactlyOnceWith(listener)
+    expect(f.listeners.size).toBe(0)
   })
 
   it.effect.each(["local", "sync", "session", "managed"] as const)("lists %s keys lazily and types a missing or rejected getKeys", (name) => Effect.gen(function*() {

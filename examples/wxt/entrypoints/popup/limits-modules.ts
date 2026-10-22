@@ -3,7 +3,7 @@ import * as KeyValueStore from "effect/persistence/KeyValueStore"
 import * as RpcClient from "effect/rpc/RpcClient"
 import * as ChromeAlarms from "effect-platform-chrome/ChromeAlarms"
 import * as ChromePermissions from "effect-platform-chrome/ChromePermissions"
-import { ChromePort } from "effect-platform-chrome/ChromePort"
+import * as ChromePort from "effect-platform-chrome/ChromePort"
 import * as ChromeRpc from "effect-platform-chrome/ChromeRpc"
 import * as ChromeRuntime from "effect-platform-chrome/ChromeRuntime"
 import * as ChromeSchemaStorage from "effect-platform-chrome/ChromeSchemaStorage"
@@ -56,7 +56,7 @@ const fillArea = (area: "local" | "session") => Effect.gen(function*() {
 
 // A port to the worker's echo handler; `seen` and `order` collect this client's echoed seqs.
 const echoPort = (client: number) => Effect.gen(function*() {
-  const ports = yield* ChromePort
+  const ports = yield* ChromePort.ChromePort
   const port = yield* ports.connect({ name: channel })
   const greeted = yield* Deferred.make<void>()
   const seen = yield* Ref.make(new Set<number>())

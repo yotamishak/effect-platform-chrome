@@ -1,18 +1,19 @@
 import { Cause, Context, Effect, Layer, Queue, Schema, Stream } from "effect"
 import type { Scope } from "effect"
+import { liveLayer } from "./internal/api.js"
 import * as PortLink from "./internal/port.js"
 
-/** The runtime API is injected; importing this module never accesses Chrome. */
-export type RuntimeApi = Pick<typeof chrome.runtime, "connect" | "lastError">
+/** The subset of `chrome.runtime` this module needs; importing it never accesses Chrome. */
+export type ChromePortApi = Pick<typeof chrome.runtime, "connect" | "lastError">
 
 export type NativePort = chrome.runtime.Port
 
 export type Ownership = "owned" | "borrowed"
 
 export class ChromePortError extends Schema.TaggedError<ChromePortError>()("ChromePortError", {
-  operation: Schema.Literals(["connect", "adopt", "send", "disconnect", "unavailable"]),
+  operation: Schema.Literals(["connect", "adopt", "send", "disconnect", "initialize"]),
   message: Schema.String,
-  cause: Schema.Unknown
+  cause: Schema.Defect()
 }) {}
 
 export interface Port {
@@ -39,11 +40,23 @@ export interface ConnectOptions {
   readonly name?: string
 }
 
+export interface ChromePortService {
+  /** Opens an owned port to this extension, or to `extensionId`, released with the scope. */
+  readonly connect: (options?: ConnectOptions) => Effect.Effect<Port, ChromePortError, Scope.Scope>
+  /**
+   * Wraps a port Chrome delivered (`onConnect`, `onConnectExternal`, `tabs.connect`).
+   * Ownership is mandatory: a borrowed port is never disconnected by the wrapper.
+   */
+  readonly adopt: (port: NativePort, ownership: Ownership) => Effect.Effect<Port, ChromePortError, Scope.Scope>
+}
+
+export class ChromePort extends Context.Service<ChromePort, ChromePortService>()("effect-platform-chrome/ChromePort") {}
+
 const error = (operation: ChromePortError["operation"], cause: unknown, message: string) =>
   new ChromePortError({ operation, cause, message })
 
 const acquire = (
-  api: RuntimeApi,
+  api: ChromePortApi,
   getPort: () => NativePort,
   ownership: Ownership,
   operation: "connect" | "adopt"
@@ -148,29 +161,19 @@ const acquire = (
   ({ release }) => release
 ).pipe(Effect.map(({ port }) => port))
 
-export const make = (api: RuntimeApi) => ({
-  connect: (options: ConnectOptions = {}): Effect.Effect<Port, ChromePortError, Scope.Scope> =>
+/** Creates the service without reading browser globals or opening ports. */
+export const make = (api: ChromePortApi): ChromePortService => ChromePort.of({
+  connect: (options = {}) =>
     acquire(api, () => options.extensionId === undefined
       ? api.connect(options.name === undefined ? {} : { name: options.name })
       : api.connect(options.extensionId, options.name === undefined ? {} : { name: options.name }), "owned", "connect"),
-  /** Ownership is mandatory: borrowed adoption never disconnects the native port. */
-  adopt: (port: NativePort, ownership: Ownership): Effect.Effect<Port, ChromePortError, Scope.Scope> =>
-    acquire(api, () => port, ownership, "adopt")
+  adopt: (port, ownership) => acquire(api, () => port, ownership, "adopt")
 })
 
-export class ChromePort extends Context.Service<ChromePort, ReturnType<typeof make>>()(
-  "effect-platform-chrome/ChromePort"
-) {
-  static readonly layer = (api: RuntimeApi) => Layer.succeed(ChromePort, make(api))
-  /** Chrome is looked up only when the layer is built, never at import time. */
-  static readonly layerLive = Layer.effect(ChromePort, Effect.try({
-    try: () => {
-      if (typeof globalThis.chrome === "undefined" || globalThis.chrome.runtime === undefined) {
-        throw new Error("Chrome runtime is unavailable")
-      }
+export const layer = (api: ChromePortApi): Layer.Layer<ChromePort> => Layer.succeed(ChromePort, make(api))
 
-      return make(globalThis.chrome.runtime)
-    },
-    catch: (cause) => error("unavailable", cause, "Chrome runtime is unavailable")
-  }))
-}
+/** The global is read only when the layer is built, never at import time. */
+export const layerLive: Layer.Layer<ChromePort, ChromePortError> = liveLayer(
+  ChromePort, "runtime", (chrome) => chrome.runtime, make,
+  (cause) => error("initialize", cause, "Chrome runtime is unavailable")
+)

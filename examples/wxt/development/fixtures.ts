@@ -8,7 +8,7 @@ import { preferencesEntry } from "../shared/schema-entry.js"
 export const fixtureExample = () => Effect.gen(function*() {
   // Always create fresh fixtures; never share mutable state between test cases.
   const storage = ChromeTesting.makeStorage()
-  const schemaLayer = ChromeSchemaStorage.layer(storage.api.onChanged).pipe(Layer.provide(storage.layer))
+  const schemaLayer = ChromeSchemaStorage.layer.pipe(Layer.provide(storage.layer))
   const observed = yield* Effect.gen(function*() {
     const service = yield* ChromeSchemaStorage.ChromeSchemaStorage
     const entry = preferencesEntry(service, "development-fixture")

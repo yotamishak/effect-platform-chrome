@@ -7,6 +7,7 @@ import * as Layer from "effect/Layer"
 import * as Predicate from "effect/Predicate"
 import * as KeyValueStore from "effect/persistence/KeyValueStore"
 import * as Schema from "effect/Schema"
+import { invoker, liveLayer } from "./internal/api.js"
 
 /** The promise-based subset of Chrome StorageArea required by this adapter. */
 export interface StorageArea {
@@ -62,7 +63,7 @@ export const make = (area: StorageArea, options: Options = {}): KeyValueStore.Ke
   const encodedKey = (key: string) => prefix + key
 
   const attempt = <A>(method: string, run: () => Promise<A>, key?: string) =>
-    Effect.tryPromise({ try: run, catch: (cause) => storageError(method, cause, key) })
+    invoker((operation, cause) => storageError(operation, cause, key))(method, run)
 
   const namespacedKeys = async () => {
     const keys = area.getKeys === undefined ? Object.keys(await area.get(null)) : await area.getKeys()
@@ -110,24 +111,23 @@ export const make = (area: StorageArea, options: Options = {}): KeyValueStore.Ke
 export const layer = (area: StorageArea, options: Options = {}): Layer.Layer<KeyValueStore.KeyValueStore> =>
   Layer.succeed(KeyValueStore.KeyValueStore, make(area, options))
 
-const liveLayer = (
+const areaLayer = (
   name: "local" | "sync" | "session",
   options: Options
-): Layer.Layer<KeyValueStore.KeyValueStore, KeyValueStore.KeyValueStoreError> =>
-  Layer.effect(KeyValueStore.KeyValueStore, Effect.try({
-    try: () => {
-      const area = globalThis.chrome?.storage?.[name]
-
-      if (area === undefined) throw new Error(`chrome.storage.${name} is unavailable`)
-
-      return make(area, options)
-    },
-    catch: (cause) => storageError("initialize", cause)
-  }))
+): Layer.Layer<KeyValueStore.KeyValueStore, KeyValueStore.KeyValueStoreError> => liveLayer(
+  KeyValueStore.KeyValueStore, `storage.${name}`,
+  // `chrome.storage` itself is absent without the storage permission.
+  (chrome) => chrome.storage?.[name],
+  (area) => make(area, options),
+  (cause) => storageError("initialize", cause)
+)
 
 /** Chrome APIs are resolved only when the layer is built. Requires storage permission. */
-export const layerLocal = (options: Options = {}) => liveLayer("local", options)
+export const layerLocal = (options: Options = {}): Layer.Layer<KeyValueStore.KeyValueStore, KeyValueStore.KeyValueStoreError> =>
+  areaLayer("local", options)
 
-export const layerSync = (options: Options = {}) => liveLayer("sync", options)
+export const layerSync = (options: Options = {}): Layer.Layer<KeyValueStore.KeyValueStore, KeyValueStore.KeyValueStoreError> =>
+  areaLayer("sync", options)
 
-export const layerSession = (options: Options = {}) => liveLayer("session", options)
+export const layerSession = (options: Options = {}): Layer.Layer<KeyValueStore.KeyValueStore, KeyValueStore.KeyValueStoreError> =>
+  areaLayer("session", options)

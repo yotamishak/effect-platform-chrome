@@ -1,9 +1,9 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Effect, Fiber, Stream } from "effect"
+import { Effect, Fiber, Option, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { describe, expect, it, vi } from "@effect/vitest"
-import { ChromeAlarms, ChromeAlarmsError, layer, make } from "../src/ChromeAlarms.js"
+import { ChromeAlarms, ChromeAlarmsError, layer, layerLive, make } from "../src/ChromeAlarms.js"
 import type { Alarm, AlarmCreateInfo, ChromeAlarmsApi } from "../src/ChromeAlarms.js"
 
 const alarm: Alarm = { name: "tick", scheduledTime: 123, persistAcrossSessions: true }
@@ -150,10 +150,10 @@ describe("ChromeAlarms", () => {
 
     expect(api.get).toHaveBeenLastCalledWith("")
     expect(api.clear).toHaveBeenLastCalledWith("")
-    expect(yield* service.get(undefined)).toBeUndefined()
+    expect(yield* service.get(undefined)).toEqual(Option.none())
     expect(yield* service.clear(undefined)).toBe(false)
-    expect(api.get).toHaveBeenLastCalledWith(undefined)
-    expect(api.clear).toHaveBeenLastCalledWith(undefined)
+    expect(api.get).toHaveBeenLastCalledWith()
+    expect(api.clear).toHaveBeenLastCalledWith()
   }))
 
   it.effect("is lazy and preserves named/unnamed create overloads", () => Effect.gen(function*() {
@@ -171,10 +171,10 @@ describe("ChromeAlarms", () => {
     const { api, service } = fixture()
     expect(api.getAll).not.toHaveBeenCalled()
     expect(api.clearAll).not.toHaveBeenCalled()
-    expect(yield* service.get()).toBeUndefined()
-    expect(api.get).toHaveBeenCalledWith(undefined)
+    expect(yield* service.get()).toEqual(Option.none())
+    expect(api.get).toHaveBeenCalledWith()
     vi.mocked(api.get).mockResolvedValue(alarm)
-    expect(yield* service.get("tick")).toBe(alarm)
+    expect(yield* service.get("tick")).toEqual(Option.some(alarm))
     expect(yield* service.getAll).toEqual([alarm])
     expect(yield* service.clear("missing")).toBe(false)
     expect(api.clear).toHaveBeenCalledWith("missing")
@@ -255,7 +255,7 @@ describe("ChromeAlarms", () => {
     const cause = new Error("registration failed")
     vi.mocked(api.onAlarm.addListener).mockImplementation(() => { throw cause })
     const error = yield* Effect.flip(Stream.runDrain(service.onAlarm))
-    expect(error.operation).toBe("onAlarm.addListener")
+    expect(error.operation).toBe("onAlarm")
     expect(error.cause).toBe(cause)
     expect(api.onAlarm.removeListener).toHaveBeenCalledExactlyOnceWith(api.onAlarm.addListener.mock.calls[0]?.[0])
   }))
@@ -263,10 +263,10 @@ describe("ChromeAlarms", () => {
   it.effect("imports without chrome and reports unavailable globals only when building the layer", () => Effect.gen(function*() {
     vi.stubGlobal("chrome", undefined)
     const module = yield* Effect.promise(() => import("../src/ChromeAlarms.js"))
-    expect(module.layer).toBe(layer)
+    expect(module.layerLive).toBe(layerLive)
 
     const error = yield* Effect.flip(
-      Effect.provide(Effect.asVoid(ChromeAlarms), layer)
+      Effect.provide(Effect.asVoid(ChromeAlarms), layerLive)
     )
 
     expect(error.operation).toBe("initialize")
@@ -277,7 +277,18 @@ describe("ChromeAlarms", () => {
     vi.stubGlobal("chrome", { alarms: api })
 
     const result = yield* Effect.provide(
-      Effect.flatMap(ChromeAlarms, (service) => service.getAll), layer
+      Effect.flatMap(ChromeAlarms, (service) => service.getAll), layerLive
+    )
+
+    expect(result).toEqual([alarm])
+  }))
+
+  it.effect("provides an injected API through layer without a global", () => Effect.gen(function*() {
+    const { api } = fixture()
+    vi.stubGlobal("chrome", undefined)
+
+    const result = yield* Effect.provide(
+      Effect.flatMap(ChromeAlarms, (service) => service.getAll), layer(api)
     )
 
     expect(result).toEqual([alarm])

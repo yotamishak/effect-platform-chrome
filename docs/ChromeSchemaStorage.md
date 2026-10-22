@@ -14,10 +14,8 @@ const Preferences = Schema.Struct({
   theme: Schema.Literals(["light", "dark", "system"])
 })
 
-// Call at a browser runtime boundary, not during module initialization.
-const makeAppLayer = () => TypedStorage.layer(chrome.storage.onChanged).pipe(
-  Layer.provide(Storage.layer)
-)
+// Neither layer reads `chrome` until it is built.
+const appLayer = TypedStorage.layer.pipe(Layer.provide(Storage.layerLive))
 
 const program = Effect.gen(function*() {
   const storage = yield* TypedStorage.ChromeSchemaStorage
@@ -42,14 +40,16 @@ const program = Effect.gen(function*() {
 })
 
 // At the application entrypoint:
-// Effect.runPromise(program.pipe(Effect.provide(makeAppLayer())))
+// Effect.runPromise(program.pipe(Effect.provide(appLayer)))
 ```
 
-For an injected Chrome API, use `TypedStorage.make(Storage.make(api), api.onChanged)`.
-Alternatively provide `Storage.ChromeStorage` and build `TypedStorage.layer(api.onChanged)`.
-The event source **must belong to the same API/backend** as the storage service.
-It is supplied explicitly because `ChromeStorage.onChanged` does not expose a
-listener-ready handshake: synchronous registration is necessary before the first read.
+`TypedStorage.layer` takes no arguments: it builds on whichever `Storage.ChromeStorage`
+service is in context, so for an injected Chrome API provide `Storage.layer(api)`
+instead of `Storage.layerLive`, or call `TypedStorage.make(Storage.make(api))`.
+Reads, writes and observation all go through that one service. Observation registers
+its listener on the service's low-level `changeEvent` (the wrapped API's native
+`storage.onChanged`) synchronously, before the first read, because the `onChanged`
+stream has no listener-ready handshake.
 
 ## API and stored format
 
@@ -172,8 +172,11 @@ cannot undo their external side effects or a Chrome operation already submitted.
 
 The deterministic stress suite uses 20,000 queued event updates, 256 simultaneous
 subscribers (half cancelled during gated reads), and 64 concurrent migration reads
-in each write-back mode. These are bounded mocked races, not browser quota, heap,
-cross-process scheduling, or atomicity benchmarks.
+in each write-back mode. `test/stress/ChromeSchemaStorage.stress.test.ts` adds a 4,096-change
+burst coalescing to its newest value, 512 observers interrupted during and after their
+initial reads, and 512 concurrent operations with interleaved storage rejections.
+These are bounded mocked races, not browser quota, heap, cross-process scheduling, or
+atomicity benchmarks.
 
 Errors preserve `ChromeStorageError` and `Schema.SchemaError`. Library failures use
 `ChromeSchemaStorageError` with `key`, `reason`, and `cause`; reasons are

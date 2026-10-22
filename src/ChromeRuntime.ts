@@ -1,15 +1,15 @@
 import { Context, Effect, Layer, Schema, Stream } from "effect"
 import { decodeResponse, type ChromeMessageError } from "./ChromeMessage.js"
-import { attempter, invoker } from "./internal/api.js"
-import { observe } from "./internal/event.js"
+import { attempter, invoker, liveLayer } from "./internal/api.js"
+import { observe, type EventSource } from "./internal/event.js"
 
-export class ChromeRuntimeError extends Schema.TaggedError<ChromeRuntimeError>()(
-  "ChromeRuntimeError",
-  { operation: Schema.String, cause: Schema.Unknown }
-) {}
+export class ChromeRuntimeError extends Schema.TaggedError<ChromeRuntimeError>()("ChromeRuntimeError", {
+  operation: Schema.String,
+  cause: Schema.Defect()
+}) {}
 
-/** The Promise overload of runtime.sendMessage (Manifest V3 / Chrome 99+). */
-export interface RuntimeApi {
+/** The MV3 subset this module needs, with the Promise overload of `sendMessage` (Chrome 99+). */
+export interface ChromeRuntimeApi {
   readonly id: string
   getManifest(): chrome.runtime.Manifest
   getURL(path: string): string
@@ -24,12 +24,16 @@ export interface RuntimeApi {
   setUninstallURL(url: string): Promise<void>
   getPlatformInfo(): Promise<chrome.runtime.PlatformInfo>
   requestUpdateCheck(): Promise<chrome.runtime.RequestUpdateCheckResult>
-  readonly onInstalled: Pick<typeof chrome.runtime.onInstalled, "addListener" | "removeListener">
-  readonly onStartup: Pick<typeof chrome.runtime.onStartup, "addListener" | "removeListener">
-  readonly onUpdateAvailable: Pick<typeof chrome.runtime.onUpdateAvailable, "addListener" | "removeListener">
-  readonly onSuspend: Pick<typeof chrome.runtime.onSuspend, "addListener" | "removeListener">
-  readonly onMessageExternal: Pick<typeof chrome.runtime.onMessageExternal, "addListener" | "removeListener">
-  readonly onConnectExternal: Pick<typeof chrome.runtime.onConnectExternal, "addListener" | "removeListener">
+  readonly onInstalled: EventSource<[details: chrome.runtime.InstalledDetails]>
+  readonly onStartup: EventSource<[]>
+  readonly onUpdateAvailable: EventSource<[details: chrome.runtime.UpdateAvailableDetails]>
+  readonly onSuspend: EventSource<[]>
+  readonly onMessageExternal: EventSource<[
+    message: unknown,
+    sender: chrome.runtime.MessageSender,
+    sendResponse: (response?: unknown) => void
+  ]>
+  readonly onConnectExternal: EventSource<[port: chrome.runtime.Port]>
 }
 
 /** A message from another extension or an externally connectable web page. */
@@ -43,7 +47,7 @@ export interface SendMessageOptions {
   readonly options?: chrome.runtime.MessageOptions
 }
 
-export interface ChromeRuntime {
+export interface ChromeRuntimeService {
   readonly id: Effect.Effect<string, ChromeRuntimeError>
   readonly getManifest: Effect.Effect<chrome.runtime.Manifest, ChromeRuntimeError>
   readonly getURL: (path: string) => Effect.Effect<string, ChromeRuntimeError>
@@ -126,7 +130,9 @@ export interface ChromeRuntime {
   readonly onConnectExternal: Stream.Stream<chrome.runtime.Port, ChromeRuntimeError>
 }
 
-export const ChromeRuntime = Context.Service<ChromeRuntime>("effect-platform-chrome/ChromeRuntime")
+export class ChromeRuntime extends Context.Service<ChromeRuntime, ChromeRuntimeService>()(
+  "effect-platform-chrome/ChromeRuntime"
+) {}
 
 const attempt = attempter((operation, cause) => new ChromeRuntimeError({ operation, cause }))
 
@@ -134,14 +140,12 @@ const invoke = invoker((operation, cause) => new ChromeRuntimeError({ operation,
 
 const eventError = (operation: string) => (cause: unknown) => new ChromeRuntimeError({ operation, cause })
 
-/** Creates a service without accessing browser globals or registering listeners. */
-export const make = (runtime: RuntimeApi): ChromeRuntime => {
-  const sendMessage: ChromeRuntime["sendMessage"] = (message, options) => Effect.tryPromise({
-    try: () => runtime.sendMessage(options?.extensionId, message, options?.options),
-    catch: (cause) => new ChromeRuntimeError({ operation: "sendMessage", cause })
-  })
+/** Creates the service without reading browser globals or registering listeners. */
+export const make = (runtime: ChromeRuntimeApi): ChromeRuntimeService => {
+  const sendMessage: ChromeRuntimeService["sendMessage"] = (message, options) =>
+    invoke("sendMessage", () => runtime.sendMessage(options?.extensionId, message, options?.options))
 
-  const sendMessageSchema: ChromeRuntime["sendMessageSchema"] = Effect.fnUntraced(function*<
+  const sendMessageSchema: ChromeRuntimeService["sendMessageSchema"] = Effect.fnUntraced(function*<
     Request extends Schema.Constraint,
     Response extends Schema.Constraint
   >(request: Request, response: Response, message: Request["Type"], options?: SendMessageOptions) {
@@ -156,30 +160,11 @@ export const make = (runtime: RuntimeApi): ChromeRuntime => {
     )
   })
 
-  const request: ChromeRuntime["request"] = (requestSchema, value, message, options) =>
+  const request: ChromeRuntimeService["request"] = (requestSchema, value, message, options) =>
     sendMessageSchema(requestSchema, Schema.Unknown, message, options).pipe(
       Effect.flatMap(decodeResponse(value)),
       Effect.catchTag("SchemaError", (cause) => Effect.fail(new ChromeRuntimeError({ operation: "sendMessage.decodeResponse", cause })))
     )
-
-  const onInstalled = observe(() => runtime.onInstalled, (details: chrome.runtime.InstalledDetails) => details,
-    (cause) => new ChromeRuntimeError({ operation: "onInstalled.addListener", cause }))
-
-  const onStartup = observe(() => runtime.onStartup, () => undefined,
-    (cause) => new ChromeRuntimeError({ operation: "onStartup.addListener", cause }))
-
-  const onUpdateAvailable = observe(() => runtime.onUpdateAvailable,
-    (details: chrome.runtime.UpdateAvailableDetails) => details, eventError("onUpdateAvailable.addListener"))
-
-  const onSuspend = observe(() => runtime.onSuspend, () => undefined, eventError("onSuspend.addListener"))
-
-  // The listener returns nothing, so it never claims the response channel.
-  const onMessageExternal = observe(() => runtime.onMessageExternal,
-    (message: unknown, sender: chrome.runtime.MessageSender): ExternalMessage => ({ message, sender }),
-    eventError("onMessageExternal.addListener"))
-
-  const onConnectExternal = observe(() => runtime.onConnectExternal, (port: chrome.runtime.Port) => port,
-    eventError("onConnectExternal.addListener"))
 
   return ChromeRuntime.of({
     id: attempt("id", () => runtime.id),
@@ -188,23 +173,30 @@ export const make = (runtime: RuntimeApi): ChromeRuntime => {
     sendMessage,
     sendMessageSchema,
     request,
-    onInstalled,
-    onStartup,
+    onInstalled: observe(() => runtime.onInstalled, (details) => details, eventError("onInstalled")),
+    onStartup: observe(() => runtime.onStartup, () => undefined, eventError("onStartup")),
     getContexts: (filter) => invoke("getContexts", () => runtime.getContexts(filter)),
     openOptionsPage: invoke("openOptionsPage", () => runtime.openOptionsPage()),
     reload: attempt("reload", () => runtime.reload()),
     setUninstallURL: (url) => invoke("setUninstallURL", () => runtime.setUninstallURL(url)),
     getPlatformInfo: invoke("getPlatformInfo", () => runtime.getPlatformInfo()),
     requestUpdateCheck: invoke("requestUpdateCheck", () => runtime.requestUpdateCheck()),
-    onUpdateAvailable,
-    onSuspend,
-    onMessageExternal,
-    onConnectExternal
+    onUpdateAvailable: observe(() => runtime.onUpdateAvailable, (details) => details, eventError("onUpdateAvailable")),
+    onSuspend: observe(() => runtime.onSuspend, () => undefined, eventError("onSuspend")),
+    // The listener returns nothing, so it never claims the response channel.
+    onMessageExternal: observe(
+      () => runtime.onMessageExternal,
+      (message, sender): ExternalMessage => ({ message, sender }),
+      eventError("onMessageExternal")
+    ),
+    onConnectExternal: observe(() => runtime.onConnectExternal, (port) => port, eventError("onConnectExternal"))
   })
 }
 
-/** Accesses chrome.runtime only when the layer is built, never at import time. */
-export const layer = Layer.effect(ChromeRuntime, attempt("runtime", () => make(globalThis.chrome.runtime)))
+export const layer = (api: ChromeRuntimeApi): Layer.Layer<ChromeRuntime> => Layer.succeed(ChromeRuntime, make(api))
 
-/** The same live layer as `layer`, under the name the other modules use. */
-export const layerLive = layer
+/** The global is read only when the layer is built, never at import time. */
+export const layerLive: Layer.Layer<ChromeRuntime, ChromeRuntimeError> = liveLayer(
+  ChromeRuntime, "runtime", (chrome) => chrome.runtime, make,
+  (cause) => new ChromeRuntimeError({ operation: "initialize", cause })
+)

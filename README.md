@@ -94,10 +94,11 @@ message/storage exceptions. Other rules still apply at these boundaries. Require
 assertions need meaningful `SAFETY:` comments. Agent assets and vendored/generated
 code are ignored without ignoring all dot-directories.
 
-Alarm `getAll` and `clearAll` are lazy Effect values (not zero-argument methods).
+Alarm `getAll` and `clearAll` are lazy Effect values (not zero-argument methods), and
+`get` returns an `Option`, None when no such alarm exists.
 Service-worker handler errors are inferred generically; unknown message payloads
 are still decoded by each protocol owner. Injected storage APIs need only the
-Promise-based `StorageApi` subset, not unrelated native Chrome members.
+Promise-based `ChromeStorageApi` subset, not unrelated native Chrome members.
 
 `.vscode/settings.json` uses the native TypeScript 7 workspace SDK settings
 recommended by this tsgo release (`js/ts.*`, not the older `typescript.tsdk`).
@@ -199,15 +200,15 @@ const program = Effect.gen(function* () {
   const storage = yield* ChromeStorage.ChromeStorage
   yield* storage.local.set({ greeting: "Hello from Effect" })
   return yield* storage.local.get("greeting")
-}).pipe(Effect.provide(ChromeStorage.layer))
+}).pipe(Effect.provide(ChromeStorage.layerLive))
 ```
 
 You can also import `effect-platform-chrome/ChromeStorage` directly.
 Every module with a Chrome global behind it exposes `layerLive`, which reads the
-global when the layer is built. Most also take an injected API through `make(api)`
-and `layer(api)`; Storage, Runtime and Alarms keep `layer` as another name for their
-live layer. Port exposes these on its `ChromePort` service class.
-KeyValueStore provides `layerLocal()`, `layerSync()`, and `layerSession()` with
+global when the layer is built and fails with operation `"initialize"` where it is
+missing. Each also takes an injected API through `make(api)` and `layer(api)`; see
+[docs/CONVENTIONS.md](docs/CONVENTIONS.md). `ChromeSchemaStorage.layer` builds on the
+`ChromeStorage` service in context. KeyValueStore provides `layerLocal()`, `layerSync()`, and `layerSession()` with
 isolated namespaces. Importing modules does not access Chrome globals.
 
 `effect-platform-chrome/internal` and all `internal/*`

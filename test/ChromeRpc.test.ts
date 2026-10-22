@@ -10,7 +10,7 @@ import * as RpcMessage from "effect/rpc/RpcMessage"
 import { TestClock } from "effect/testing"
 import { finishAccepted, makeClientProtocol, makeServerProtocol, serve } from "../src/ChromeRpc.js"
 import type { Options } from "../src/ChromeRpc.js"
-import type { NativePort, RuntimeApi } from "../src/ChromePort.js"
+import type { ChromePortApi, NativePort } from "../src/ChromePort.js"
 
 class Rejected extends Schema.TaggedError<Rejected>()("Rejected", { message: Schema.String }) {}
 
@@ -70,7 +70,7 @@ const pair = () => {
 
   // SAFETY: Chrome's ambient declaration makes lastError required although it is
   // undefined outside a native error callback. This mock models the actual boundary.
-  const api = { connect: () => client, lastError: undefined } as RuntimeApi
+  const api = { connect: () => client, lastError: undefined } as ChromePortApi
 
   return { client, server, api, close, clientMessages, serverMessages, clientDisconnects, serverDisconnects }
 }

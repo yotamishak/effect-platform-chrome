@@ -40,7 +40,7 @@ const fixture = () => {
 
   return {
     api,
-    service: make(storage, events),
+    service: make(storage),
     storage,
     listeners,
     emit: (key: string, change: chrome.storage.StorageChange, changedArea: chrome.storage.AreaName = "local") => {
@@ -172,7 +172,7 @@ describe("ChromeSchemaStorage", () => {
       f.listeners.add(listener)
       throw registrationCause
     })
-    expect(yield* Effect.flip(Stream.runDrain(entry.observe))).toMatchObject({ operation: "onChanged.addListener", cause: registrationCause })
+    expect(yield* Effect.flip(Stream.runDrain(entry.observe))).toMatchObject({ operation: "onChanged", cause: registrationCause })
     expect(f.listeners.size).toBe(0)
     expect(f.api.local.get).not.toHaveBeenCalled()
     const removalCause = new Error("removed then failed")
@@ -272,7 +272,7 @@ describe("ChromeSchemaStorage", () => {
       expect(f.api.local.data[entry.storageKey]).toEqual({ version: 1, payload: "dark" })
       yield* entry.remove
       expect(yield* entry.get()).toEqual(Option.none())
-    }).pipe(Effect.provide(layer(f.api.onChanged).pipe(Layer.provide(Layer.succeed(ChromeStorage, f.storage)))))
+    }).pipe(Effect.provide(layer.pipe(Layer.provide(Layer.succeed(ChromeStorage, f.storage)))))
   })
 
   it.effect("defaults only missing entries, creates fresh values, and never persists defaults", () => Effect.gen(function*() {
@@ -574,7 +574,7 @@ describe("ChromeSchemaStorage", () => {
     expect(yield* Effect.flip(Stream.runDrain(entry.observe))).toMatchObject({ operation: "get" })
     expect(f.listeners.size).toBe(0)
     f.api.onChanged.addListener.mockImplementationOnce(() => { throw new Error("register failed") })
-    expect(yield* Effect.flip(Stream.runDrain(entry.observe))).toMatchObject({ operation: "onChanged.addListener" })
+    expect(yield* Effect.flip(Stream.runDrain(entry.observe))).toMatchObject({ operation: "onChanged" })
     expect(f.listeners.size).toBe(0)
   }))
 

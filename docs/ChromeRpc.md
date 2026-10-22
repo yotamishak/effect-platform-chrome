@@ -121,7 +121,7 @@ reached the peer, and waiting for Pong from a dead peer would hang cancellation.
 
 The existing `ChromePort.messages` stream slides at 64 messages. RPC cannot
 tolerate that behavior. This module therefore uses `ChromePort.NativePort`,
-`RuntimeApi` and `Ownership` directly with its own scoped native listeners.
+`ChromePortApi` and `Ownership` directly with its own scoped native listeners.
 **Do not simultaneously adopt/consume the same port through ChromePort.**
 No sibling API changes are required.
 
