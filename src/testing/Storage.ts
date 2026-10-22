@@ -21,18 +21,48 @@ const equal = (left: unknown, right: unknown): boolean => {
   if (Array.isArray(left) !== Array.isArray(right)) return false
 
   const a = Object.entries(left)
-  const b = Object.entries(right)
+  const b = new Map(Object.entries(right))
 
-  return a.length === b.length && a.every(([key, value]) =>
-    b.some(([otherKey, otherValue]) => key === otherKey && equal(value, otherValue)))
+  return a.length === b.size && a.every(([key, value]) => b.has(key) && equal(value, b.get(key)))
 }
 
 export type StorageOperation = "get" | "getBytesInUse" | "getKeys" | "set" | "remove" | "clear" | "setAccessLevel"
 
-type Changes = Record<string, chrome.storage.StorageChange>
+type Changes = ChromeStorage.Changes
 
-/** Fresh state for each call. Managed policy can only be changed by controls. */
-export const makeStorage = () => {
+/**
+ * Replacements for one area's members. A member given as `undefined` is removed, so
+ * `{ getKeys: undefined }` behaves like Chrome before 130 and `{ setAccessLevel: undefined }`
+ * like Chrome before 102.
+ */
+export type AreaOverrides<Api> = { readonly [K in keyof Api]?: Api[K] | undefined }
+
+export interface StorageOverrides {
+  readonly local?: AreaOverrides<ChromeStorage.StorageAreaApi>
+  readonly sync?: AreaOverrides<ChromeStorage.StorageAreaApi>
+  readonly session?: AreaOverrides<ChromeStorage.StorageAreaApi>
+  readonly managed?: AreaOverrides<ChromeStorage.ManagedAreaApi>
+  /** Replaces the global event; the fixture's writes then emit only on `controls.onChanged`. */
+  readonly onChanged?: ChromeStorage.ChromeStorageApi["onChanged"]
+}
+
+/** An area as the fixture exposes it: its Api members plus the per-area `onChanged` event. */
+export type FixtureArea<Api> = Api & { readonly onChanged: TestEvent.EventApi<[Changes]> }
+
+/** An area under construction, before its optional members are added. */
+type Building<Area> = { -readonly [K in keyof Area]: Area[K] }
+
+/** The override for `key` when one is given, `undefined` included; otherwise `fallback`. */
+const member = <Api, K extends keyof Api>(overrides: AreaOverrides<Api>, key: K, fallback: Api[K]): Api[K] | undefined =>
+  Object.hasOwn(overrides, key) ? overrides[key] : fallback
+
+/**
+ * An in-memory `chrome.storage` with fresh state for each call: `local`, `sync` and
+ * `session` are writable, while `managed` policy changes only through `controls.seed`.
+ * Every call can be failed once with `controls.failNext`; `overrides` replace or remove
+ * any area member, or replace the global `onChanged` event.
+ */
+export const makeStorage = (overrides: StorageOverrides = {}) => {
   const globalEvent = TestEvent.makeEvent<[Changes, ChromeStorage.AreaName]>()
   const failures = new Map<string, Array<unknown>>()
 
@@ -86,10 +116,10 @@ export const makeStorage = () => {
       if (emit) notify(structuredClone(changes))
     }
 
-    const get = async (keys: ChromeStorage.GetKeys = null): Promise<ChromeStorage.Items> => {
+    // Chrome's typed key-selector union requires string/object discrimination.
+    /* oxlint-disable anti-slop/no-runtime-typeof */
+    const get = async (keys: ChromeStorage.GetKeys | undefined = null): Promise<ChromeStorage.Items> => {
       check(name, "get")
-      // Chrome's typed key-selector union requires string/object discrimination.
-      /* oxlint-disable anti-slop/no-runtime-typeof */
 
       const selected = keys === null ? Array.from(values.keys())
         : typeof keys === "string" ? [keys]
@@ -108,7 +138,7 @@ export const makeStorage = () => {
       return cloneItems(result)
     }
 
-    const getBytesInUse = async (keys: ChromeStorage.Keys = null): Promise<number> => {
+    const getBytesInUse = async (keys: ChromeStorage.Keys | undefined = null): Promise<number> => {
       check(name, "getBytesInUse")
       const selected = keys === null ? Array.from(values.keys()) : typeof keys === "string" ? [keys] : keys
       const encoder = new TextEncoder()
@@ -167,17 +197,51 @@ export const makeStorage = () => {
 
   const areas = { local: area("local"), sync: area("sync"), session: area("session"), managed: area("managed") }
 
+  const writableArea = (name: "local" | "sync" | "session"): FixtureArea<ChromeStorage.StorageAreaApi> => {
+    const base = areas[name].writable
+    const override = overrides[name] ?? {}
+    const getKeys = member(override, "getKeys", base.getKeys)
+    const setAccessLevel = member(override, "setAccessLevel", base.setAccessLevel)
+
+    const result: Building<FixtureArea<ChromeStorage.StorageAreaApi>> = {
+      get: override.get ?? base.get,
+      getBytesInUse: override.getBytesInUse ?? base.getBytesInUse,
+      set: override.set ?? base.set,
+      remove: override.remove ?? base.remove,
+      clear: override.clear ?? base.clear,
+      onChanged: base.onChanged
+    }
+
+    // Version-gated members stay absent when removed, as on older Chrome.
+    if (getKeys !== undefined) result.getKeys = getKeys
+
+    if (setAccessLevel !== undefined) result.setAccessLevel = setAccessLevel
+
+    return result
+  }
+
+  const managedArea = (): FixtureArea<ChromeStorage.ManagedAreaApi> => {
+    const base = areas.managed.writable
+    const override = overrides.managed ?? {}
+    const getKeys = member(override, "getKeys", base.getKeys)
+
+    const result: Building<FixtureArea<ChromeStorage.ManagedAreaApi>> = {
+      get: override.get ?? base.get,
+      getBytesInUse: override.getBytesInUse ?? base.getBytesInUse,
+      onChanged: base.onChanged
+    }
+
+    if (getKeys !== undefined) result.getKeys = getKeys
+
+    return result
+  }
+
   const api = {
-    local: areas.local.writable,
-    sync: areas.sync.writable,
-    session: areas.session.writable,
-    managed: {
-      get: areas.managed.writable.get,
-      getBytesInUse: areas.managed.writable.getBytesInUse,
-      getKeys: areas.managed.writable.getKeys,
-      onChanged: areas.managed.writable.onChanged
-    },
-    onChanged: globalEvent.api
+    local: writableArea("local"),
+    sync: writableArea("sync"),
+    session: writableArea("session"),
+    managed: managedArea(),
+    onChanged: overrides.onChanged ?? globalEvent.api
   }
 
   // Assignment checks the structural boundary without narrowing fixture extras.
@@ -192,9 +256,11 @@ export const makeStorage = () => {
         local: areas.local.event, sync: areas.sync.event,
         session: areas.session.event, managed: areas.managed.event
       },
+      /** Replaces the whole area, managed policy included; emits the changes when `emit` is true. */
       seed: (name: ChromeStorage.AreaName, items: ChromeStorage.Items, emit = false) => areas[name].seed(items, emit),
       /** The area's current access level, as last set through `setAccessLevel`. */
       accessLevel: (name: "local" | "sync" | "session") => areas[name].accessLevel(),
+      /** Rejects the area's next `operation` call with `cause`, before any mutation. */
       failNext: (name: ChromeStorage.AreaName, operation: StorageOperation, cause: unknown) => {
         const key = `${name}:${operation}`
         const queue = failures.get(key) ?? []
