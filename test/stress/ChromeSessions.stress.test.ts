@@ -590,8 +590,15 @@ describe("ChromeSessions stress: fixture", () => {
         const entry = model.length === 0 ? undefined : pick(model, random)
         const target = entry === undefined || entry.tabs.length === 0 || random() < 0.5 ? entry?.id : pick(entry.tabs, random)
         const sessionId = target ?? String(1_000_000 + step)
-        const exit = yield* Effect.exit(sessions.restore(sessionId))
+        // Chrome parses ids as integers, so every spelling of the same number names the same entry.
+        const spelling = `${pick(["", "", "0", "000", "+", "+0"], random)}${sessionId}`
+        const exit = yield* Effect.exit(sessions.restore(spelling))
         expect(Exit.isSuccess(exit)).toBe(entry !== undefined)
+
+        if (Exit.isFailure(exit)) {
+          const error = Exit.findErrorOption(exit)
+          expect(Option.map(error, (value) => String(value.cause))).toEqual(Option.some(`Error: Invalid session id: "${sessionId}".`))
+        }
 
         if (entry !== undefined) {
           if (target === entry.id) {

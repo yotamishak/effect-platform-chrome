@@ -426,7 +426,8 @@ describe("makeSessions", () => {
     })
     expect(tab.tab?.id).toBeUndefined()
     expect(window.lastModified).toBe(1_700_000_005)
-    expect(window.window).toMatchObject({ sessionId: "2", focused: false, incognito: false, type: "normal", state: "maximized" })
+    // Chrome lists every closed window as normal, whatever its state was.
+    expect(window.window).toMatchObject({ sessionId: "2", focused: false, incognito: false, type: "normal", state: "normal" })
     expect(window.window?.id).toBeUndefined()
     expect(window.window?.tabs?.map((closed) => [closed.sessionId, closed.index, closed.active, closed.url])).toEqual([
       ["3", 0, true, "https://a.test/"],
@@ -602,6 +603,90 @@ describe("makeSessions", () => {
     fixture.controls.setDevices([device])
     expect(emissions).toHaveBeenCalledTimes(27)
     fixture.api.onChanged.removeListener(emissions)
+  }))
+
+  it.effect("lists a closed window as Chrome does, normal and unfocused without bounds, and restores it as it was", () => Effect.gen(function*() {
+    const fixture = makeSessions()
+    const sessions = make(fixture.api)
+
+    const closed = fixture.controls.closeWindow(
+      { type: "popup", state: "maximized", focused: true, alwaysOnTop: true, incognito: true, left: 10, top: 20, width: 300, height: 200 },
+      [{ title: "a" }, { title: "b", active: true }, { title: "c" }]
+    )
+
+    // Chrome's CreateWindowModelHelper hardcodes these and sets no bounds for recently closed windows.
+    expect(closed.window).toMatchObject({ type: "normal", state: "normal", focused: false, alwaysOnTop: false, incognito: false })
+
+    for (const bound of ["left", "top", "width", "height"]) expect(closed.window).not.toHaveProperty(bound)
+
+    // Exactly one tab is active: the window's selected tab.
+    expect(closed.window?.tabs?.map((tab) => tab.active)).toEqual([false, true, false])
+    expect(yield* sessions.getRecentlyClosed()).toEqual([closed])
+    expect(fixture.controls.recentlyClosed()).toEqual([closed])
+
+    const restored = yield* sessions.restore(closed.window?.sessionId ?? "")
+    expect(restored.window).toMatchObject({ type: "popup", state: "maximized", focused: true, alwaysOnTop: true, left: 10, top: 20, width: 300, height: 200 })
+    expect(restored.window?.tabs?.map((tab) => [tab.title, tab.active])).toEqual([["a", false], ["b", true], ["c", false]])
+  }))
+
+  it.effect("lists a closed tab as inactive, as Chrome reports every closed tab outside a window", () => Effect.gen(function*() {
+    const fixture = makeSessions()
+    const closed = fixture.controls.closeTab({ active: true, title: "was active" })
+    expect(closed.tab?.active).toBe(false)
+    expect((yield* make(fixture.api).getRecentlyClosed())[0]?.tab?.active).toBe(false)
+  }))
+
+  it.effect("parses session ids as Chrome does: one integer, after the first dot for a device", () => Effect.gen(function*() {
+    const fixture = makeSessions()
+    const sessions = make(fixture.api)
+
+    for (const title of ["one", "two", "three"]) fixture.controls.closeTab({ title })
+
+    const syncedWindow = (sessionId: string): Session => ({
+      lastModified: 1,
+      window: { sessionId, focused: false, alwaysOnTop: false, incognito: false, tabs: [{ ...closedTab, sessionId: `${sessionId}0`, title: sessionId }] }
+    })
+
+    fixture.controls.setDevices([{ deviceName: "Phone", sessions: [syncedWindow("phone.7"), syncedWindow("a.b.5")] }])
+
+    // base::StringToInt accepts a sign and leading zeros, so these name entries 3 and 2 and window 7.
+    expect((yield* sessions.restore("003")).tab?.title).toBe("three")
+    expect((yield* sessions.restore("+2")).tab?.title).toBe("two")
+    expect((yield* sessions.restore("phone.007")).window?.tabs?.[0]?.title).toBe("phone.7")
+    expect((yield* sessions.restore("phone.+7")).window?.tabs?.[0]?.title).toBe("phone.7")
+
+    // A parsed id that matches nothing is reported in its canonical spelling, an unparsable one as given.
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ["0099", "99"], ["-0", "0"], ["+0", "0"], ["phone.0099", "phone.99"],
+      [" 1", " 1"], ["1 ", "1 "], ["1e1", "1e1"], ["2147483648", "2147483648"], ["a.b.5", "a.b.5"], ["phone.", "phone."]
+    ]
+
+    for (const [sessionId, reported] of cases) {
+      const error = yield* Effect.flip(sessions.restore(sessionId))
+      expect(error).toMatchObject({ operation: "restore" })
+      expect(String(error.cause)).toContain(`Invalid session id: "${reported}".`)
+    }
+
+    expect((yield* sessions.getRecentlyClosed()).map((entry) => entry.tab?.title)).toEqual(["one"])
+  }))
+
+  it.effect("copies what closeTab and closeWindow are given, so later changes to it do not leak in", () => Effect.gen(function*() {
+    const fixture = makeSessions()
+    const mutedInfo: chrome.tabs.MutedInfo = { muted: true }
+    const tabs: Array<Partial<chrome.tabs.Tab>> = [{ title: "kept", mutedInfo: { muted: false } }]
+    fixture.controls.closeTab({ mutedInfo })
+    fixture.controls.closeWindow({}, tabs)
+    mutedInfo.muted = false
+
+    for (const tab of tabs) {
+      tab.title = "changed"
+
+      if (tab.mutedInfo !== undefined) tab.mutedInfo.muted = true
+    }
+
+    const [window, tab] = yield* make(fixture.api).getRecentlyClosed()
+    expect(tab?.tab?.mutedInfo).toEqual({ muted: true })
+    expect(window?.window?.tabs?.map((closed) => [closed.title, closed.mutedInfo])).toEqual([["kept", { muted: false }]])
   }))
 
   it.effect("replaces members through overrides, keeping the rest", () => Effect.gen(function*() {

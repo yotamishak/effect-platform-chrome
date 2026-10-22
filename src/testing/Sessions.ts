@@ -40,11 +40,56 @@ const limitOf = (operation: string, filter: ChromeSessions.Filter | undefined): 
 
 const invalidSessionId = (sessionId: string) => new Error(`Invalid session id: "${sessionId}".`)
 
+/** `base::StringToInt`: an optional sign and decimal digits, leading zeros allowed, within int32. */
+const parseInt32 = (text: string): number | undefined => {
+  if (!/^[+-]?\d+$/.test(text)) return undefined
+
+  const value = Number(text)
+
+  return value < -2_147_483_648 || value > 2_147_483_647 ? undefined : value
+}
+
+/**
+ * Chrome's `SessionId::Parse`: a local id is one integer; a device id is a tag, the first `.`,
+ * then one integer. Returns the canonical spelling Chrome looks up and reports, or `undefined`
+ * when Chrome rejects the id as given.
+ */
+const parseSessionId = (sessionId: string): { readonly foreign: boolean, readonly canonical: string } | undefined => {
+  const separator = sessionId.indexOf(".")
+  const tag = separator === -1 ? "" : sessionId.slice(0, separator)
+  const id = parseInt32(tag === "" ? sessionId : sessionId.slice(separator + 1))
+
+  if (id === undefined) return undefined
+
+  // String(-0) is "0", as Chrome's NumberToString(0) is.
+  return tag === "" ? { foreign: false, canonical: String(id) } : { foreign: true, canonical: `${tag}.${String(id)}` }
+}
+
+/**
+ * How `getRecentlyClosed` reports an entry: Chrome lists every standalone closed tab as inactive
+ * and every closed window as a normal, unfocused, non-incognito window without bounds, whatever
+ * it was. Restoring reopens the tab or window as it was closed.
+ */
+const reported = (session: ChromeSessions.Session): ChromeSessions.Session => {
+  const result = structuredClone(session)
+
+  if (result.tab !== undefined) result.tab.active = false
+
+  if (result.window !== undefined) {
+    const { left: _left, top: _top, width: _width, height: _height, ...rest } = result.window
+    result.window = { ...rest, type: "normal", state: "normal", focused: false, alwaysOnTop: false, incognito: false }
+  }
+
+  return result
+}
+
 /**
  * Chrome's recently closed list and synced devices, in memory. `controls.closeTab` and
- * `controls.closeWindow` record entries most recent first, keep the newest 25 as Chrome does,
- * and fire `onChanged`; closed tabs carry a numeric `sessionId` and no `id`, closed windows list
- * their tabs, each with its own `sessionId`. `lastModified` is `controls.setTime`'s value, in
+ * `controls.closeWindow` record copies of their arguments most recent first, keep the newest 25
+ * as Chrome does, and fire `onChanged`; closed tabs carry a numeric `sessionId` and no `id`,
+ * closed windows list their tabs, each with its own `sessionId`. As in Chrome, a closed tab is
+ * listed as inactive, and a closed window as a normal, unfocused, non-incognito window without
+ * bounds with exactly one active tab; restoring reopens either as it was. `lastModified` is `controls.setTime`'s value, in
  * seconds (0 until set). `getRecentlyClosed` honours `maxResults`; `getDevices` returns
  * `controls.setDevices`' devices, each limited to `maxResults` sessions. An invalid
  * `maxResults` throws synchronously, as Chrome's bindings do.
@@ -55,10 +100,12 @@ const invalidSessionId = (sessionId: string) => new Error(`Invalid session id: "
  * entry leaves the list, as does a window whose last tab is restored. As in Chrome, removing
  * the entry fires `onChanged` and the finished restore fires it again, so restoring a whole entry
  * fires it twice and restoring one tab of a window that keeps other tabs fires it once.
- * Ids containing a `.` name a device's window or tab, which restores without changing the
- * device list or firing `onChanged`. Failures reject with Chrome's messages: "There are no
- * recently closed sessions." and `Invalid session id: "<id>".`. Pass `overrides` to replace any
- * member.
+ * Ids are parsed as Chrome parses them: one integer (a sign and leading zeros allowed, so "007"
+ * names entry 7), or a device tag, the first `.`, and one integer, naming a device's window or
+ * tab, which restores without changing the device list or firing `onChanged`. Failures reject
+ * with Chrome's messages: "There are no recently closed sessions." and
+ * `Invalid session id: "<id>".`, where `<id>` is the canonical id when it parsed ("0099" is
+ * reported as "99") and the id as given otherwise. Pass `overrides` to replace any member.
  */
 export const makeSessions = (overrides: Partial<ChromeSessions.ChromeSessionsApi> = {}) => {
   const entries: Array<ChromeSessions.Session> = []
@@ -68,12 +115,13 @@ export const makeSessions = (overrides: Partial<ChromeSessions.ChromeSessionsApi
   let nextSessionId = 1
   let nextLiveId = 1
 
+  /** Stores a copy, so nested objects the caller passed in stay the caller's. */
   const record = (session: ChromeSessions.Session): ChromeSessions.Session => {
-    entries.unshift(session)
+    entries.unshift(structuredClone(session))
     entries.splice(maxEntries)
     changed.controls.emit()
 
-    return structuredClone(session)
+    return reported(session)
   }
 
   const liveTab = (tab: Tab, windowId?: number): Tab => {
@@ -166,18 +214,18 @@ export const makeSessions = (overrides: Partial<ChromeSessions.ChromeSessionsApi
       return finish(latest)
     }
 
-    if (/^\d+$/.test(sessionId)) return restoreLocal(sessionId)
+    const parsed = parseSessionId(sessionId)
 
-    if (/^.+\.\d+$/.test(sessionId)) return restoreForeign(sessionId)
+    if (parsed === undefined) throw invalidSessionId(sessionId)
 
-    throw invalidSessionId(sessionId)
+    return parsed.foreign ? restoreForeign(parsed.canonical) : restoreLocal(parsed.canonical)
   }
 
   const api: ChromeSessions.ChromeSessionsApi = {
     getRecentlyClosed: (filter) => {
       const limit = limitOf("getRecentlyClosed", filter)
 
-      return Promise.resolve(structuredClone(entries.slice(0, limit)))
+      return Promise.resolve(entries.slice(0, limit).map((entry) => reported(entry)))
     },
     getDevices: (filter) => {
       const limit = limitOf("getDevices", filter)
@@ -193,24 +241,28 @@ export const makeSessions = (overrides: Partial<ChromeSessions.ChromeSessionsApi
     api,
     layer: ChromeSessions.layer(api),
     controls: {
-      /** Records a closed tab as the most recent entry and fires `onChanged`; returns its entry. */
+      /**
+       * Records a closed tab as the most recent entry and fires `onChanged`; returns its entry as
+       * Chrome lists it, inactive.
+       */
       closeTab: (properties: Partial<Tab> = {}): ChromeSessions.Session =>
         record({ lastModified: now, tab: closedTab(String(nextSessionId++), 0, properties) }),
       /**
        * Records a closed window with its tabs (at least one; one blank tab by default) as the most
-       * recent entry and fires `onChanged`; returns its entry. The first tab is active unless a tab
-       * says otherwise.
+       * recent entry and fires `onChanged`; returns its entry as Chrome lists it. Exactly one tab is
+       * active, the window's selected tab: the first marked `active: true`, else the first tab.
        */
       closeWindow: (properties: Partial<Window> = {}, tabs: ReadonlyArray<Partial<Tab>> = [{}]): ChromeSessions.Session => {
         if (tabs.length === 0) throw new Error("A closed window has at least one tab")
 
         const { id: _liveId, tabs: _tabs, ...rest } = properties
+        const selected = Math.max(0, tabs.findIndex((tab) => tab.active === true))
 
         const window: Window = {
           focused: false, alwaysOnTop: false, incognito: false, type: "normal", state: "normal",
           ...rest,
           sessionId: String(nextSessionId++),
-          tabs: tabs.map((tab, index) => closedTab(String(nextSessionId++), index, { active: index === 0, ...tab }))
+          tabs: tabs.map((tab, index) => closedTab(String(nextSessionId++), index, { ...tab, active: index === selected }))
         }
 
         return record({ lastModified: now, window })
@@ -220,8 +272,8 @@ export const makeSessions = (overrides: Partial<ChromeSessions.ChromeSessionsApi
         entries.splice(0)
         changed.controls.emit()
       },
-      /** A snapshot of the recently closed list, most recent first. */
-      recentlyClosed: (): Array<ChromeSessions.Session> => structuredClone(entries),
+      /** A snapshot of the recently closed list, most recent first, as `getRecentlyClosed` lists it. */
+      recentlyClosed: (): Array<ChromeSessions.Session> => entries.map((entry) => reported(entry)),
       /** Replaces the synced devices; Chrome reports no event for this. */
       setDevices: (next: ReadonlyArray<ChromeSessions.Device>): void => { devices = structuredClone(Array.from(next)) },
       /** Sets the clock, in seconds since the epoch, used for new entries and restore results. */

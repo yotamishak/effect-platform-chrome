@@ -46,6 +46,8 @@ export interface ChromeSessionsService {
    * Recently closed tabs and windows, most recently closed first, at most `filter.maxResults`
    * (default and maximum `MAX_SESSION_RESULTS`). A closed tab group is listed as its tabs.
    * Closed windows list their tabs; any of those tabs' `sessionId`s can be restored on its own.
+   * Chrome reports a closed tab as inactive and a closed window as a normal, unfocused window
+   * without bounds, whatever it was; `restore` reopens it as it really was.
    */
   readonly getRecentlyClosed: (filter?: Filter) => Effect.Effect<Array<Session>, ChromeSessionsError>
   /**
@@ -57,9 +59,11 @@ export interface ChromeSessionsService {
    * Reopens a closed tab or window by its `sessionId`, or the most recently closed entry when no
    * id is given; a synced device's session id reopens that tab or window here and leaves the
    * device's list unchanged. Resolves to the session describing the live tab or window, whose
-   * `lastModified` is the restore time. Chrome fails with "There are no recently closed
+   * `lastModified` is the restore time. Chrome parses the id as an integer (or a device tag, `.`
+   * and an integer), so `"007"` names entry `7`. It fails with "There are no recently closed
    * sessions." when nothing is closed, `Invalid session id: "<id>".` for an unknown id, and also
-   * in incognito contexts and when synced sessions are unavailable.
+   * in incognito contexts and when synced sessions are unavailable. Interrupting the effect does
+   * not undo a restore Chrome has started; only its result is discarded.
    */
   readonly restore: (sessionId?: string) => Effect.Effect<Session, ChromeSessionsError>
   /**
