@@ -13,12 +13,20 @@ const cloneMessage = (message: unknown): unknown => {
   return JSON.parse(encoded)
 }
 
+export interface PortPairOptions {
+  /**
+   * The `sender` of the right endpoint, the side Chrome would pass to `onConnect`. The left
+   * endpoint, the connecting side, never has one, as in Chrome.
+   */
+  readonly sender?: chrome.runtime.MessageSender
+}
+
 /** A single two-endpoint connection, with manually flushed FIFO delivery. */
-export const makePortPair = (name = "") => {
+export const makePortPair = (name = "", options: PortPairOptions = {}) => {
   const tasks: Array<() => void> = []
   let connected = true
 
-  const endpoint = () => {
+  const endpoint = (sender: chrome.runtime.MessageSender | undefined) => {
     const message = TestEvent.makeEvent<[unknown, chrome.runtime.Port]>()
     const disconnect = TestEvent.makeEvent<[chrome.runtime.Port]>()
     let lastError: chrome.runtime.LastError | undefined
@@ -54,6 +62,9 @@ export const makePortPair = (name = "") => {
       }
     }
 
+    // Chrome leaves `sender` out entirely on the connecting side.
+    if (sender !== undefined) native.sender = sender
+
     const api: ChromePort.ChromePortApi = {
       get lastError() { return lastError },
       connect: () => {
@@ -83,9 +94,9 @@ export const makePortPair = (name = "") => {
     }
   }
 
-  const left = endpoint()
+  const left = endpoint(undefined)
 
-  const right = endpoint()
+  const right = endpoint(options.sender)
 
   return {
     left: { port: left.port, api: left.api, layer: left.layer },

@@ -130,4 +130,36 @@ describe("internal/port", () => {
     expect(f.listenerCount()).toBe(0)
     expect(f.disconnect).not.toHaveBeenCalled()
   })
+
+  it("detaches both listeners when Chrome reports the disconnect while the message listener is added", () => {
+    const f = fixture()
+    const add = f.native.onMessage.addListener.bind(f.native.onMessage)
+
+    vi.spyOn(f.native.onMessage, "addListener").mockImplementation((listener) => {
+      add(listener)
+      f.close("lost during registration")
+    })
+
+    f.link.register()
+    f.message.controls.emit("late", f.native)
+    expect(f.reported).toEqual([{ message: "lost during registration" }])
+    expect(f.received).toEqual([])
+    expect(f.link.isOpen()).toBe(false)
+    expect(f.listenerCount()).toBe(0)
+    expect(f.disconnect).not.toHaveBeenCalled()
+  })
+
+  it("forwards the message argument only, ignoring the port Chrome passes alongside it", () => {
+    const f = fixture("borrowed")
+    f.link.register()
+
+    for (let index = 0; index < 4096; index++) f.message.controls.emit(index, f.native)
+
+    expect(f.received).toEqual(Array.from({ length: 4096 }, (_, index) => index))
+    f.link.close()
+    f.link.detach()
+    f.link.disconnect()
+    expect(f.listenerCount()).toBe(0)
+    expect(f.disconnect).not.toHaveBeenCalled()
+  })
 })
