@@ -3,7 +3,7 @@
 Standalone TypeScript ESM library for **Effect v4** and **Chrome
 Manifest V3**, modeled after `@effect/platform-browser`.
 
-**Status:** initial implementation with thirty-six public modules and mocked behavior
+**Status:** initial implementation with thirty-seven public modules and mocked behavior
 tests. The library focuses on platform services rather than UI APIs.
 
 This is an independent community project, not an official Effect package.
@@ -144,7 +144,7 @@ CLI is not a library runtime dependency; use it only with trusted documentation.
 | `ChromeRuntime` | Runtime messaging, lifecycle, update and external message/connection events, extension contexts and metadata; `request` unwraps the worker's reply envelope. |
 | `ChromeMessage` | The `{ ok, value \| error }` reply envelope shared by `ChromeServiceWorker` and senders: its schema, `succeed`/`fail`, and `decodeResponse`. |
 | `ChromePort` | Scoped long-lived messaging ports and streams. |
-| `ChromeTabs` | Tab operations and event streams. |
+| `ChromeTabs` | Tab operations (create, update, move, duplicate, reload, discard, grouping, zoom, history, language detection, messaging, ports, capture) and tab event streams. |
 | `ChromeAlarms` | Alarm scheduling and event handling. |
 | `ChromeServiceWorker` | Manifest V3 service-worker lifecycle integration, with wake listeners for any event (optionally filtered) via `listen`. |
 | [`ChromeRpc`](docs/ChromeRpc.md) | Effect RPC client/server protocols over Chrome ports. |
@@ -155,7 +155,8 @@ CLI is not a library runtime dependency; use it only with trusted documentation.
 | `ChromeWebNavigation` | A tab's frames (`getAllFrames`, `getFrame`) and every navigation event (before-navigate, committed, DOMContentLoaded, completed, errors, created targets, fragment/history updates, tab replacement), each filterable by URL through `filtered(filter)`. |
 | `ChromeCookies` | Reading, setting and removing cookies (including removing a cookie read from `getAll`), listing cookie stores, and cookie change events. |
 | `ChromeNotifications` | Creating, updating, clearing and listing notifications, the permission level, and click, button, close and permission-change events. |
-| `ChromeWindows` | Reading and updating windows, including bringing one to the front. |
+| `ChromeWindows` | Listing, creating, updating, focusing and closing windows, with window-type-filterable event streams. |
+| `ChromeTabGroups` | Reading, querying, updating and moving tab groups, and their event streams. |
 | [`ChromeOffscreen`](docs/ChromeOffscreen.md) | The single offscreen document: concurrency-safe `ensureDocument` and a scoped `document`. |
 | `ChromeAction` | Toolbar action: per-tab badge text/colors, icon, title, popup, enable/disable, `openPopup`, user settings; `onClicked` / `onUserSettingsChanged` streams. |
 | `ChromeCommands` | Keyboard commands: `getAll` and the `onCommand` stream (command name and optional tab). |
@@ -174,7 +175,7 @@ CLI is not a library runtime dependency; use it only with trusted documentation.
 | `ChromeUserScripts` | User-script registration, world configuration and one-off `execute`, with an `isAvailable` probe for the user's "Allow User Scripts" toggle. |
 | [`ChromeDebugger`](docs/ChromeDebugger.md) | Chrome DevTools Protocol commands and events, with scoped sessions that attach on acquire and detach on release. |
 | `ChromeTabCapture` | Tab-capture stream ids for offscreen documents, captured tabs, and capture status events. |
-| [`ChromeTesting`](docs/ChromeTesting.md) | In-memory fixtures for storage, tabs, ports, action, context menus, omnibox, offscreen, cookies, identity, web navigation, notifications, declarativeNetRequest and bookmarks, plus event simulators; one module per adapter under `testing/`. |
+| [`ChromeTesting`](docs/ChromeTesting.md) | In-memory fixtures for storage, tabs, windows, ports, action, context menus, omnibox, offscreen, cookies, identity, web navigation, notifications, declarativeNetRequest and bookmarks, plus event simulators; one module per adapter under `testing/`. |
 
 Modules use Effect v4 services, tagged errors, layers, and scoped streams.
 Manifest V3 wakeup listeners must

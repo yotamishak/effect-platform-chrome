@@ -30,3 +30,5 @@ export * from "./testing/Notifications.js"
 export * from "./testing/DeclarativeNetRequest.js"
 
 export * from "./testing/Bookmarks.js"
+
+export * from "./testing/Windows.js"

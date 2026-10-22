@@ -139,11 +139,16 @@ not claims about native browser scheduling or serialization fidelity.
 ## Tabs
 
 `makeTabs(overrides?)` is an in-memory tab strip behind `ChromeTabs.layer`. Tabs
-keep the properties they were created, seeded or updated with; `query` matches
-`active`, `windowId` and exact `url`s (no match patterns). `create`, `update` and
-`remove` emit the matching events synchronously. `get`, `update` and `remove` reject
-an unknown id as Chrome does, and `sendMessage` rejects as Chrome does with no
-receiver.
+keep the properties they were created, seeded or updated with, are ordered per window,
+and their `index` follows that order. `query` matches the common fields and exact
+`url`s (no match patterns), returning results by window, then index. `create`,
+`update`, `remove`, `duplicate`, `move` (onMoved, or onDetached then onAttached across
+windows), `reload` (loading, then complete), `discard`, `group`/`ungroup` and zoom
+update the strip and emit the matching events synchronously. Calls that default to
+the current tab use the first active one. `get`, `update` and `remove` reject an
+unknown id as Chrome does, and `sendMessage` rejects as Chrome does with no receiver.
+`goBack`/`goForward` reject (no history is modelled) and `detectLanguage` returns
+`"und"`.
 
 - `controls.seed(properties)` adds a tab and returns it with its id;
   `controls.tab(id)` reads the live record.
@@ -167,6 +172,7 @@ Every adapter fixture returns `{ api, layer, controls }`: `api` fits the module'
 | `testing/Storage` | `makeStorage` | All storage areas, `getKeys`, access levels and change events (above). |
 | `testing/Port` | `makePortPair` | Two connected ports with manual delivery (above). |
 | `testing/Tabs` | `makeTabs` | An in-memory tab strip (above). |
+| `testing/Windows` | `makeWindows` | A window list with focus tracking and `windowTypes` filters; removing or unfocusing the focused window refocuses the previous one (or reports -1). Tabs, urls and `populate` are not modelled. |
 | `testing/Action` | `makeAction` | Per-tab badge, title, popup and enabled state falling back to defaults; `controls.click(tab)` opens the popup or fires `onClicked`. |
 | `testing/ContextMenus` | `makeContextMenus` | A menu tree; `create` reports duplicate ids and unknown parents through `lastError` like Chrome; `controls.click`. |
 | `testing/Omnibox` | `makeOmnibox` | A keyword session; `controls.change(text)` returns the suggestion batches listeners send. |

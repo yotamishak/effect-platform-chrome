@@ -36,6 +36,8 @@ export * as ChromeNotifications from "./ChromeNotifications.js"
 
 export * as ChromeWindows from "./ChromeWindows.js"
 
+export * as ChromeTabGroups from "./ChromeTabGroups.js"
+
 export * as ChromeOffscreen from "./ChromeOffscreen.js"
 
 export * as ChromeAction from "./ChromeAction.js"
