@@ -108,7 +108,10 @@ export interface ChromeBookmarksService {
   readonly get: (id: string, ...ids: Array<string>) => Effect.Effect<Array<BookmarkTreeNode>, ChromeBookmarksError>
   /** A folder's direct children, without their own children; a bookmark has none. */
   readonly getChildren: (id: string) => Effect.Effect<Array<BookmarkTreeNode>, ChromeBookmarksError>
-  /** At most `numberOfItems` (at least 1) of the most recently added bookmarks, never folders, newest first. */
+  /**
+   * At most `numberOfItems` (an integer, at least 1) of the most recently added bookmarks,
+   * never folders, newest first.
+   */
   readonly getRecent: (numberOfItems: number) => Effect.Effect<Array<BookmarkTreeNode>, ChromeBookmarksError>
   /** The whole tree: a single root node (id "0") whose children are the permanent folders. */
   readonly getTree: Effect.Effect<Array<BookmarkTreeNode>, ChromeBookmarksError>
@@ -123,13 +126,15 @@ export interface ChromeBookmarksService {
   readonly search: (query: string | SearchQuery) => Effect.Effect<Array<BookmarkTreeNode>, ChromeBookmarksError>
   /**
    * Creates a bookmark, or a folder when `url` is absent or empty, at `index` (default: last)
-   * in `parentId` (default: Other bookmarks). Chrome stores the URL in canonical form.
+   * in `parentId` (default: Other bookmarks). Chrome stores the URL in canonical form. Any
+   * `index` must be an integer from 0 to the folder's size; Chrome rejects others.
    */
   readonly create: (bookmark: CreateDetails) => Effect.Effect<BookmarkTreeNode, ChromeBookmarksError>
   /**
    * Moves a node to `index` (default: last) in `parentId` (default: its current folder).
    * Within the same folder the index counts positions before the node is taken out, so
-   * moving to its own index or the next one changes nothing and fires no `onMoved`.
+   * moving to its own index or the next one changes nothing and fires no `onMoved`. A folder
+   * cannot move into itself or its descendants, nor anything into a bookmark.
    */
   readonly move: (id: string, destination: MoveDestination) => Effect.Effect<BookmarkTreeNode, ChromeBookmarksError>
   /**

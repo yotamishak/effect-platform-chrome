@@ -1,10 +1,10 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Effect, Exit, Fiber, Stream } from "effect"
+import { Effect, Exit, Fiber, Schedule, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeBookmarks, ChromeBookmarksError, layer, layerLive, make } from "../src/ChromeBookmarks.js"
 import type {
-  BookmarkTreeNode, ChangedEvent, ChildrenReorderedEvent, ChromeBookmarksApi, ChromeBookmarksService, CreatedEvent,
+  BookmarkTreeNode, ChangedEvent, ChangeInfo, ChildrenReorderedEvent, ChromeBookmarksApi, ChromeBookmarksService, CreatedEvent,
   MovedEvent, RemovedEvent
 } from "../src/ChromeBookmarks.js"
 import type { EventSource } from "../src/internal/event.js"
@@ -275,7 +275,11 @@ describe("ChromeBookmarks", () => {
     expect(titles(yield* bookmarks.getRecent(5))).toEqual(["Second", "First"])
     expect(titles(yield* bookmarks.getRecent(1))).toEqual(["Second"])
     expect(yield* Effect.flip(bookmarks.getRecent(0))).toMatchObject({
-      operation: "getRecent", cause: new Error("numberOfItems cannot be less than 1.")
+      operation: "getRecent",
+      cause: new TypeError(
+        "Error in invocation of bookmarks.getRecent(integer numberOfItems, optional function callback): " +
+          "Error at parameter 'numberOfItems': Value must be at least 1."
+      )
     })
     expect(yield* Effect.flip(bookmarks.getRecent(-3))).toMatchObject({ operation: "getRecent" })
   }))
@@ -352,7 +356,8 @@ describe("ChromeBookmarks", () => {
     expect(yield* failure(TestBookmarks.bookmarksBarId, { parentId: "2" })).toMatchObject({
       cause: new Error("Can't modify the root bookmark folders.")
     })
-    expect(yield* failure(inner.id, { parentId: leaf.id })).toMatchObject({ cause: new Error("Can't move a folder to itself or its descendant.") })
+    // Chrome checks that the destination is a folder before checking that it lies outside the node.
+    expect(yield* failure(inner.id, { parentId: leaf.id })).toMatchObject({ cause: new Error("Parameter 'parentId' does not specify a folder.") })
     const other = yield* bookmarks.create({ title: "Other", url: "https://other.example/" })
     expect(yield* failure(leaf.id, { parentId: other.id })).toMatchObject({
       cause: new Error("Parameter 'parentId' does not specify a folder.")
@@ -360,7 +365,7 @@ describe("ChromeBookmarks", () => {
     expect(yield* failure(leaf.id, { parentId: "404" })).toMatchObject({ cause: new Error("Can't find parent bookmark for id.") })
     expect(yield* failure("404", { parentId: "1" })).toMatchObject({ cause: new Error("Can't find bookmark for id.") })
     expect(yield* failure(leaf.id, { index: 2 })).toMatchObject({ cause: new Error("Index out of bounds.") })
-    expect(yield* failure(leaf.id, { index: -1 })).toMatchObject({ cause: new Error("Index out of bounds.") })
+    expect((yield* failure(leaf.id, { index: -1 })).cause).toBeInstanceOf(TypeError)
     expect(yield* failure(leaf.id, { parentId: "1", index: 1 })).toMatchObject({ cause: new Error("Index out of bounds.") })
     expect(titles(yield* bookmarks.getChildren(inner.id))).toEqual(["Leaf"])
     expect(titles(yield* bookmarks.getChildren(outer.id))).toEqual(["Inner"])
@@ -397,7 +402,7 @@ describe("ChromeBookmarks", () => {
     expect(yield* Effect.flip(bookmarks.create({ title: "Late", index: 5 }))).toMatchObject({
       operation: "create", cause: new Error("Index out of bounds.")
     })
-    expect(yield* Effect.flip(bookmarks.create({ title: "Early", index: -1 }))).toMatchObject({ cause: new Error("Index out of bounds.") })
+    expect((yield* Effect.flip(bookmarks.create({ title: "Early", index: -1 }))).cause).toBeInstanceOf(TypeError)
     expect(yield* Effect.flip(bookmarks.create({ parentId: TestBookmarks.rootId, title: "Top" }))).toMatchObject({
       operation: "create", cause: new Error("Can't modify the root bookmark folders.")
     })
@@ -422,6 +427,160 @@ describe("ChromeBookmarks", () => {
     expect(fixture.controls.node(folder.id)).toBeUndefined()
     expect(fixture.controls.node(child.id)).toBeUndefined()
     expect(fixture.controls.size).toBe(5)
+  }))
+
+  it.effect("validates integer arguments synchronously like Chrome's schema, changing nothing", () => Effect.gen(function*() {
+    const fixture = TestBookmarks.makeBookmarks()
+    const bookmarks = make(fixture.api)
+    const page = yield* bookmarks.create({ title: "Page", url: "https://page.example/" })
+    yield* bookmarks.create({ title: "Second", url: "https://second.example/" })
+    const createdEvents = yield* Effect.forkScoped(Stream.runCollect(Stream.take(bookmarks.onCreated, 1)))
+    const movedEvents = yield* Effect.forkScoped(Stream.runCollect(Stream.take(bookmarks.onMoved, 1)))
+    yield* Effect.promise(() => fixture.controls.onCreated.waitForListener())
+    yield* Effect.promise(() => fixture.controls.onMoved.waitForListener())
+
+    const createPrefix = "Error in invocation of bookmarks.create(bookmarks.CreateDetails bookmark, optional function callback): " +
+      "Error at parameter 'bookmark': Error at property 'index': "
+
+    const movePrefix = "Error in invocation of bookmarks.move(string id, object destination, optional function callback): " +
+      "Error at parameter 'destination': Error at property 'index': "
+
+    for (const index of [1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+      expect(() => fixture.api.create({ title: "Bad", index })).toThrow(new TypeError(`${createPrefix}Invalid type: expected integer, found number.`))
+      expect(() => fixture.api.move(page.id, { index })).toThrow(new TypeError(`${movePrefix}Invalid type: expected integer, found number.`))
+      expect(() => fixture.api.getRecent(index)).toThrow(TypeError)
+      expect(yield* Effect.flip(bookmarks.create({ title: "Bad", index }))).toMatchObject({ operation: "create" })
+      expect(yield* Effect.flip(bookmarks.move(page.id, { index }))).toMatchObject({ operation: "move" })
+      expect(yield* Effect.flip(bookmarks.getRecent(index))).toMatchObject({ operation: "getRecent" })
+    }
+
+    expect(() => fixture.api.create({ title: "Bad", index: -1 })).toThrow(new TypeError(`${createPrefix}Value must be at least 0.`))
+    expect(() => fixture.api.move(page.id, { index: -1 })).toThrow(new TypeError(`${movePrefix}Value must be at least 0.`))
+    expect((yield* bookmarks.getChildren("2")).map(({ title, index }) => [title, index])).toEqual([["Page", 0], ["Second", 1]])
+    expect(fixture.controls.size).toBe(6)
+    const valid = yield* bookmarks.create({ title: "Valid", index: 1 })
+    yield* bookmarks.move(valid.id, { index: 0 })
+    expect((yield* Fiber.join(createdEvents)).map(({ id }) => id)).toEqual([valid.id])
+    expect(yield* Fiber.join(movedEvents)).toEqual([{ id: valid.id, parentId: "2", index: 0, oldParentId: "2", oldIndex: 1 }])
+  }))
+
+  it.effect("refuses to move a bookmark into itself because it is not a folder", () => Effect.gen(function*() {
+    const fixture = TestBookmarks.makeBookmarks()
+    const bookmarks = make(fixture.api)
+    const page = yield* bookmarks.create({ title: "Page", url: "https://page.example/" })
+    const folder = yield* bookmarks.create({ title: "Folder" })
+    expect(yield* Effect.flip(bookmarks.move(page.id, { parentId: page.id }))).toMatchObject({
+      operation: "move", cause: new Error("Parameter 'parentId' does not specify a folder.")
+    })
+    expect(yield* Effect.flip(bookmarks.move(folder.id, { parentId: folder.id }))).toMatchObject({
+      operation: "move", cause: new Error("Can't move a folder to itself or its descendant.")
+    })
+  }))
+
+  it.effect("parses ids as 64-bit integers, as Chrome does before looking them up", () => Effect.gen(function*() {
+    const fixture = TestBookmarks.makeBookmarks()
+    const bookmarks = make(fixture.api)
+    expect((yield* bookmarks.get("01", "+2", "-0")).map(({ id }) => id)).toEqual(["1", "2", "0"])
+    expect((yield* bookmarks.getChildren("000")).map(({ id }) => id)).toEqual(["1", "2", "3"])
+    const folder = yield* bookmarks.create({ parentId: "01", title: "Padded" })
+    expect(folder).toMatchObject({ parentId: "1", index: 0 })
+    expect(yield* bookmarks.update(`0${folder.id}`, { title: "Renamed" })).toMatchObject({ id: folder.id, title: "Renamed" })
+    expect(yield* Effect.flip(bookmarks.remove("+1"))).toMatchObject({ cause: new Error("Can't modify the root bookmark folders.") })
+    expect(yield* Effect.flip(bookmarks.get("9223372036854775807"))).toMatchObject({ cause: new Error("Can't find bookmark for id.") })
+
+    for (const id of ["9223372036854775808", "-9223372036854775809", "", " 1", "1 ", "1.0", "0x1", "-", "+"]) {
+      expect(yield* Effect.flip(bookmarks.get(id))).toMatchObject({ operation: "get", cause: new Error("Bookmark id is invalid.") })
+    }
+  }))
+
+  it.effect("refuses isolated web app URLs, as Chrome does", () => Effect.gen(function*() {
+    const fixture = TestBookmarks.makeBookmarks()
+    const bookmarks = make(fixture.api)
+    const page = yield* bookmarks.create({ title: "Page", url: "https://page.example/" })
+    expect(yield* Effect.flip(bookmarks.create({ title: "App", url: "isolated-app://app/" }))).toMatchObject({
+      operation: "create", cause: new Error("Invalid URL.")
+    })
+    expect(yield* Effect.flip(bookmarks.update(page.id, { url: "isolated-app://app/" }))).toMatchObject({
+      operation: "update", cause: new Error("Invalid URL.")
+    })
+    expect(fixture.controls.node(page.id)?.url).toBe("https://page.example/")
+  }))
+
+  it.effect("applies a whole operation before delivering its events to listeners that call back synchronously", () => Effect.gen(function*() {
+    const fixture = TestBookmarks.makeBookmarks()
+    const bookmarks = make(fixture.api)
+    const page = yield* bookmarks.create({ title: "Page", url: "https://page.example/" })
+    const observed = yield* Effect.forkScoped(Stream.runCollect(Stream.take(Stream.merge(bookmarks.onChanged, bookmarks.onRemoved), 3)))
+    yield* Effect.promise(() => fixture.controls.onChanged.waitForListener())
+    yield* Effect.promise(() => fixture.controls.onRemoved.waitForListener())
+    const seen: Array<string> = []
+    const removals: Array<Promise<void>> = []
+
+    // A raw listener that removes the node the moment it hears of the first change.
+    const removeOnChange = (id: string, info: ChangeInfo) => {
+      seen.push(`changed ${info.title} ${info.url ?? ""}`)
+      fixture.api.onChanged.removeListener(removeOnChange)
+      removals.push(fixture.api.remove(id))
+    }
+
+    fixture.api.onChanged.addListener(removeOnChange)
+    fixture.api.onRemoved.addListener((_id, info) => { seen.push(`removed at ${info.index}`) })
+    const result = yield* bookmarks.update(page.id, { title: "Renamed", url: "https://renamed.example/" })
+    expect(result).toMatchObject({ id: page.id, parentId: "2", index: 0, title: "Renamed", url: "https://renamed.example/" })
+    expect(seen).toEqual(["changed Renamed https://page.example/", "removed at 0"])
+    yield* Effect.promise(() => Promise.all(removals))
+    const events = yield* Fiber.join(observed)
+    expect(events.map((event) => "node" in event ? `removed at ${event.index}` : `changed ${event.url ?? ""}`)).toEqual([
+      "changed https://page.example/", "changed https://renamed.example/", "removed at 0"
+    ])
+    expect(fixture.controls.node(page.id)).toBeUndefined()
+
+    // A listener that moves each created node leaves the result and the event at the creation place.
+    const createdEvents: Array<BookmarkTreeNode> = []
+    const moves: Array<Promise<BookmarkTreeNode>> = []
+    fixture.api.onCreated.addListener((id) => { moves.push(fixture.api.move(id, { parentId: TestBookmarks.bookmarksBarId })) })
+    fixture.api.onCreated.addListener((_id, node) => { createdEvents.push(node) })
+    const moved = yield* Effect.forkScoped(Stream.runCollect(Stream.take(bookmarks.onMoved, 1)))
+    yield* Effect.promise(() => fixture.controls.onMoved.waitForListener())
+    const created = yield* bookmarks.create({ title: "Created", url: "https://created.example/" })
+    expect(created).toMatchObject({ parentId: "2", index: 0 })
+    expect(createdEvents).toEqual([created])
+    expect(yield* Effect.promise(() => Promise.all(moves))).toEqual([expect.objectContaining({ id: created.id, parentId: "1", index: 0 })])
+    expect(yield* Fiber.join(moved)).toEqual([{ id: created.id, parentId: "1", index: 0, oldParentId: "2", oldIndex: 0 }])
+  }))
+
+  it.effect("hands out copies, so mutating a result or an event never changes the tree", () => Effect.gen(function*() {
+    const fixture = TestBookmarks.makeBookmarks()
+    const bookmarks = make(fixture.api)
+    const folder = yield* bookmarks.create({ title: "Folder" })
+    yield* bookmarks.create({ parentId: folder.id, title: "Child", url: "https://child.example/" })
+    const events: Array<string> = []
+
+    fixture.api.onCreated.addListener((_id, node) => {
+      node.title = "Mutated by a listener"
+      events.push(node.title)
+    })
+
+    const created = yield* bookmarks.create({ title: "Fresh" })
+    expect(created.title).toBe("Fresh")
+    created.title = "Mutated result"
+    const [tree] = yield* bookmarks.getSubTree(folder.id)
+    tree?.children?.splice(0)
+    expect(events).toEqual(["Mutated by a listener"])
+    expect(fixture.controls.node(created.id)?.title).toBe("Fresh")
+    expect(fixture.controls.node(folder.id)?.children).toEqual([expect.objectContaining({ title: "Child" })])
+  }))
+
+  it.effect("re-registers a stream value after its registration failed, as Stream.retry does", () => Effect.gen(function*() {
+    const fixture = TestBookmarks.makeBookmarks()
+    const bookmarks = make(fixture.api)
+    fixture.controls.onCreated.failNext("addListener", new Error("refused once"))
+    const fiber = yield* Effect.forkScoped(Stream.runCollect(Stream.take(Stream.retry(bookmarks.onCreated, Schedule.recurs(1)), 1)))
+    yield* Effect.promise(() => fixture.controls.onCreated.waitForListener())
+    expect(fixture.controls.onCreated.listenerCount).toBe(1)
+    const node = yield* bookmarks.create({ title: "After retry" })
+    expect((yield* Fiber.join(fiber)).map(({ id }) => id)).toEqual([node.id])
+    expect(fixture.controls.onCreated.listenerCount).toBe(0)
   }))
 
   it.effect("stores canonical URLs and treats an empty url as none", () => Effect.gen(function*() {

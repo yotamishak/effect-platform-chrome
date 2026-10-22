@@ -771,3 +771,42 @@ describe("ChromeBookmarks fixture stress", () => {
     expect(fixture.controls.size).toBe(4)
   }))
 })
+
+describe("ChromeBookmarks re-entrancy stress", () => {
+  it.effect("delivers a 10,000-step cascade of listeners calling back synchronously in order, without recursion", () => Effect.gen(function*() {
+    const total = 10_000
+    const fixture = TestBookmarks.makeBookmarks()
+    const bookmarks = make(fixture.api)
+    const creations: Array<Promise<BookmarkTreeNode>> = []
+    const moves: Array<Promise<BookmarkTreeNode>> = []
+    const createdEvents: Array<CreatedEvent> = []
+    const movedEvents: Array<readonly [string, MoveInfo]> = []
+    const newest = yield* Effect.forkChild(Stream.runCollect(Stream.take(bookmarks.onMoved, 64)))
+    yield* Effect.promise(() => fixture.controls.onMoved.waitForListener())
+
+    // Each creation, as it is heard of, creates the next node and moves the one heard of away.
+    fixture.api.onCreated.addListener((id, bookmark) => {
+      createdEvents.push({ id, bookmark })
+
+      if (createdEvents.length < total) creations.push(fixture.api.create({ index: 0, title: `n${createdEvents.length}` }))
+      moves.push(fixture.api.move(id, { parentId: TestBookmarks.bookmarksBarId, index: 0 }))
+    })
+    fixture.api.onMoved.addListener((id, info) => { movedEvents.push([id, info]) })
+
+    const first = yield* bookmarks.create({ title: "n0" })
+    const created = [first, ...yield* Effect.promise(() => Promise.all(creations))]
+    const moved = yield* Effect.promise(() => Promise.all(moves))
+    expect(created).toHaveLength(total)
+    expect(created.every((node, index) => node.title === `n${index}` && node.parentId === "2" && node.index === 0)).toBe(true)
+    expect(createdEvents.map(({ id }) => id)).toEqual(created.map(({ id }) => id))
+    expect(createdEvents.every(({ bookmark }, index) => bookmark.parentId === "2" && bookmark.index === 0 && bookmark.title === `n${index}`)).toBe(true)
+    expect(moved.every((node) => node.parentId === "1" && node.index === 0)).toBe(true)
+    expect(movedEvents.map(([id]) => id)).toEqual(created.map(({ id }) => id))
+    // Every node but the last still shares Other bookmarks with its successor when it is moved away.
+    expect(movedEvents.every(([, info], index) => info.oldParentId === "2" && info.oldIndex === (index === total - 1 ? 0 : 1) && info.index === 0))
+      .toBe(true)
+    expect(childIds(fixture, "2")).toEqual([])
+    expect(childIds(fixture, "1")).toEqual(created.map(({ id }) => id).reverse())
+    expect((yield* Fiber.join(newest)).map(({ id }) => id)).toEqual(created.slice(-64).map(({ id }) => id))
+  }))
+})

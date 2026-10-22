@@ -32,11 +32,48 @@ const permanentIds: ReadonlySet<string> = new Set([rootId, bookmarksBarId, other
 
 const fail = (message: string): never => { throw new Error(message) }
 
-/** Chrome parses ids as 64-bit integers before looking them up. */
-const checkId = (id: string): string => /^-?\d+$/.test(id) ? id : fail("Bookmark id is invalid.")
+const int64Min = -(2n ** 63n)
 
-/** The URL in canonical form, as Chrome stores it. */
-const canonicalUrl = (url: string): string => URL.canParse(url) ? new URL(url).href : fail("Invalid URL.")
+const int64Max = 2n ** 63n - 1n
+
+/**
+ * The id as the node it names: Chrome parses ids as signed 64-bit integers before looking
+ * them up, so "01" and "+1" name node "1", and an id out of range is invalid.
+ */
+const checkId = (id: string): string => {
+  const value = /^[+-]?\d+$/.test(id) ? BigInt(id) : undefined
+
+  return value === undefined || value < int64Min || value > int64Max ? fail("Bookmark id is invalid.") : String(value)
+}
+
+/**
+ * Chrome validates integer arguments against the API schema before the call starts, throwing
+ * a TypeError synchronously rather than rejecting: an integer must be a 32-bit one, at least
+ * `minimum`.
+ */
+const checkInteger = (signature: string, path: readonly [string, ...Array<string>], value: number, minimum: number) => {
+  const [parameter, ...properties] = path
+  const where = [`Error at parameter '${parameter}'`, ...properties.map((property) => `Error at property '${property}'`)].join(": ")
+
+  const problem = !Number.isInteger(value) || value < -(2 ** 31) || value >= 2 ** 31
+    ? "Invalid type: expected integer, found number."
+    : value < minimum ? `Value must be at least ${minimum}.` : undefined
+
+  if (problem !== undefined) throw new TypeError(`Error in invocation of bookmarks.${signature}: ${where}: ${problem}`)
+}
+
+const createSignature = "create(bookmarks.CreateDetails bookmark, optional function callback)"
+
+const moveSignature = "move(string id, object destination, optional function callback)"
+
+const getRecentSignature = "getRecent(integer numberOfItems, optional function callback)"
+
+/** The URL in canonical form, as Chrome stores it; Chrome refuses isolated web app URLs. */
+const canonicalUrl = (url: string): string => {
+  const parsed = URL.canParse(url) ? new URL(url) : undefined
+
+  return parsed === undefined || parsed.protocol === "isolated-app:" ? fail("Invalid URL.") : parsed.href
+}
 
 /** Case- and accent-insensitive text, as Chrome compares search words. */
 const fold = (text: string): string => text.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase()
@@ -55,6 +92,10 @@ const containsAll = (text: string, terms: ReadonlyArray<string>): boolean => {
  * Other bookmarks ("2") and Mobile bookmarks ("3") folders. Mutations fail with Chrome's
  * messages where Chrome would (malformed or unknown ids, permanent folders, non-empty folders,
  * out-of-range indexes, invalid URLs, moving a folder into itself) and emit Chrome's events.
+ * Like Chrome's argument validation, a negative or non-integer `index` or `numberOfItems`
+ * throws a TypeError synchronously. Ids are parsed as 64-bit integers, so "01" names node "1".
+ * Events are delivered after the operation has fully applied and its result was taken, in
+ * order, so a listener that calls back into the API synchronously cannot interleave with them.
  * URLs are stored in canonical form, and an empty `url` means none. `search` matches bookmarks
  * and folders but never the permanent folders, with every word in the title or every word in
  * the URL; `update` emits `onChanged` once for a title change and once more for a URL change;
@@ -73,6 +114,26 @@ export const makeBookmarks = (overrides: Partial<ChromeBookmarks.ChromeBookmarks
   const importEnded = TestEvent.makeEvent<[]>()
   let nextId = 4
   let sequence = 0
+  const pending: Array<() => void> = []
+  let delivering = false
+
+  /**
+   * Delivers events in order once the operation that caused them has finished, as Chrome
+   * does: a listener sees the whole operation applied, and the calls it makes, even
+   * synchronously, take effect only after the events already queued.
+   */
+  const deliver = (...emissions: Array<() => void>) => {
+    pending.push(...emissions)
+
+    if (delivering) return
+    delivering = true
+
+    try {
+      for (let next = pending.shift(); next !== undefined; next = pending.shift()) next()
+    } finally {
+      delivering = false
+    }
+  }
 
   const insert = (
     id: string,
@@ -205,7 +266,7 @@ export const makeBookmarks = (overrides: Partial<ChromeBookmarks.ChromeBookmarks
     touch(parent)
 
     for (const descendant of subtree(entry)) entries.delete(descendant.id)
-    removed.controls.emit(entry.id, { parentId: parent.id, index, node: removedNode })
+    deliver(() => removed.controls.emit(entry.id, { parentId: parent.id, index, node: removedNode }))
   }
 
   insert(rootId, undefined, "", undefined)
@@ -219,64 +280,80 @@ export const makeBookmarks = (overrides: Partial<ChromeBookmarks.ChromeBookmarks
     childrenOf(find(rootId)).push(id)
   }
 
+  const createNode = async (details: ChromeBookmarks.CreateDetails): Promise<BookmarkTreeNode> => {
+    const parent = findParent(details.parentId ?? otherBookmarksId)
+
+    if (parent.id === rootId) fail("Can't modify the root bookmark folders.")
+    const siblings = childrenOf(parent)
+    const index = details.index ?? siblings.length
+
+    if (index > siblings.length) fail("Index out of bounds.")
+    const url = details.url === undefined || details.url === "" ? undefined : canonicalUrl(details.url)
+    const entry = insert(String(nextId++), parent.id, details.title ?? "", url)
+    siblings.splice(index, 0, entry.id)
+    touch(parent)
+    const event = describe(entry, index, false)
+    const result = describe(entry, index, false)
+    deliver(() => created.controls.emit(entry.id, event))
+
+    return result
+  }
+
+  const moveNode = async (id: string, destination: ChromeBookmarks.MoveDestination): Promise<BookmarkTreeNode> => {
+    const entry = modifiable(id)
+    const oldParent = find(entry.parentId ?? rootId)
+    const parent = destination.parentId === undefined ? oldParent : findParent(destination.parentId)
+
+    // Chrome checks the root, then that the parent is a folder, then that it lies outside the node.
+    if (parent.id === rootId) fail("Can't modify the root bookmark folders.")
+    const siblings = childrenOf(parent)
+
+    if (within(parent, entry)) fail("Can't move a folder to itself or its descendant.")
+    const oldIndex = childrenOf(oldParent).indexOf(entry.id)
+    const requested = destination.index ?? siblings.length
+
+    if (requested > siblings.length) fail("Index out of bounds.")
+
+    // Like Chrome, an index in the same folder counts positions before the node is taken out.
+    if (parent === oldParent && (requested === oldIndex || requested === oldIndex + 1)) return describe(entry, oldIndex, false)
+    const index = parent === oldParent && requested > oldIndex ? requested - 1 : requested
+    childrenOf(oldParent).splice(oldIndex, 1)
+    siblings.splice(index, 0, entry.id)
+    entry.parentId = parent.id
+    touch(oldParent)
+    touch(parent)
+    const result = describe(entry, index, false)
+    deliver(() => moved.controls.emit(entry.id, { parentId: parent.id, index, oldParentId: oldParent.id, oldIndex }))
+
+    return result
+  }
+
   const api: ChromeBookmarks.ChromeBookmarksApi = {
     get: async (idOrIdList) => [idOrIdList].flat().map((id) => node(find(id), false)),
     getChildren: async (id) => (find(id).children ?? []).map((child, index) => describe(find(child), index, false)),
-    getRecent: async (numberOfItems) => {
-      if (numberOfItems < 1) fail("numberOfItems cannot be less than 1.")
+    getRecent: (numberOfItems) => {
+      checkInteger(getRecentSignature, ["numberOfItems"], numberOfItems, 1)
 
-      return Array.from(entries.values())
+      return Promise.resolve(Array.from(entries.values())
         .filter((entry) => entry.url !== undefined)
         .sort((left, right) => right.dateAdded - left.dateAdded || right.sequence - left.sequence)
         .slice(0, numberOfItems)
-        .map((entry) => node(entry, false))
+        .map((entry) => node(entry, false)))
     },
     getTree: async () => [node(find(rootId), true)],
     getSubTree: async (id) => [node(find(id), true)],
     search: async (query) => subtree(find(rootId))
       .filter((entry) => !permanentIds.has(entry.id) && matches(entry, query))
       .map((entry) => node(entry, false)),
-    create: async (details) => {
-      const parent = findParent(details.parentId ?? otherBookmarksId)
+    create: (details) => {
+      if (details.index !== undefined) checkInteger(createSignature, ["bookmark", "index"], details.index, 0)
 
-      if (parent.id === rootId) fail("Can't modify the root bookmark folders.")
-      const siblings = childrenOf(parent)
-      const index = details.index ?? siblings.length
-
-      if (index < 0 || index > siblings.length) fail("Index out of bounds.")
-      const url = details.url === undefined || details.url === "" ? undefined : canonicalUrl(details.url)
-      const entry = insert(String(nextId++), parent.id, details.title ?? "", url)
-      siblings.splice(index, 0, entry.id)
-      touch(parent)
-      created.controls.emit(entry.id, describe(entry, index, false))
-
-      return describe(entry, index, false)
+      return createNode(details)
     },
-    move: async (id, destination) => {
-      const entry = modifiable(id)
-      const oldParent = find(entry.parentId ?? rootId)
-      const parent = destination.parentId === undefined ? oldParent : findParent(destination.parentId)
+    move: (id, destination) => {
+      if (destination.index !== undefined) checkInteger(moveSignature, ["destination", "index"], destination.index, 0)
 
-      if (parent.id === rootId) fail("Can't modify the root bookmark folders.")
-
-      if (within(parent, entry)) fail("Can't move a folder to itself or its descendant.")
-      const siblings = childrenOf(parent)
-      const oldIndex = childrenOf(oldParent).indexOf(entry.id)
-      const requested = destination.index ?? siblings.length
-
-      if (requested < 0 || requested > siblings.length) fail("Index out of bounds.")
-
-      // Like Chrome, an index in the same folder counts positions before the node is taken out.
-      if (parent === oldParent && (requested === oldIndex || requested === oldIndex + 1)) return describe(entry, oldIndex, false)
-      const index = parent === oldParent && requested > oldIndex ? requested - 1 : requested
-      childrenOf(oldParent).splice(oldIndex, 1)
-      siblings.splice(index, 0, entry.id)
-      entry.parentId = parent.id
-      touch(oldParent)
-      touch(parent)
-      moved.controls.emit(entry.id, { parentId: parent.id, index, oldParentId: oldParent.id, oldIndex })
-
-      return describe(entry, index, false)
+      return moveNode(id, destination)
     },
     update: async (id, changes) => {
       // Chrome validates the URL before looking the node up.
@@ -284,9 +361,11 @@ export const makeBookmarks = (overrides: Partial<ChromeBookmarks.ChromeBookmarks
       const entry = modifiable(id)
 
       if (url !== undefined && entry.url === undefined) fail("Can't set URL of a bookmark folder.")
+      const reports: Array<() => void> = []
 
       const report = () => {
-        changed.controls.emit(entry.id, entry.url === undefined ? { title: entry.title } : { title: entry.title, url: entry.url })
+        const info: ChromeBookmarks.ChangeInfo = entry.url === undefined ? { title: entry.title } : { title: entry.title, url: entry.url }
+        reports.push(() => changed.controls.emit(entry.id, info))
       }
 
       // Chrome sets the title, then the URL, notifying for each that actually changed.
@@ -300,7 +379,10 @@ export const makeBookmarks = (overrides: Partial<ChromeBookmarks.ChromeBookmarks
         report()
       }
 
-      return node(entry, false)
+      const result = node(entry, false)
+      deliver(...reports)
+
+      return result
     },
     remove: async (id) => removeEntry(modifiable(id), false),
     removeTree: async (id) => removeEntry(modifiable(id), true),
@@ -340,7 +422,8 @@ export const makeBookmarks = (overrides: Partial<ChromeBookmarks.ChromeBookmarks
 
         // Assigned in place rather than spread, so very large folders stay within argument limits.
         childIds.forEach((id, index) => { children[index] = id })
-        childrenReordered.controls.emit(folderId, { childIds: [...childIds] })
+        const reorderInfo = { childIds: [...childIds] }
+        deliver(() => childrenReordered.controls.emit(folderId, reorderInfo))
       },
       onCreated: created.controls,
       onRemoved: removed.controls,
