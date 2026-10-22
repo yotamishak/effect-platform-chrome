@@ -13,6 +13,11 @@ export interface StorageArea {
   readonly get: (keys: string | null) => Promise<Record<string, unknown>>
   readonly set: (items: Record<string, unknown>) => Promise<void>
   readonly remove: (keys: string | Array<string>) => Promise<void>
+  /**
+   * Chrome 130+. When present, `size` and `clear` list keys with it instead of reading
+   * every value in the area; without it they fall back to `get(null)`.
+   */
+  readonly getKeys?: () => Promise<Array<string>>
 }
 
 export interface Options {
@@ -48,7 +53,8 @@ const storageError = (method: string, cause: unknown, key?: string) => {
  * Missing keys return undefined. Like Effect's memory store, get reads binary
  * values as base64 and getUint8Array reads strings as UTF-8. Invalid envelopes
  * fail with KeyValueStoreError; has and size report physical key existence.
- * clear only removes namespaced keys, never calls StorageArea.clear.
+ * clear only removes namespaced keys, never calls StorageArea.clear. size and clear
+ * list keys with getKeys where the browser has it (Chrome 130+), else read the area.
  */
 export const make = (area: StorageArea, options: Options = {}): KeyValueStore.KeyValueStore => {
   const namespace = options.namespace ?? defaultNamespace
@@ -57,6 +63,12 @@ export const make = (area: StorageArea, options: Options = {}): KeyValueStore.Ke
 
   const attempt = <A>(method: string, run: () => Promise<A>, key?: string) =>
     Effect.tryPromise({ try: run, catch: (cause) => storageError(method, cause, key) })
+
+  const namespacedKeys = async () => {
+    const keys = area.getKeys === undefined ? Object.keys(await area.get(null)) : await area.getKeys()
+
+    return keys.filter((key) => key.startsWith(prefix))
+  }
 
   const read = (method: string, key: string) => attempt(method, async () => {
     const name = encodedKey(key)
@@ -86,12 +98,11 @@ export const make = (area: StorageArea, options: Options = {}): KeyValueStore.Ke
       return Object.hasOwn(await area.get(name), name)
     }, key),
     clear: attempt("clear", async () => {
-      const keys = Object.keys(await area.get(null)).filter((key) => key.startsWith(prefix))
+      const keys = await namespacedKeys()
 
       if (keys.length > 0) await area.remove(keys)
     }),
-    size: attempt("size", async () =>
-      Object.keys(await area.get(null)).filter((key) => key.startsWith(prefix)).length)
+    size: attempt("size", async () => (await namespacedKeys()).length)
   })
 }
 

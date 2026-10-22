@@ -27,7 +27,7 @@ const equal = (left: unknown, right: unknown): boolean => {
     b.some(([otherKey, otherValue]) => key === otherKey && equal(value, otherValue)))
 }
 
-export type StorageOperation = "get" | "getBytesInUse" | "set" | "remove" | "clear" | "setAccessLevel"
+export type StorageOperation = "get" | "getBytesInUse" | "getKeys" | "set" | "remove" | "clear" | "setAccessLevel"
 
 type Changes = Record<string, chrome.storage.StorageChange>
 
@@ -121,8 +121,14 @@ export const makeStorage = () => {
       return bytes
     }
 
+    const getKeys = async (): Promise<Array<string>> => {
+      check(name, "getKeys")
+
+      return Array.from(values.keys())
+    }
+
     const writable = {
-      get, getBytesInUse, onChanged: event.api,
+      get, getBytesInUse, getKeys, onChanged: event.api,
       set: async (items: ChromeStorage.Items): Promise<void> => {
         check(name, "set")
         update(items, false, true)
@@ -168,6 +174,7 @@ export const makeStorage = () => {
     managed: {
       get: areas.managed.writable.get,
       getBytesInUse: areas.managed.writable.getBytesInUse,
+      getKeys: areas.managed.writable.getKeys,
       onChanged: areas.managed.writable.onChanged
     },
     onChanged: globalEvent.api

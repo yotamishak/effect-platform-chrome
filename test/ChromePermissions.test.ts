@@ -330,4 +330,27 @@ describe("ChromePermissions", () => {
       return yield* service.getAll
     }).pipe(Effect.provide(layerLive))).toBe(permissions)
   }))
+
+  it.effect("adds and removes host access requests lazily", () => Effect.gen(function*() {
+    const addHostAccessRequest = vi.fn(async (_request: chrome.permissions.AddHostAccessRequest) => {})
+    const removeHostAccessRequest = vi.fn(async (_request: chrome.permissions.RemoveHostAccessRequest) => {})
+    const service = make({ ...mockApi(), addHostAccessRequest, removeHostAccessRequest })
+    const add = service.addHostAccessRequest({ tabId: 7, pattern: "https://example.com/*" })
+    expect(addHostAccessRequest).not.toHaveBeenCalled()
+    yield* add
+    yield* service.removeHostAccessRequest({ documentId: "doc", pattern: "https://example.com/*" })
+    expect(addHostAccessRequest).toHaveBeenCalledExactlyOnceWith({ tabId: 7, pattern: "https://example.com/*" })
+    expect(removeHostAccessRequest).toHaveBeenCalledExactlyOnceWith({ documentId: "doc", pattern: "https://example.com/*" })
+    const cause = new Error("Extension cannot request access to this host.")
+    addHostAccessRequest.mockRejectedValueOnce(cause)
+    const error = yield* Effect.flip(service.addHostAccessRequest({ tabId: 7 }))
+    expect(error).toBeInstanceOf(ChromePermissionsError)
+    expect(error).toMatchObject({ operation: "addHostAccessRequest", cause })
+  }))
+
+  it.effect("types host access request members absent before Chrome 133", () => Effect.gen(function*() {
+    const service = make(mockApi())
+    expect(yield* Effect.flip(service.addHostAccessRequest({ tabId: 1 }))).toMatchObject({ operation: "addHostAccessRequest" })
+    expect(yield* Effect.flip(service.removeHostAccessRequest({ tabId: 1 }))).toMatchObject({ operation: "removeHostAccessRequest" })
+  }))
 })

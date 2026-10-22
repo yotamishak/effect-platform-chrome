@@ -4,6 +4,7 @@ import { Effect, Fiber, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeStorage, ChromeStorageError, changeBufferSize, layer, make } from "../src/ChromeStorage.js"
 import * as ChromeStorageModule from "../src/ChromeStorage.js"
+import { makeStorage } from "../src/testing/Storage.js"
 
 const fixture = () => {
   type Listener = (changes: Record<string, chrome.storage.StorageChange>, area: chrome.storage.AreaName) => void
@@ -281,4 +282,34 @@ describe("ChromeStorage", () => {
   it("names the live layer layerLive, as the other modules do", () => {
     expect(ChromeStorageModule.layerLive).toBe(layer)
   })
+
+  it.effect.each(["local", "sync", "session", "managed"] as const)("lists %s keys lazily and types a missing or rejected getKeys", (name) => Effect.gen(function*() {
+    const { raw } = fixture()
+    const getKeys = vi.fn(async () => ["a", "b"])
+    const storage = make({ ...raw, [name]: { ...raw[name], getKeys } })
+    const keys = storage[name].getKeys
+    expect(getKeys).not.toHaveBeenCalled()
+    expect(yield* keys).toEqual(["a", "b"])
+    expect(raw[name].get).not.toHaveBeenCalled()
+    const cause = new Error("getKeys failed")
+    getKeys.mockRejectedValueOnce(cause)
+    expect(yield* Effect.flip(keys)).toMatchObject({ area: name, operation: "getKeys", cause })
+    const missing = yield* Effect.flip(make(raw)[name].getKeys)
+    expect(missing).toBeInstanceOf(ChromeStorageError)
+    expect(missing).toMatchObject({ area: name, operation: "getKeys" })
+  }))
+
+  it.effect("lists fixture keys for every area and injects getKeys failures", () => Effect.gen(function*() {
+    const fixture = makeStorage()
+    const storage = make(fixture.api)
+    yield* storage.local.set({ b: 2, a: 1 })
+    fixture.controls.seed("managed", { policy: true })
+    expect(yield* storage.local.getKeys).toEqual(["b", "a"])
+    expect(yield* storage.managed.getKeys).toEqual(["policy"])
+    expect(yield* storage.session.getKeys).toEqual([])
+    const cause = new Error("quota")
+    fixture.controls.failNext("sync", "getKeys", cause)
+    expect(yield* Effect.flip(storage.sync.getKeys)).toMatchObject({ area: "sync", operation: "getKeys", cause })
+    expect(yield* storage.sync.getKeys).toEqual([])
+  }))
 })

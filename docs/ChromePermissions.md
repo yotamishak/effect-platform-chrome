@@ -91,7 +91,40 @@ Worker startup buffering follows `ChromeServiceWorker`'s bounded startup queue,
 not the streams' sliding buffer. Chrome can terminate workers without finalizers;
 these events and buffers are not durable history. Recheck `getAll`/`contains` before
 permission-dependent work, and handle revocation races in the relevant API call.
-No host-access request UI APIs are included.
+
+## Host access requests
+
+`addHostAccessRequest(request)` and `removeHostAccessRequest(request)` (Chrome 133+)
+are lazy Effects over Chrome's host access request UI. Adding a request asks Chrome
+to signal, in the toolbar and extensions menu, that the extension wants access to the
+site in a tab; the user accepting it grants persistent access to that site's top
+origin. Unlike `request`, no user gesture is needed and nothing is granted by the call.
+
+- Address the request with `tabId` or `documentId` (a top-level document), and
+  optionally a URL `pattern` limiting where it shows. A new request for a tab replaces
+  the existing one; Chrome removes it when the tab navigates cross-origin.
+- `removeHostAccessRequest` withdraws a request for the same tab or document; a given
+  `pattern` must match the added one exactly.
+- Chrome only signals hosts the extension can be granted (declared in
+  `host_permissions` or `optional_host_permissions` and currently withheld). Its
+  rejections become `ChromePermissionsError` with the method name as `operation`.
+- Both members are optional in `ChromePermissionsApi` so injected APIs without them
+  still fit. When Chrome (before 133) or an injected API lacks one, calling it fails
+  with a typed `ChromePermissionsError` rather than throwing.
+
+Watch `onAdded` (or recheck `contains`) to learn when the user accepts.
+
+```ts
+import { Effect } from "effect"
+import * as ChromePermissions from "effect-platform-chrome/ChromePermissions"
+
+const askForSite = (tabId: number) => Effect.gen(function*() {
+  const permissions = yield* ChromePermissions.ChromePermissions
+  const granted = yield* permissions.contains({ origins: ["https://example.com/*"] })
+
+  if (!granted) yield* permissions.addHostAccessRequest({ tabId, pattern: "https://example.com/*" })
+})
+```
 
 ## Stress coverage
 

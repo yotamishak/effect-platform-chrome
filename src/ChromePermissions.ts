@@ -7,7 +7,11 @@ export class ChromePermissionsError extends Schema.TaggedError<ChromePermissions
   cause: Schema.Defect()
 }) {}
 
-/** Promise-based MV3 permissions subset; no host-access UI APIs. */
+/**
+ * Promise-based MV3 permissions subset. The host access request members are Chrome 133+;
+ * they are optional so injected APIs without them still fit, and calling one that is
+ * absent fails with the typed error.
+ */
 export interface ChromePermissionsApi {
   getAll(): Promise<chrome.permissions.Permissions>
   contains(permissions: chrome.permissions.Permissions): Promise<boolean>
@@ -15,6 +19,8 @@ export interface ChromePermissionsApi {
   remove(permissions: chrome.permissions.Permissions): Promise<boolean>
   readonly onAdded: Pick<typeof chrome.permissions.onAdded, "addListener" | "removeListener">
   readonly onRemoved: Pick<typeof chrome.permissions.onRemoved, "addListener" | "removeListener">
+  readonly addHostAccessRequest?: (request: chrome.permissions.AddHostAccessRequest) => Promise<void>
+  readonly removeHostAccessRequest?: (request: chrome.permissions.RemoveHostAccessRequest) => Promise<void>
 }
 
 export interface ChromePermissionsService {
@@ -27,11 +33,22 @@ export interface ChromePermissionsService {
   readonly remove: (permissions: chrome.permissions.Permissions) => Effect.Effect<boolean, ChromePermissionsError>
   readonly onAdded: Stream.Stream<chrome.permissions.Permissions, ChromePermissionsError>
   readonly onRemoved: Stream.Stream<chrome.permissions.Permissions, ChromePermissionsError>
+  /**
+   * Chrome 133+: signals in the toolbar that the extension wants access to the site in a
+   * tab (or document); accepting grants persistent access to its top origin. Needs no user
+   * gesture. Chrome rejects hosts the extension cannot be granted, and resets the request
+   * on cross-origin navigation.
+   */
+  readonly addHostAccessRequest: (request: chrome.permissions.AddHostAccessRequest) => Effect.Effect<void, ChromePermissionsError>
+  /** Chrome 133+: withdraws a request added for the same tab or document and exact pattern. */
+  readonly removeHostAccessRequest: (request: chrome.permissions.RemoveHostAccessRequest) => Effect.Effect<void, ChromePermissionsError>
 }
 
 export class ChromePermissions extends Context.Service<ChromePermissions, ChromePermissionsService>()("effect-platform-chrome/ChromePermissions") {}
 
 const invoke = invoker((operation, cause) => new ChromePermissionsError({ operation, cause }))
+
+const unavailable = (operation: string) => new Error(`permissions.${operation} is unavailable`)
 
 /** Attach both settlement handlers immediately, even if the returned Effect is never run. */
 const requestImmediately = (
@@ -68,7 +85,13 @@ export const make = (api: ChromePermissionsApi): ChromePermissionsService => Chr
   requestFromUserGesture: (permissions) => requestImmediately(api, permissions),
   remove: (permissions) => invoke("remove", () => api.remove(permissions)),
   onAdded: permissionEvents("onAdded", () => api.onAdded),
-  onRemoved: permissionEvents("onRemoved", () => api.onRemoved)
+  onRemoved: permissionEvents("onRemoved", () => api.onRemoved),
+  addHostAccessRequest: (request) => invoke("addHostAccessRequest", () => api.addHostAccessRequest === undefined
+    ? Promise.reject(unavailable("addHostAccessRequest"))
+    : api.addHostAccessRequest(request)),
+  removeHostAccessRequest: (request) => invoke("removeHostAccessRequest", () => api.removeHostAccessRequest === undefined
+    ? Promise.reject(unavailable("removeHostAccessRequest"))
+    : api.removeHostAccessRequest(request))
 })
 
 export const layer = (api: ChromePermissionsApi): Layer.Layer<ChromePermissions> => Layer.succeed(ChromePermissions, make(api))

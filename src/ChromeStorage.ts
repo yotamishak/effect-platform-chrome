@@ -22,13 +22,15 @@ export interface StorageAreaApi {
   readonly clear: () => Promise<void>
   /** Optional so injected APIs without it still fit; calling it then fails with a typed error. */
   readonly setAccessLevel?: (options: { readonly accessLevel: AccessLevel }) => Promise<void>
+  /** Chrome 130+. Optional like `setAccessLevel`; absent, `getKeys` fails with a typed error. */
+  readonly getKeys?: () => Promise<Array<string>>
 }
 
 export interface StorageApi {
   readonly local: StorageAreaApi
   readonly sync: StorageAreaApi
   readonly session: StorageAreaApi
-  readonly managed: Pick<StorageAreaApi, "get" | "getBytesInUse">
+  readonly managed: Pick<StorageAreaApi, "get" | "getBytesInUse" | "getKeys">
   readonly onChanged: Pick<typeof chrome.storage.onChanged, "addListener" | "removeListener">
 }
 
@@ -53,6 +55,11 @@ export interface ReadOnlyArea {
   readonly area: AreaName
   readonly get: (keys?: GetKeys) => Effect.Effect<Items, ChromeStorageError>
   readonly getBytesInUse: (keys?: Keys) => Effect.Effect<number, ChromeStorageError>
+  /**
+   * Every key in the area, without reading values. Needs Chrome 130+; earlier browsers
+   * fail with a typed error, so fall back to `get()` where they must be supported.
+   */
+  readonly getKeys: Effect.Effect<Array<string>, ChromeStorageError>
   readonly onChanged: Stream.Stream<Change, ChromeStorageError>
 }
 
@@ -103,6 +110,13 @@ export const make = (api: StorageApi): Service => {
     area,
     get: (keys = null) => call(area, "get", () => api[area].get(keys)),
     getBytesInUse: (keys = null) => call(area, "getBytesInUse", () => api[area].getBytesInUse(keys)),
+    getKeys: call(area, "getKeys", () => {
+      const target = api[area]
+
+      return target.getKeys === undefined
+        ? Promise.reject(new Error(`storage.${area}.getKeys is unavailable`))
+        : target.getKeys()
+    }),
     onChanged: changes(area)
   })
 
