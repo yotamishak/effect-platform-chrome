@@ -475,6 +475,36 @@ describe("ChromeManagement", () => {
     expect(read).toHaveBeenCalledOnce()
   }))
 
+  // "management" may be an optional permission: Chrome adds the gated members when it is granted
+  // and removes them when it is revoked, on the namespace the service already holds.
+  it.effect("reads each member when its call or stream runs, following a later grant or revocation", () => Effect.gen(function*() {
+    const mock = mockApi()
+
+    const api: ChromeManagementApi = {
+      getSelf: mock.api.getSelf, getPermissionWarningsByManifest: mock.api.getPermissionWarningsByManifest, uninstallSelf: mock.api.uninstallSelf
+    }
+
+    const management = make(api)
+    const getAll = management.getAll
+    const disabled = Stream.runCollect(Stream.take(management.onDisabled, 1))
+    expect(yield* Effect.flip(getAll)).toMatchObject({ operation: "getAll" })
+    expect(yield* Effect.flip(disabled)).toMatchObject({ operation: "onDisabled" })
+    expect(yield* Effect.flip(management.setEnabledFromUserGesture(info.id, false))).toMatchObject({ operation: "setEnabled" })
+    Object.assign(api, mock.api)
+    expect(yield* getAll).toEqual([info, app])
+    yield* management.setEnabledFromUserGesture(info.id, false)
+    expect(mock.api.setEnabled).toHaveBeenCalledExactlyOnceWith(info.id, false)
+    const fiber = yield* Effect.forkChild(disabled)
+    yield* Effect.promise(() => mock.events.onDisabled.waitForListener())
+    mock.events.onDisabled.emit(info)
+    expect(yield* Fiber.join(fiber)).toEqual([info])
+    Reflect.deleteProperty(api, "getAll")
+    Reflect.deleteProperty(api, "onDisabled")
+    expect(yield* Effect.flip(getAll)).toMatchObject({ operation: "getAll" })
+    expect(yield* Effect.flip(disabled)).toMatchObject({ operation: "onDisabled" })
+    expect(mock.api.getAll).toHaveBeenCalledOnce()
+  }))
+
   it.effect("keeps interruption of a lazy call from becoming a typed error", () => Effect.gen(function*() {
     const { api } = mockApi()
     api.getAll.mockImplementationOnce(() => new Promise(() => {}))
@@ -558,6 +588,32 @@ describe("makeManagement", () => {
     for (const manifestObject of [{}, { name: "x", version: "1" }, { ...valid, manifest_version: "3" }, { ...valid, permissions: "tabs" }]) {
       expect(message(yield* Effect.flip(service.getPermissionWarningsByManifest(JSON.stringify(manifestObject)))))
         .toBe("Failed to create extension from manifest.")
+    }
+  }))
+
+  it.effect("validates a manifest's name, version and manifest_version as Chrome does", () => Effect.gen(function*() {
+    const { service } = fixture()
+    const valid = { name: "x", version: "1", manifest_version: 3 }
+
+    const rejected = [
+      { ...valid, name: "" }, { ...valid, name: 3 }, { ...valid, version: "" }, { ...valid, version: "1.0.0.0.0" },
+      { ...valid, version: "1.a" }, { ...valid, version: "01.0" }, { ...valid, version: "1..0" }, { ...valid, version: "-1" },
+      { ...valid, version: "1.4294967296" }, { ...valid, version: 1 }, { ...valid, manifest_version: 1 },
+      { ...valid, manifest_version: 2.5 }, { ...valid, manifest_version: 0 }
+    ]
+
+    for (const manifestObject of rejected) {
+      const error = yield* Effect.flip(service.getPermissionWarningsByManifest(JSON.stringify(manifestObject)))
+      expect(message(error), JSON.stringify(manifestObject)).toBe("Failed to create extension from manifest.")
+    }
+
+    const accepted = [
+      valid, { ...valid, name: "   " }, { ...valid, version: "0" }, { ...valid, version: "1.02.3.4" },
+      { ...valid, version: "4294967295.0" }, { ...valid, manifest_version: 2 }, { ...valid, manifest_version: 4 }
+    ]
+
+    for (const manifestObject of accepted) {
+      expect(yield* service.getPermissionWarningsByManifest(JSON.stringify(manifestObject))).toEqual([])
     }
   }))
 
@@ -785,6 +841,42 @@ describe("makeManagement", () => {
 
     yield* nested
     expect(controls.shortcuts).toEqual([extensionId(2)])
+  }))
+
+  it.effect("keeps its own copy of the seeded self entry", () => Effect.gen(function*() {
+    const permissions = ["storage"]
+    const { service, controls } = fixture({ self: { name: "Me", permissions } })
+    permissions.push("tabs")
+    expect((yield* service.getSelf).permissions).toEqual(["storage"])
+    expect(controls.self?.permissions).toEqual(["storage"])
+  }))
+
+  it.effect("never gives a generated app the id of an installed item", () => Effect.gen(function*() {
+    const taken = extensionInfo(extensionId(0x10001), { name: "Taken" })
+    const { service, controls } = fixture({ installed: [taken] })
+    const generated = yield* controls.withUserGesture(() => service.generateAppForLinkFromUserGesture("https://example.com/", "Example"))
+    expect(generated.id).not.toBe(taken.id)
+    expect(controls.item(taken.id)).toEqual(taken)
+    expect(controls.ids).toEqual([extensionId(0), taken.id, generated.id])
+  }))
+
+  it.effect("acts on the state an accepted re-enable prompt finds", () => Effect.gen(function*() {
+    const { api, service, controls } = fixture()
+    const enabled: Array<string> = []
+    api.onEnabled?.addListener((item) => { enabled.push(item.id) })
+    controls.answerDialogs("hold")
+    controls.setEnabled(extensionId(1), false, "permissions_increase")
+    const raced = controls.withUserGesture(() => service.setEnabledFromUserGesture(extensionId(1), true))
+    controls.setEnabled(extensionId(1), true)
+    controls.answerDialog(true)
+    yield* raced
+    expect(enabled).toHaveLength(1)
+    controls.setEnabled(extensionId(1), false, "permissions_increase")
+    const removed = controls.withUserGesture(() => service.setEnabledFromUserGesture(extensionId(1), true))
+    controls.uninstall(extensionId(1))
+    controls.answerDialog(true)
+    expect(String((yield* Effect.flip(removed)).cause)).toBe(`Error: Failed to find extension with id ${extensionId(1)}.`)
+    expect(enabled).toHaveLength(1)
   }))
 
   it.effect("replaces members through overrides and provides its layer", () => Effect.gen(function*() {

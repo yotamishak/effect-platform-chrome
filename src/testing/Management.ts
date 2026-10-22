@@ -74,11 +74,18 @@ const notAnApp = (id: string): never => fail(`Extension ${id} is not an App.`)
 
 const contextInvalidated = "Extension context invalidated."
 
-/** The manifest fields the warnings model reads; Chrome requires name, version and manifest_version. */
+/** A `base::Version` with at most four parts: unsigned 32-bit integers, the first without leading zeros. */
+const isExtensionVersion = (version: string): boolean => /^(0|[1-9]\d*)(\.\d+){0,3}$/.test(version) &&
+  version.split(".").every((part) => Number(part) <= 0xFFFF_FFFF)
+
+/**
+ * The manifest fields the warnings model reads. Chrome requires a non-empty name, a valid
+ * version, and an integer manifest_version of at least 2 (later versions load with a warning).
+ */
 const Manifest = Schema.Struct({
-  name: Schema.String,
-  version: Schema.String,
-  manifest_version: Schema.Finite,
+  name: Schema.NonEmptyString,
+  version: Schema.String.check(Schema.makeFilter(isExtensionVersion)),
+  manifest_version: Schema.Int.check(Schema.isGreaterThanOrEqualTo(2)),
   permissions: Schema.optionalKey(Schema.Array(Schema.Unknown)),
   host_permissions: Schema.optionalKey(Schema.Array(Schema.Unknown))
 })
@@ -121,13 +128,15 @@ const disabledCopy = (info: ExtensionInfo, reason: DisabledReason): ExtensionInf
  * entry; setting an item to its current state changes nothing and emits nothing.
  * `uninstallSelf` (and `uninstall` of the extension's own id) removes the extension and,
  * unlike Chrome, resolves; afterwards every call rejects with "Extension context
- * invalidated." `getPermissionWarningsByManifest` parses strict JSON and reports one warning
- * per listed permission and host pattern found in `warnings`, in manifest order (Chrome's
- * merging of overlapping warnings is not modelled). Launched apps, created shortcuts and
+ * invalidated." `getPermissionWarningsByManifest` parses strict JSON, rejects a manifest
+ * Chrome could not load (an empty name, a version that is not 1–4 dot-separated integers,
+ * a manifest_version that is not an integer of at least 2), and reports one warning per
+ * listed permission and host pattern found in `warnings`, in manifest order (Chrome's
+ * merging of overlapping warnings is not modelled). Generated apps never take an installed id. Launched apps, created shortcuts and
  * replacement web app launches are recorded in `controls`.
  */
 export const makeManagement = (options: ManagementOptions = {}) => {
-  const self = extensionInfo(options.self?.id ?? extensionId(0), options.self)
+  const self = extensionInfo(options.self?.id ?? extensionId(0), structuredClone(options.self))
   const items = new Map<string, ExtensionInfo>([[self.id, self]])
   const warnings = options.warnings ?? new Map<string, string>()
   const installed = TestEvent.makeEvent<[ExtensionInfo]>()
@@ -313,7 +322,9 @@ export const makeManagement = (options: ManagementOptions = {}) => {
 
       if (title === "") fail("The title can not be empty.")
 
-      generated++
+      // Skip ids already in use, so a generated app never replaces a seeded or installed item.
+      do generated++
+      while (items.has(extensionId(0x10000 + generated)))
 
       const app = extensionInfo(extensionId(0x10000 + generated), {
         name: title, type: "hosted_app", appLaunchUrl: url, launchType: "OPEN_AS_WINDOW",

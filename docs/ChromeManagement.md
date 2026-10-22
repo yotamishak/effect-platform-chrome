@@ -82,7 +82,8 @@ extension's own install and update, use `ChromeRuntime`.
   gated members as Chrome does; `replacementWebApp` adds `installReplacementWebApp`;
   `warnings` maps permissions and host patterns to warning text.
 - Calls fail with Chrome's messages for unknown ids, items the user may not modify,
-  app-only calls on non-apps, unavailable launch types, invalid links and missing gestures.
+  app-only calls on non-apps, unavailable launch types, invalid links, manifests Chrome
+  could not load and missing gestures.
 - `controls.withUserGesture(run)` makes the calls `run` starts synchronously count as a
   gesture, so it tells `uninstallFromUserGesture` apart from a lazy `uninstall` run later.
 - Dialogs accept by default; `controls.answerDialogs("cancel" | "hold")` changes that, and

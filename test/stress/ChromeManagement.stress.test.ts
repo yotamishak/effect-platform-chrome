@@ -747,6 +747,31 @@ describe("ChromeManagement fixture stress", () => {
     expect(controls.ids).toEqual([extensionId(0)])
   }))
 
+  it.effect("generates 1,024 apps around 512 seeded items in the generated id range without replacing any", () => Effect.gen(function*() {
+    const random = seeded(512)
+    const taken = new Set<number>()
+
+    while (taken.size < 512) taken.add(0x10001 + Math.floor(random() * 1536))
+
+    const installed = Array.from(taken, (index) => extensionInfo(extensionId(index), { name: `Seeded ${index}` }))
+    const { api, controls } = makeManagement({ installed })
+    const management = make(api)
+
+    const outcomes = controls.withUserGesture(() => Array.from({ length: 1024 }, (_, index) =>
+      management.generateAppForLinkFromUserGesture(`https://example.com/${index}`, `App ${index}`)))
+
+    const apps = yield* Effect.all(outcomes, { concurrency: "unbounded" })
+    const generatedIds = new Set(apps.map((generated) => generated.id))
+    expect(generatedIds.size).toBe(1024)
+
+    for (const item of installed) {
+      expect(generatedIds.has(item.id)).toBe(false)
+      expect(controls.item(item.id)).toEqual(item)
+    }
+
+    expect(controls.ids).toHaveLength(1 + 512 + 1024)
+  }))
+
   it.effect("answers 1,024 held dialogs out of a seeded mix of accepts and cancels", () => Effect.gen(function*() {
     const random = seeded(1024)
     const installed = Array.from({ length: 1024 }, (_, index) => extensionInfo(extensionId(index + 1)))
