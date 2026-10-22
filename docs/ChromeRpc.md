@@ -53,8 +53,6 @@ const handlers = Api.toLayer({
 const worker = ChromeServiceWorker.start({
   chrome,
   layer: Layer.empty,
-  selectMessage: () => false,
-  onMessage: () => Effect.void,
   onConnect: (port) => port.name === "example-rpc"
     ? ChromeRpc.serve(chrome.runtime, port, "owned", Api).pipe(Effect.provide(handlers))
     : Effect.void
@@ -64,7 +62,12 @@ const worker = ChromeServiceWorker.start({
 ```
 
 `serve` completes on disconnect, interrupts all connection handlers and closes
-the connection scope. For manual integration, `makeServerProtocol` returns the
+the connection scope. That differs from `runtime.sendMessage`, whose listener
+always runs to completion after its sender goes away. Wrap handlers whose work
+must outlive the caller (an upload, a sign-in, a write) in `finishAccepted`:
+`Api.toLayer(ChromeRpc.finishAccepted(handlers))`. Each Effect result then runs
+in a detached fiber; a disconnect interrupts only the wait, and the reply is
+dropped. Stream results are left as they are. For manual integration, `makeServerProtocol` returns the
 native Effect protocol plus a `closed: Effect<void>` notification. Run
 `RpcServer.make(Api)` with that protocol and race it against `closed` within the
 same scope. `layerServer` provides just the standard protocol; its enclosing scope
@@ -93,8 +96,24 @@ export const program = Effect.scoped(Effect.gen(function*() {
 `layerClient` also provides the standard protocol. Use exactly **one**
 `RpcClient.make` per acquired protocol; use another native port for another
 client. Clients and servers must remain inside the protocol's owning scope.
-Readiness has no intrinsic deadline; bound calls or your whole session with
-Effect timeout when an unavailable server must not wait indefinitely.
+Readiness has no deadline by default. Set `Options.readyTimeout` to fail the
+transport (and every waiting call) when no Pong arrives in time. Chrome connects a
+port when any script in the target listens on `onConnect`, so a `tabs.connect` port
+reaching a frame where only listeners for other port names run is never answered.
+Independently, bound calls with Effect timeout when a slow handler must not hold
+the caller.
+
+## Wire format
+
+Frames are JSON strings from `RpcSerialization.json`: `{"_tag":"Ping"}` and
+`{"_tag":"Pong"}` for readiness, `{"_tag":"Request","id","tag","payload","headers"}`
+and `{"_tag":"Exit","requestId","exit"}` for calls. Two details matter to anything
+that speaks the format by hand (a test harness, another language):
+
+- A procedure without a payload sends `payload: null`. Declare such procedures with
+  no `payload` rather than `payload: {}`, whose struct does not accept `null`.
+- Effect's JSON codecs write a present-but-undefined optional field as `null` and
+  read it back as absent, so typed clients and servers round-trip it.
 Cancellation before readiness does not send `Interrupt`: its request never
 reached the peer, and waiting for Pong from a dead peer would hang cancellation.
 

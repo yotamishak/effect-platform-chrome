@@ -1,6 +1,6 @@
 // Effect 4.0.4 RPC protocols are intentionally unstable; this adapter targets that pinned API.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Cause, Data, Deferred, Effect, Layer, Predicate, Queue, Schema } from "effect"
+import { Cause, Data, Deferred, Duration, Effect, Fiber, Layer, Predicate, Queue, Schema } from "effect"
 import * as RpcClient from "effect/rpc/RpcClient"
 import { RpcClientDefect, RpcClientError } from "effect/rpc/RpcClientError"
 import * as RpcServer from "effect/rpc/RpcServer"
@@ -15,6 +15,12 @@ export interface Options {
   readonly capacity?: number
   /** Maximum JSON frame length in UTF-16 code units (default 1 MiB). */
   readonly maxFrameLength?: number
+  /**
+   * Client only: how long to wait for the server's Pong before failing the transport (default:
+   * forever). Chrome connects a port when any script in the target listens on `onConnect`, so a
+   * port that reaches only listeners for other names is never answered.
+   */
+  readonly readyTimeout?: Duration.Input
 }
 
 /** Acquisition, disconnect, serialization, and buffer-limit failures. */
@@ -192,6 +198,21 @@ export const makeClientProtocol = Effect.fnUntraced(function*(
         }
       }).pipe(Effect.ignore, Effect.forkScoped)
 
+      const { readyTimeout } = options
+
+      if (readyTimeout !== undefined) {
+        yield* Effect.gen(function*() {
+          yield* Effect.sleep(readyTimeout)
+
+          if (!(yield* Deferred.isDone(wire.ready))) {
+            wire.stop(new ChromeRpcError({
+              message: `Chrome RPC peer did not answer within ${Duration.format(Duration.fromInputUnsafe(readyTimeout))}`,
+              cause: undefined
+            }))
+          }
+        }).pipe(Effect.forkScoped)
+      }
+
       return yield* Effect.gen(function*() {
         while (true) {
           const frame = yield* Queue.take(wire.queue)
@@ -306,6 +327,39 @@ export const serve = Effect.fnUntraced(function*<Rpcs extends Rpc.Any>(
     Effect.provideService(RpcServer.Protocol, protocol), Effect.raceFirst(protocol.closed)
   )
 }, Effect.scoped)
+
+// Handlers are opaque here: finishAccepted re-hosts whatever each returns, and the caller's
+// RpcGroup types both sides.
+// oxlint-disable-next-line anti-slop/no-unknown-returns
+type Handler = (payload: never, options: never) => unknown
+
+/**
+ * Lets each handler's work run to completion when its caller disconnects; only the reply is
+ * lost. `serve` otherwise interrupts a connection's handlers when its port closes, unlike
+ * `runtime.sendMessage`, whose listener always finishes. Use it for handlers whose work must
+ * outlive the caller (an upload, a sign-in, a write), as in
+ * `Group.toLayer(ChromeRpc.finishAccepted(handlers))`. Effect results run in a detached fiber
+ * with the same success, error and requirements; stream results are left as they are.
+ */
+export const finishAccepted = <const Handlers extends { readonly [Tag in keyof Handlers]: Handler }>(
+  handlers: Handlers
+): Handlers => {
+  const finished = new Map<string, Handler>()
+
+  for (const [tag, handler] of Object.entries<Handler>(handlers)) {
+    finished.set(tag, (payload, handlerOptions) => {
+      const result = handler(payload, handlerOptions)
+
+      // The caller's group types the Effect; this only moves it to a detached fiber.
+      // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context
+      return Effect.isEffect(result) ? Effect.flatMap(Effect.forkDetach(result), Fiber.join) : result
+    })
+  }
+
+  // SAFETY: every entry keeps its tag and parameters; an Effect result keeps its success,
+  // error and requirement types, only moved to a detached fiber.
+  return Object.fromEntries(finished) as Handlers
+}
 
 /** Scoped client protocol layer; the port must be dedicated to this RPC connection. */
 export const layerClient = (api: RuntimeApi, port: NativePort, ownership: Ownership, options: Options = {}) =>

@@ -119,3 +119,6 @@ export const layer: Layer.Layer<ChromeAlarms, ChromeAlarmsError> = Layer.effect(
     catch: (cause) => new ChromeAlarmsError({ operation: "initialize", cause })
   })
 )
+
+/** The same live layer as `layer`, under the name the other modules use. */
+export const layerLive = layer

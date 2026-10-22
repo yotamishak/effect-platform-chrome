@@ -25,7 +25,7 @@ export type MessageListener = (
 
 export interface ChromeApis {
   readonly runtime: {
-    readonly onMessage: ChromeEvent<MessageListener>
+    readonly onMessage?: ChromeEvent<MessageListener>
     readonly onConnect?: ChromeEvent<(port: chrome.runtime.Port) => void>
     readonly onInstalled?: ChromeEvent<(details: chrome.runtime.InstalledDetails) => void>
     readonly onStartup?: ChromeEvent<() => void>
@@ -34,9 +34,13 @@ export interface ChromeApis {
 }
 
 export interface Handlers<R, E = never> {
-  /** Routing only, not validation. Must be synchronous; false leaves the channel unclaimed. */
-  readonly selectMessage: (message: unknown, sender: chrome.runtime.MessageSender) => boolean
-  readonly onMessage: (message: unknown, sender: chrome.runtime.MessageSender) => Effect.Effect<unknown, E, R>
+  /**
+   * One-off `runtime.sendMessage` handling; give both or neither. A worker whose messaging is
+   * all over ports (ChromeRpc) leaves both out, and no `onMessage` listener is installed.
+   * Routing only, not validation. Must be synchronous; false leaves the channel unclaimed.
+   */
+  readonly selectMessage?: (message: unknown, sender: chrome.runtime.MessageSender) => boolean
+  readonly onMessage?: (message: unknown, sender: chrome.runtime.MessageSender) => Effect.Effect<unknown, E, R>
   readonly onConnect?: (port: chrome.runtime.Port) => Effect.Effect<unknown, E, R>
   readonly onInstalled?: (details: chrome.runtime.InstalledDetails) => Effect.Effect<unknown, E, R>
   readonly onStartup?: () => Effect.Effect<unknown, E, R>
@@ -173,9 +177,12 @@ export const start = <R, ER, EI = never, EH = never>(options: Options<R, ER, EI,
     }
   }
 
-  const listener: MessageListener = (message, sender, sendResponse) => {
+  const messageListener = (
+    selectMessage: (message: unknown, sender: chrome.runtime.MessageSender) => boolean,
+    onMessage: (message: unknown, sender: chrome.runtime.MessageSender) => Effect.Effect<unknown, EH, R>
+  ): MessageListener => (message, sender, sendResponse) => {
     try {
-      if (!options.selectMessage(message, sender)) return false
+      if (!selectMessage(message, sender)) return false
     } catch (error) {
       report({ code: "HandlerFailed", message: String(error) })
 
@@ -195,14 +202,23 @@ export const start = <R, ER, EI = never, EH = never>(options: Options<R, ER, EI,
 
     const fail = (error: WorkerError): void => { respond({ ok: false, error }) }
 
-    submit(() => execute(() => options.onMessage(message, sender),
+    submit(() => execute(() => onMessage(message, sender),
       (value) => respond({ ok: true, value }), fail), fail)
 
     return true
   }
 
   try {
-    install(options.chrome.runtime.onMessage, listener)
+    const { selectMessage, onMessage } = options
+
+    if ((selectMessage === undefined) !== (onMessage === undefined)) {
+      throw new Error("selectMessage and onMessage must be configured together")
+    }
+
+    if (selectMessage !== undefined && onMessage !== undefined) {
+      if (!options.chrome.runtime.onMessage) throw new Error("Configured onMessage event is unavailable")
+      install(options.chrome.runtime.onMessage, messageListener(selectMessage, onMessage))
+    }
 
     if (options.onConnect) {
       if (!options.chrome.runtime.onConnect) throw new Error("Configured onConnect event is unavailable")

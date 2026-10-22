@@ -3,7 +3,7 @@
 Standalone TypeScript ESM library for **Effect v4** and **Chrome
 Manifest V3**, modeled after `@effect/platform-browser`.
 
-**Status:** initial implementation with twelve public modules and mocked behavior
+**Status:** initial implementation with seventeen public modules and mocked behavior
 tests. The library focuses on platform services rather than UI APIs.
 
 This is an independent community project, not an official Effect package.
@@ -148,7 +148,12 @@ CLI is not a library runtime dependency; use it only with trusted documentation.
 | [`ChromeSchemaStorage`](docs/ChromeSchemaStorage.md) | Schema validation, defaults, version migrations, and latest-state observation. |
 | [`ChromePermissions`](docs/ChromePermissions.md) | Permission checks, requests, revocation, and change events. |
 | [`ChromeScripting`](docs/ChromeScripting.md) | Typed script injection, CSS, and dynamic content-script registration. |
-| [`ChromeTesting`](docs/ChromeTesting.md) | Isolated storage fixtures, event simulators, and paired ports. |
+| `ChromeIdentity` | Web auth flows (`launchWebAuthFlow`) and the extension's OAuth redirect URL. |
+| `ChromeWebNavigation` | A tab's frames (`getAllFrames`, `getFrame`) and committed/history navigations. |
+| `ChromeCookies` | Reading, setting and removing cookies, including removing a cookie read from `getAll`. |
+| `ChromeNotifications` | Creating and clearing notifications, and their click/close events. |
+| `ChromeWindows` | Reading and updating windows, including bringing one to the front. |
+| [`ChromeTesting`](docs/ChromeTesting.md) | Isolated storage and tab fixtures, event simulators, and paired ports. |
 
 Modules use Effect v4 services, tagged errors, layers, and scoped streams.
 Manifest V3 wakeup listeners must
@@ -172,8 +177,10 @@ const program = Effect.gen(function* () {
 ```
 
 You can also import `effect-platform-chrome/ChromeStorage` directly.
-Storage, Runtime, and Alarms expose a live `layer`; Tabs exposes `layerLive`
-and injectable `layer(api)`; Port exposes these on its `ChromePort` service class.
+Every module with a Chrome global behind it exposes `layerLive`, which reads the
+global when the layer is built. Most also take an injected API through `make(api)`
+and `layer(api)`; Storage, Runtime and Alarms keep `layer` as another name for their
+live layer. Port exposes these on its `ChromePort` service class.
 KeyValueStore provides `layerLocal()`, `layerSync()`, and `layerSession()` with
 isolated namespaces. Importing modules does not access Chrome globals.
 

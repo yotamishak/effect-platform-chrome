@@ -1,5 +1,45 @@
 # Stress testing
 
+## Limits runner — 2026-10-22
+
+`examples/wxt` gained a limits runner (`popup/limits.ts`, `popup/limits-modules.ts`) that
+drives every module, including the five added for extension adopters, to the Chrome
+limit it meets in practice. It ran in two places:
+
+- headless Chrome for Testing (Playwright, which passes `--disable-ipc-flooding-protection`)
+  with a local stand-in for example.com: 27 of 29 stages passed, 2 skipped;
+- a real Chrome 155 profile on macOS, driven over its debugging connection: 27 passed,
+  0 failed, 2 skipped (capture without an `activeTab` grant, scripting without the optional
+  example.com access), in 22.5 s. The original stress runner passed alongside it with zero
+  errors.
+
+What Chrome itself turned out to enforce, as observed in that real profile:
+
+| Area | Observed |
+| --- | --- |
+| History updates | About 200 `pushState` calls per 10 s per frame; Chrome ignores the rest (one 500-call burst applied 98 to 298, depending on what the window had already used). Every applied update reached `onHistoryStateUpdated`, in order. Headless automation lifts the cap and delivers about 23 events/s. |
+| Cookies | 400 cookies on one host kept 152, including the newest |
+| Alarms | `An extension cannot have more than 500 active alarms.` |
+| Storage | `local`: `Resource::kQuotaBytes quota exceeded` at the 11th 1 MB item; `session`: `Session storage quota bytes exceeded`; `sync`: `Resource::kQuotaBytesPerItem quota exceeded` for a 9000-character item |
+| Capture | `captureVisibleTab` needs `<all_urls>` or `activeTab`, even on the extension's own pages |
+| webNavigation | Reports nothing for `chrome-extension://` pages, so frame targets have to be web pages |
+| Hidden pages | Chrome throttles a hidden runner page's timers: 10,000 redirect-URL lookups went from 29 ms to 2.2 s, and RPC readiness timeouts fired up to 3 s late |
+
+And what the library did at those limits:
+
+- `readyTimeout` (300 ms) failed every port that only an unrelated listener received, at
+  302–314 ms; a port to a frame with no listener failed in under 15 ms.
+- `finishAccepted`: 40 callers disconnected mid-call; all 40 wrapped handlers finished and
+  all 40 plain ones were interrupted.
+- RPC: 2048 concurrent calls on one port; a 1,000,000-character payload round-tripped and a
+  1,100,000-character one was refused before sending (`Invalid or oversized outbound RPC frame`).
+- Ports: 50 ports × 200 echoes with no loss under flow control; a 2000-message blast at one
+  port lost 120 (and 1060 on a throttled page) to the documented 64-message sliding
+  buffers, with what arrived in order and unduplicated.
+- Runtime messaging: 10,000 concurrent `sendMessage` round trips in about 1.4 s.
+- Schema storage: 256 subscribers all reached the last of 100 writes.
+
+
 ## Live Chrome observations — 2026-10-13
 
 Tested the WXT development extension through `agent-browser`, connected to the

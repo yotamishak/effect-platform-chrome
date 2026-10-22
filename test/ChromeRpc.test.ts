@@ -8,7 +8,7 @@ import * as RpcClient from "effect/rpc/RpcClient"
 import * as RpcServer from "effect/rpc/RpcServer"
 import * as RpcMessage from "effect/rpc/RpcMessage"
 import { TestClock } from "effect/testing"
-import { makeClientProtocol, makeServerProtocol, serve } from "../src/ChromeRpc.js"
+import { finishAccepted, makeClientProtocol, makeServerProtocol, serve } from "../src/ChromeRpc.js"
 import type { Options } from "../src/ChromeRpc.js"
 import type { NativePort, RuntimeApi } from "../src/ChromePort.js"
 
@@ -692,5 +692,61 @@ describe("ChromeRpc", () => {
     ports.close()
     yield* Fiber.join(server)
     expect(ports.serverMessages.size + ports.serverDisconnects.size).toBe(0)
+  }))
+
+  it.effect("readyTimeout fails waiting calls when nothing serves the port", () => Effect.gen(function*() {
+    const ports = pair()
+    const ping = yield* Deferred.make<void>()
+    ports.client.postMessage = () => { Deferred.doneUnsafe(ping, Effect.void) }
+
+    const protocol = yield* makeClientProtocol(ports.api, ports.client, "owned", { readyTimeout: "1 second" })
+    const client = yield* RpcClient.make(group).pipe(Effect.provideService(RpcClient.Protocol, protocol))
+    const call = yield* client.Echo({ value: "unanswered" }).pipe(Effect.forkScoped)
+    yield* Deferred.await(ping)
+    yield* TestClock.adjust("1 second")
+    const error = yield* Fiber.join(call).pipe(Effect.flip)
+    expect(error._tag).toBe("RpcClientError")
+    expect(String(Cause.squash(Cause.fail(error)))).toContain("did not answer within")
+    expect(ports.close).toHaveBeenCalled()
+  }))
+
+  it.effect("readyTimeout does not affect a peer that answers in time", () => Effect.gen(function*() {
+    const { client } = yield* connect(pair(), group.toLayer({
+      Echo: ({ value }) => Effect.succeed(value), Wait: () => Effect.never, Numbers: () => Stream.empty
+    }), { readyTimeout: "1 second" })
+
+    expect(yield* client.Echo({ value: "in time" })).toBe("in time")
+    yield* TestClock.adjust("2 seconds")
+    expect(yield* client.Echo({ value: "still connected" })).toBe("still connected")
+  }))
+
+  it.effect.each([false, true])("a caller's disconnect interrupts accepted work unless finishAccepted (finishAccepted=%s)", (finish) => Effect.gen(function*() {
+    const ports = pair()
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const finished = yield* Deferred.make<boolean>()
+
+    const handlers = {
+      Echo: ({ value }: { readonly value: string }) => Effect.succeed(value),
+      Wait: () => Deferred.succeed(started, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+        Effect.as("done"),
+        Effect.onExit((exit) => Deferred.succeed(finished, Exit.isSuccess(exit)))
+      ),
+      Numbers: () => Stream.empty
+    }
+
+    const server = yield* serve(ports.api, ports.server, "owned", group).pipe(
+      Effect.provide(group.toLayer(finish ? finishAccepted(handlers) : handlers)), Effect.forkScoped
+    )
+
+    const protocol = yield* makeClientProtocol(ports.api, ports.client, "owned")
+    const client = yield* RpcClient.make(group).pipe(Effect.provideService(RpcClient.Protocol, protocol))
+    yield* client.Wait().pipe(Effect.forkScoped)
+    yield* Deferred.await(started)
+    ports.close()
+    yield* Fiber.join(server)
+    yield* Deferred.succeed(release, undefined)
+    expect(yield* Deferred.await(finished)).toBe(finish)
   }))
 })

@@ -1,6 +1,7 @@
 import { Layer, Schema } from "effect"
 import * as ChromeStorage from "./ChromeStorage.js"
 import * as ChromePort from "./ChromePort.js"
+import * as ChromeTabs from "./ChromeTabs.js"
 
 // These are deliberately raw Chrome I/O boundaries: messages, stored values and
 // callback exceptions are unvalidated until a consumer applies its own schema.
@@ -106,7 +107,7 @@ const equal = (left: unknown, right: unknown): boolean => {
     b.some(([otherKey, otherValue]) => key === otherKey && equal(value, otherValue)))
 }
 
-export type StorageOperation = "get" | "getBytesInUse" | "set" | "remove" | "clear"
+export type StorageOperation = "get" | "getBytesInUse" | "set" | "remove" | "clear" | "setAccessLevel"
 
 type Changes = Record<string, chrome.storage.StorageChange>
 
@@ -123,6 +124,8 @@ export const makeStorage = () => {
 
   const area = (name: ChromeStorage.AreaName) => {
     const values = new Map<string, unknown>()
+    // Chrome's defaults: only session storage starts closed to content scripts.
+    let accessLevel: ChromeStorage.AccessLevel = name === "session" ? "TRUSTED_CONTEXTS" : "TRUSTED_AND_UNTRUSTED_CONTEXTS"
     const event = makeEvent<[Changes]>()
 
     const notify = (changes: Changes) => {
@@ -220,11 +223,20 @@ export const makeStorage = () => {
       clear: async (): Promise<void> => {
         check(name, "clear")
         update({}, true, true)
+      },
+      setAccessLevel: async (options: { readonly accessLevel: ChromeStorage.AccessLevel }): Promise<void> => {
+        check(name, "setAccessLevel")
+        accessLevel = options.accessLevel
       }
     }
     /* oxlint-enable anti-slop/no-runtime-typeof */
 
-    return { writable, event: event.controls, seed: (items: ChromeStorage.Items, emit = false) => update(items, true, emit) }
+    return {
+      writable,
+      event: event.controls,
+      accessLevel: () => accessLevel,
+      seed: (items: ChromeStorage.Items, emit = false) => update(items, true, emit)
+    }
   }
 
   const areas = { local: area("local"), sync: area("sync"), session: area("session"), managed: area("managed") }
@@ -254,6 +266,8 @@ export const makeStorage = () => {
         session: areas.session.event, managed: areas.managed.event
       },
       seed: (name: ChromeStorage.AreaName, items: ChromeStorage.Items, emit = false) => areas[name].seed(items, emit),
+      /** The area's current access level, as last set through `setAccessLevel`. */
+      accessLevel: (name: "local" | "sync" | "session") => areas[name].accessLevel(),
       failNext: (name: ChromeStorage.AreaName, operation: StorageOperation, cause: unknown) => {
         const key = `${name}:${operation}`
         const queue = failures.get(key) ?? []
@@ -362,6 +376,121 @@ export const makePortPair = (name = "") => {
         tasks.push(() => { left.notifyDisconnect(error) })
         tasks.push(() => { right.notifyDisconnect(error) })
       }
+    }
+  }
+}
+
+const blankTab = (id: number, properties: Partial<chrome.tabs.Tab>): chrome.tabs.Tab => ({
+  id, index: 0, windowId: 1, highlighted: false, active: true, pinned: false, incognito: false,
+  discarded: false, autoDiscardable: true, groupId: -1, frozen: false, selected: true, lastAccessed: 0,
+  ...properties
+})
+
+/** A connection a test opened with the fake `connect`; serve or answer it through `pair`. */
+export interface TabConnection {
+  readonly tabId: number
+  readonly connectInfo: chrome.tabs.ConnectInfo | undefined
+  readonly pair: ReturnType<typeof makePortPair>
+}
+
+/**
+ * An in-memory tab strip. Tabs keep the properties they were created or updated with;
+ * `query` matches `active`, `windowId` and exact `url`s. `sendMessage` fails as Chrome does
+ * with no receiver, `connect` returns one end of a port pair (the other end is in
+ * `controls.connections`), and `captureVisibleTab` returns an empty JPEG data URL. Pass
+ * `overrides` to replace any member, such as a `get` that models a slow navigation.
+ */
+export const makeTabs = (overrides: Partial<ChromeTabs.ChromeTabsApi> = {}) => {
+  const tabs = new Map<number, chrome.tabs.Tab>()
+  const connections: Array<TabConnection> = []
+  const created = makeEvent<[chrome.tabs.Tab]>()
+  const updated = makeEvent<[number, chrome.tabs.OnUpdatedInfo, chrome.tabs.Tab]>()
+  const removed = makeEvent<[number, chrome.tabs.OnRemovedInfo]>()
+  const activated = makeEvent<[chrome.tabs.OnActivatedInfo]>()
+  let nextId = 1
+
+  const find = (tabId: number): chrome.tabs.Tab => {
+    const tab = tabs.get(tabId)
+
+    if (tab === undefined) throw new Error(`No tab with id: ${tabId}.`)
+
+    return tab
+  }
+
+  const create = (properties: Partial<chrome.tabs.Tab> = {}): chrome.tabs.Tab => {
+    const tab = blankTab(nextId++, properties)
+    tabs.set(tab.id ?? 0, tab)
+    created.controls.emit(structuredClone(tab))
+
+    return structuredClone(tab)
+  }
+
+  const matches = (tab: chrome.tabs.Tab, info: chrome.tabs.QueryInfo): boolean =>
+    (info.active === undefined || tab.active === info.active)
+    && (info.windowId === undefined || tab.windowId === info.windowId)
+    && (info.url === undefined || [info.url].flat().includes(tab.url ?? ""))
+
+  const api: ChromeTabs.ChromeTabsApi = {
+    query: async (info) => Array.from(tabs.values(), (tab) => structuredClone(tab)).filter((tab) => matches(tab, info)),
+    get: async (tabId) => structuredClone(find(tabId)),
+    create: async (properties) => {
+      const tab: Partial<chrome.tabs.Tab> = { active: properties.active ?? true }
+
+      if (properties.url !== undefined) tab.url = properties.url
+
+      if (properties.windowId !== undefined) tab.windowId = properties.windowId
+
+      return create(tab)
+    },
+    update: async (tabId, properties) => {
+      const tab = find(tabId ?? -1)
+      const changeInfo: chrome.tabs.OnUpdatedInfo = {}
+
+      if (properties.url !== undefined) {
+        tab.url = properties.url
+        changeInfo.url = properties.url
+      }
+
+      if (properties.active !== undefined) tab.active = properties.active
+
+      updated.controls.emit(tab.id ?? 0, changeInfo, structuredClone(tab))
+
+      return structuredClone(tab)
+    },
+    remove: async (tabIds) => {
+      for (const tabId of [tabIds].flat()) {
+        const tab = find(tabId)
+        tabs.delete(tabId)
+        removed.controls.emit(tabId, { windowId: tab.windowId, isWindowClosing: false })
+      }
+    },
+    sendMessage: async () => { throw new Error("Could not establish connection. Receiving end does not exist.") },
+    connect: (tabId, connectInfo) => {
+      const pair = makePortPair(connectInfo?.name)
+      connections.push({ tabId, connectInfo, pair })
+
+      return pair.left.port
+    },
+    captureVisibleTab: async () => "data:image/jpeg;base64,",
+    onCreated: created.api,
+    onUpdated: updated.api,
+    onRemoved: removed.api,
+    onActivated: activated.api,
+    ...overrides
+  }
+
+  return {
+    api,
+    layer: ChromeTabs.layer(api),
+    controls: {
+      /** Adds a tab without going through `create`; returns it with its id. */
+      seed: (properties: Partial<chrome.tabs.Tab> = {}) => create(properties),
+      tab: (tabId: number): chrome.tabs.Tab | undefined => tabs.get(tabId),
+      connections,
+      onCreated: created.controls,
+      onUpdated: updated.controls,
+      onRemoved: removed.controls,
+      onActivated: activated.controls
     }
   }
 }

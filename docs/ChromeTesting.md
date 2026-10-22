@@ -2,7 +2,8 @@
 
 Import `effect-platform-chrome/ChromeTesting`. These injected fixtures have no
 Vitest runtime dependency and never access Chrome globals. They cover the
-existing `ChromeStorage` and `ChromePort` adapters, not every Chrome service.
+`ChromeStorage`, `ChromeTabs` and `ChromePort` adapters, not every Chrome service;
+the other services take a plain object through `make(api)` or `layer(api)`.
 Create a fixture **inside each test**. Its layer and raw API intentionally share
 that fixture's state; calling the factory again creates independent state.
 
@@ -29,7 +30,9 @@ it.effect("reads configured settings", () => Effect.gen(function*() {
 
 Alternatively use `ChromeStorage.make(fixture.api)` directly. The raw API is a
 structural Promise-based subset, **not** `typeof chrome.storage`: callback
-overloads, access levels and quota constants are absent.
+overloads and quota constants are absent. Access levels are recorded per area,
+starting from Chrome's defaults (`session` trusted contexts only, the others open);
+`controls.accessLevel(area)` reads the current one.
 
 - `local`, `sync`, `session` support `get`, `set`, `remove`, `clear`,
   `getBytesInUse` and per-area `onChanged`. `managed` exposes only reads/events.
@@ -130,3 +133,21 @@ callback-scoped `lastError`; throwing/reentrant listeners do not leak it. Storag
 tests check duplicate selectors, prototype-like keys, defaults, and nested cloning
 at synchronous get/set boundaries. These are deterministic fixture contracts,
 not claims about native browser scheduling or serialization fidelity.
+
+## Tabs
+
+`makeTabs(overrides?)` is an in-memory tab strip behind `ChromeTabs.layer`. Tabs
+keep the properties they were created, seeded or updated with; `query` matches
+`active`, `windowId` and exact `url`s (no match patterns). `create`, `update` and
+`remove` emit the matching events synchronously. `get`, `update` and `remove` reject
+an unknown id as Chrome does, and `sendMessage` rejects as Chrome does with no
+receiver.
+
+- `controls.seed(properties)` adds a tab and returns it with its id;
+  `controls.tab(id)` reads the live record.
+- `connect` returns one end of a `makePortPair`, and records the connection in
+  `controls.connections` with the pair, so a test can serve the other end
+  (`ChromeRpc.serve` on `pair.right.port`) or leave it unanswered.
+- `captureVisibleTab` resolves to an empty JPEG data URL.
+- `overrides` replaces any member, for behaviour the strip does not model, such as a
+  `get` that reports `about:blank` until a navigation commits.

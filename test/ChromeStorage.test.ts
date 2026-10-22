@@ -3,6 +3,7 @@
 import { Effect, Fiber, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeStorage, ChromeStorageError, changeBufferSize, layer, make } from "../src/ChromeStorage.js"
+import * as ChromeStorageModule from "../src/ChromeStorage.js"
 
 const fixture = () => {
   type Listener = (changes: Record<string, chrome.storage.StorageChange>, area: chrome.storage.AreaName) => void
@@ -262,4 +263,22 @@ describe("ChromeStorage", () => {
     expect(f.listeners.size).toBe(0)
     expect(f.raw.onChanged.removeListener).toHaveBeenCalledOnce()
   }))
+
+  it.effect("sets an area's access level and types a missing or rejected setter", () => Effect.gen(function*() {
+    const { raw } = fixture()
+    const setAccessLevel = vi.fn(async (_options: { readonly accessLevel: ChromeStorageModule.AccessLevel }) => {})
+    const storage = make({ ...raw, local: { ...raw.local, setAccessLevel } })
+    yield* storage.local.setAccessLevel("TRUSTED_CONTEXTS")
+    expect(setAccessLevel).toHaveBeenCalledExactlyOnceWith({ accessLevel: "TRUSTED_CONTEXTS" })
+    expect(yield* Effect.flip(storage.session.setAccessLevel("TRUSTED_CONTEXTS"))).toMatchObject({
+      operation: "setAccessLevel", area: "session"
+    })
+    const cause = new Error("Access level not supported")
+    setAccessLevel.mockRejectedValueOnce(cause)
+    expect(yield* Effect.flip(storage.local.setAccessLevel("TRUSTED_AND_UNTRUSTED_CONTEXTS"))).toMatchObject({ cause })
+  }))
+
+  it("names the live layer layerLive, as the other modules do", () => {
+    expect(ChromeStorageModule.layerLive).toBe(layer)
+  })
 })

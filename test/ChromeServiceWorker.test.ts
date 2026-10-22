@@ -620,4 +620,20 @@ describe("ChromeServiceWorker", () => {
     expect(onError).toHaveBeenCalledWith({ code: "HandlerFailed", message: expect.stringContaining("native removal failed") })
     expect(onError).toHaveBeenCalledWith({ code: "Disposed", message: "Service worker disposed" })
   })
+
+  it("installs no message listener when the worker answers only ports", async () => {
+    const api = setup()
+    const worker = start({ chrome: api.chrome, layer: Layer.empty, onConnect: () => Effect.void })
+    expect(api.chrome.runtime.onMessage.listeners.size).toBe(0)
+    expect(api.chrome.runtime.onConnect.listeners.size).toBe(1)
+    await worker.dispose()
+  })
+
+  it("refuses a message selector without a handler", () => {
+    const api = setup()
+    expect(() => start({ chrome: api.chrome, layer: Layer.empty, selectMessage: () => true })).toThrow(
+      "selectMessage and onMessage must be configured together"
+    )
+    expect(api.chrome.runtime.onMessage.listeners.size).toBe(0)
+  })
 })

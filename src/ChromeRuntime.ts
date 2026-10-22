@@ -107,3 +107,6 @@ export const make = (runtime: RuntimeApi): ChromeRuntime => {
 
 /** Accesses chrome.runtime only when the layer is built, never at import time. */
 export const layer = Layer.effect(ChromeRuntime, attempt("runtime", () => make(globalThis.chrome.runtime)))
+
+/** The same live layer as `layer`, under the name the other modules use. */
+export const layerLive = layer
