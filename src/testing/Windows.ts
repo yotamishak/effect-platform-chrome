@@ -79,9 +79,11 @@ const makeWindowEvent = <Args extends ReadonlyArray<unknown>>(
  * An in-memory window list with focus tracking. `create` opens a focused window unless
  * `focused: false` or `state: "minimized"` (tabs and urls are not modelled; a `panel` opens as
  * a popup), `update` applies state, bounds and focus, and `remove` closes a window; each emits
- * Chrome's events, honouring `windowTypes` filters. `create` and `update` reject the state,
- * focus and bounds combinations Chrome rejects with "Invalid value for state", and any
- * `locked-fullscreen` request for lack of its permission. Removing, minimizing or unfocusing
+ * Chrome's events, honouring `windowTypes` filters, synchronously but only once the call has
+ * finished, so calls listeners make land after it, in order. `create` and `update` reject the
+ * state, focus and bounds combinations Chrome rejects with "Invalid value for state", then any
+ * `locked-fullscreen` request, and any update or removal of a locked window, for lack of its
+ * permission. Removing, minimizing or unfocusing
  * the focused window refocuses the most recently focused other window that is not minimized,
  * or reports -1 when none is left; focusing a minimized window restores its previous state.
  * `onFocusChanged` reports -1 to a listener that cannot see the newly focused window, and
@@ -111,6 +113,37 @@ export const makeWindows = (overrides: Partial<ChromeWindows.ChromeWindowsApi> =
   const boundsChanged = makeWindowEvent<[chrome.windows.Window]>((window) => subjectOf(window.id ?? ChromeWindows.WINDOW_ID_NONE), incognitoVisible)
   let focusedId: number = ChromeWindows.WINDOW_ID_NONE
   let nextId = 1
+
+  /** Events of the calls in progress, dispatched in order once the outermost call has finished. */
+  const pending: Array<() => void> = []
+  let depth = 0
+  let dispatching = false
+
+  const dispatch = (emit: () => void) => { pending.push(emit) }
+
+  /**
+   * Runs a mutating call to completion before any of its events reach listeners, as Chrome
+   * dispatches them only after the call; calls listeners make are queued behind them.
+   */
+  const atomically = <A>(call: () => A): A => {
+    depth++
+
+    try {
+      return call()
+    } finally {
+      depth--
+
+      if (depth === 0 && !dispatching) {
+        dispatching = true
+
+        try {
+          for (let next = pending.shift(); next !== undefined; next = pending.shift()) next()
+        } finally {
+          dispatching = false
+        }
+      }
+    }
+  }
 
   const visible = (window: chrome.windows.Window, types: ReadonlyArray<ChromeWindows.WindowType>) =>
     types.includes(window.type ?? "normal") && (!window.incognito || incognitoAccess)
@@ -168,7 +201,7 @@ export const makeWindows = (overrides: Partial<ChromeWindows.ChromeWindowsApi> =
       restoreStates.delete(windowId)
     }
 
-    focusChanged.controls.emit(windowId)
+    dispatch(() => focusChanged.controls.emit(windowId))
   }
 
   /** Focuses the most recently focused other window that is not minimized, or none. */
@@ -183,12 +216,18 @@ export const makeWindows = (overrides: Partial<ChromeWindows.ChromeWindowsApi> =
   }
 
   const open = (properties: Partial<chrome.windows.Window>): chrome.windows.Window => {
-    const window = blankWindow(nextId++, { ...properties, focused: false })
-    const id = window.id ?? 0
+    const id = properties.id ?? nextId
+
+    if (windows.has(id)) throw new Error(`Window ${id} is already open`)
+
+    // Chrome never reuses an id, so an explicitly seeded one also moves the counter past it.
+    nextId = Math.max(nextId, id + 1)
+    const window = blankWindow(id, { ...properties, id, focused: false })
     windows.set(id, window)
     subjects.set(id, { type: window.type ?? "normal", incognito: window.incognito })
     inactive.add(id)
-    created.controls.emit(structuredClone(window))
+    const snapshot = structuredClone(window)
+    dispatch(() => created.controls.emit(snapshot))
 
     if (properties.focused === true && window.state !== "minimized") setFocus(id)
 
@@ -220,7 +259,7 @@ export const makeWindows = (overrides: Partial<ChromeWindows.ChromeWindowsApi> =
     getAll: async (queryOptions) => Array.from(windows.values())
       .filter((window) => visible(window, queryOptions?.windowTypes ?? defaultQueryTypes))
       .map((window) => structuredClone(window)),
-    create: async (createData = {}) => {
+    create: async (createData = {}) => atomically(() => {
       const { state } = createData
 
       if (state === "minimized" && (createData.focused === true || hasBounds(createData))) throw new Error(invalidState)
@@ -248,8 +287,8 @@ export const makeWindows = (overrides: Partial<ChromeWindows.ChromeWindowsApi> =
       const window = open(properties)
 
       return window.incognito && !incognitoAccess ? undefined : window
-    },
-    update: async (windowId, updateInfo) => {
+    }),
+    update: async (windowId, updateInfo) => atomically(() => {
       const window = find(windowId, allTypes)
       const id = window.id ?? ChromeWindows.WINDOW_ID_NONE
       const { state, focused } = updateInfo
@@ -260,7 +299,7 @@ export const makeWindows = (overrides: Partial<ChromeWindows.ChromeWindowsApi> =
 
       if (focused === false && isFullscreenLike(state)) throw new Error(invalidState)
 
-      if (state === "locked-fullscreen") throw new Error(lockedFullscreen)
+      if (state === "locked-fullscreen" || window.state === "locked-fullscreen") throw new Error(lockedFullscreen)
 
       if (state !== undefined && state !== window.state) {
         if (state === "minimized") {
@@ -285,15 +324,18 @@ export const makeWindows = (overrides: Partial<ChromeWindows.ChromeWindowsApi> =
         }
       }
 
-      if (moved) boundsChanged.controls.emit(structuredClone(window))
+      if (moved) {
+        const snapshot = structuredClone(window)
+        dispatch(() => boundsChanged.controls.emit(snapshot))
+      }
 
       if (focused === true) setFocus(id)
 
       if (focused === false && focusedId === id) refocus(id)
 
       return structuredClone(window)
-    },
-    remove: async (windowId) => {
+    }),
+    remove: async (windowId) => atomically(() => {
       const window = find(windowId, allTypes)
       const id = window.id ?? ChromeWindows.WINDOW_ID_NONE
 
@@ -303,10 +345,10 @@ export const makeWindows = (overrides: Partial<ChromeWindows.ChromeWindowsApi> =
       history.delete(id)
       inactive.delete(id)
       restoreStates.delete(id)
-      removed.controls.emit(id)
+      dispatch(() => removed.controls.emit(id))
 
       if (focusedId === id) refocus(id)
-    },
+    }),
     onCreated: created.api,
     onRemoved: removed.api,
     onFocusChanged: focusChanged.api,
@@ -320,9 +362,10 @@ export const makeWindows = (overrides: Partial<ChromeWindows.ChromeWindowsApi> =
     controls: {
       /**
        * Adds a window without going through `create` or its validation, emitting `onCreated`;
-       * focused only when `focused` is true and it is not minimized.
+       * focused only when `focused` is true and it is not minimized. An explicit `id` must not
+       * be open, and later windows get higher ids; throws otherwise.
        */
-      seed: (properties: Partial<chrome.windows.Window> = {}) => open(properties),
+      seed: (properties: Partial<chrome.windows.Window> = {}) => atomically(() => open(properties)),
       /** The live window record, or undefined once removed; mutations bypass events. */
       window: (windowId: number): chrome.windows.Window | undefined => windows.get(windowId),
       /** The focused window's id, or -1 when none is. */

@@ -683,4 +683,92 @@ describe("ChromeWindows stress", () => {
       if (index > 0) expect(id).not.toBe(focusEvents[index - 1])
     }
   }))
+
+  it.effect("keeps events and state in step when listeners call back into the fixture", () => Effect.gen(function*() {
+    const random = seeded(2024)
+    const fixture = makeWindows()
+    const windows = make(fixture.api)
+    const types: Array<WindowType> = ["normal", "popup", "devtools"]
+    const all = { windowTypes: types }
+    const open = new Set<number>()
+    const focusEvents: Array<number> = []
+    const nested: Array<Promise<unknown>> = []
+    let budget = 4096
+
+    const known = (): number => {
+      const ids = Array.from(open)
+
+      return ids.length === 0 ? WINDOW_ID_NONE : pick(random, ids)
+    }
+
+    /**
+     * A random nested call, issued synchronously from inside a listener while the budget lasts,
+     * aimed at the window the event concerns half the time.
+     */
+    const react = (subject: number) => {
+      if (budget === 0 || random() >= 0.3) return
+
+      budget--
+      const target = random() < 0.5 ? subject : known()
+
+      const calls = [
+        () => fixture.api.create({ focused: random() < 0.5 }),
+        () => fixture.api.remove(target),
+        () => fixture.api.update(target, { focused: random() < 0.5 }),
+        () => fixture.api.update(target, { state: pick(random, ["minimized", "maximized", "normal"] as const) }),
+        () => fixture.api.update(target, { width: Math.floor(random() * 2000) })
+      ]
+
+      nested.push(pick(random, calls)().catch((cause: unknown) => cause))
+    }
+
+    fixture.api.onCreated.addListener((window) => {
+      open.add(window.id ?? WINDOW_ID_NONE)
+      react(window.id ?? WINDOW_ID_NONE)
+    }, all)
+    fixture.api.onRemoved.addListener((windowId) => {
+      expect(open.delete(windowId)).toBe(true)
+      react(windowId)
+    }, all)
+    fixture.api.onFocusChanged.addListener((windowId) => {
+      focusEvents.push(windowId)
+      react(windowId)
+    }, all)
+    fixture.api.onBoundsChanged.addListener((window) => { react(window.id ?? WINDOW_ID_NONE) })
+
+    for (let round = 0; round < 2048; round++) {
+      const target = known()
+      const plan = pick(random, ["create", "focus", "remove", "minimize", "seed"] as const)
+
+      if (plan === "seed") fixture.controls.seed({ type: pick(random, types), focused: random() < 0.5 })
+      else if (plan === "create") yield* windows.create({ type: pick(random, ["normal", "popup"] as const) })
+      else if (plan === "focus") yield* Effect.ignore(windows.focus(target))
+      else if (plan === "remove") yield* Effect.ignore(windows.remove(target))
+      else yield* Effect.ignore(windows.update(target, { state: "minimized" }))
+
+      // Every call, nested ones included, has finished and dispatched: focus is on an open window.
+      const focusedNow = fixture.controls.focused
+
+      if (focusedNow !== WINDOW_ID_NONE) expect(fixture.controls.window(focusedNow)?.focused).toBe(true)
+
+      expect(focusEvents.at(-1) ?? WINDOW_ID_NONE).toBe(focusedNow)
+    }
+
+    const failures = yield* Effect.promise(() => Promise.all(nested))
+    expect(nested.length).toBeGreaterThan(512)
+
+    for (const failure of failures.filter((each) => each !== undefined && !("id" in Object(each)))) {
+      expect(String(failure)).toMatch(/^Error: (No window with id: -?\d+\.|Invalid value for state)$/)
+    }
+
+    const listed = yield* windows.getAll(all)
+    expect(listed.map((each) => each.id)).toEqual(Array.from(open).sort((left, right) => left - right))
+    const current = fixture.controls.focused
+    expect(focusEvents.at(-1)).toBe(current)
+    expect(listed.filter((each) => each.focused).map((each) => each.id)).toEqual(current === WINDOW_ID_NONE ? [] : [current])
+
+    for (const [index, id] of focusEvents.entries()) {
+      if (index > 0) expect(id).not.toBe(focusEvents[index - 1])
+    }
+  }))
 })

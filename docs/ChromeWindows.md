@@ -85,6 +85,10 @@ page describes: default and explicit `windowTypes` for queries and events, `-1` 
 for hidden windows, focus history (removing, minimizing or unfocusing the focused window
 refocuses the most recently focused other window that is not minimized, or reports -1),
 restoring a minimized window when it is focused, Chrome's state/focus/bounds validation,
-`WINDOW_ID_CURRENT`, and incognito access through `controls.incognitoAccess`. `controls.seed`
-adds windows of any type or state without validation. Tabs, URLs and `populate` are not
+`WINDOW_ID_CURRENT`, and incognito access through `controls.incognitoAccess`. Updating or
+removing a `locked-fullscreen` window fails for lack of its permission. As in Chrome, a call
+finishes before its events reach listeners, so a listener calling back into the fixture (to
+close the window it was told about, say) acts on the finished state, and its own events follow
+in order. `controls.seed` adds windows of any type or state without validation; an explicit
+`id` must not be open, and later windows get higher ids. Tabs, URLs and `populate` are not
 modelled, and state changes do not move bounds.

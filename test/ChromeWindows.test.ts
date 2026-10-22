@@ -1,6 +1,6 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Effect, Exit, Fiber, Option, Stream } from "effect"
+import { Effect, Exit, Fiber, Option, Schedule, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import {
   ChromeWindows, ChromeWindowsError, layer, layerLive, make, WINDOW_ID_CURRENT, WINDOW_ID_NONE
@@ -400,6 +400,24 @@ describe("ChromeWindows", () => {
     expect(api[operation].addListener).not.toHaveBeenCalled()
   }))
 
+  it.effect("re-subscribes once after a failed registration, leaving a single listener", () => Effect.gen(function*() {
+    const api = mockApi()
+    api.onFocusChanged.failNext(new Error("added, then failed"), true)
+
+    const fiber = yield* Effect.forkChild(Stream.runCollect(Stream.take(
+      Stream.retry(make(api).onFocusChanged({ windowTypes: ["normal"] }), Schedule.recurs(1)), 2
+    )))
+
+    yield* Effect.promise(() => api.onFocusChanged.added)
+    expect(api.onFocusChanged.addListener).toHaveBeenCalledTimes(2)
+    expect(api.onFocusChanged.listeners.size).toBe(1)
+    api.onFocusChanged.emit(4)
+    api.onFocusChanged.emit(WINDOW_ID_NONE)
+    expect(yield* Fiber.join(fiber)).toEqual([4, WINDOW_ID_NONE])
+    expect(api.onFocusChanged.listeners.size).toBe(0)
+    expect(api.onFocusChanged.removeListener).toHaveBeenCalledTimes(2)
+  }))
+
   it.effect("reads no events and registers nothing until a stream runs", () => Effect.gen(function*() {
     let reads = 0
     const api = mockApi()
@@ -691,5 +709,79 @@ describe("ChromeTesting windows fixture", () => {
     yield* windows.focus(id)
     yield* windows.update(id, { drawAttention: true })
     expect(focused).toEqual([id])
+  }))
+
+  it.effect("never hands out an id that seed was given explicitly", () => Effect.gen(function*() {
+    const fixture = makeWindows()
+    const windows = service(fixture)
+    expect(fixture.controls.seed({ id: 2, type: "popup" }).id).toBe(2)
+    const created = [yield* windows.create(), yield* windows.create()].map((window) => Option.getOrThrow(window).id)
+    expect(created).toEqual([3, 4])
+    expect((yield* windows.get(2)).type).toBe("popup")
+    expect(yield* windows.getAll()).toHaveLength(3)
+    expect(() => fixture.controls.seed({ id: 3, type: "popup" })).toThrow("Window 3 is already open")
+    expect(fixture.controls.window(3)?.type).toBe("normal")
+    expect(fixture.controls.seed({ id: undefined }).id).toBe(5)
+    yield* windows.remove(2)
+    expect(fixture.controls.seed({ id: 2 }).id).toBe(2)
+  }))
+
+  it.effect("reports a window a listener closes as focused, then refocuses, as Chrome does", () => Effect.gen(function*() {
+    const fixture = makeWindows()
+    const windows = service(fixture)
+    const focused: Array<number> = []
+    const closing: Array<Promise<void>> = []
+    fixture.api.onFocusChanged.addListener((windowId) => { focused.push(windowId) })
+    const closeOnCreate = (window: chrome.windows.Window) => { closing.push(fixture.api.remove(window.id ?? WINDOW_ID_NONE)) }
+
+    fixture.api.onCreated.addListener(closeOnCreate)
+    const created = Option.getOrThrow(yield* windows.create()).id ?? WINDOW_ID_NONE
+    expect(fixture.controls.window(created)).toBeUndefined()
+    expect(fixture.controls.focused).toBe(WINDOW_ID_NONE)
+    expect(focused).toEqual([created, WINDOW_ID_NONE])
+    fixture.api.onCreated.removeListener(closeOnCreate)
+    const kept = Option.getOrThrow(yield* windows.create()).id ?? WINDOW_ID_NONE
+    const moved = fixture.controls.seed().id ?? WINDOW_ID_NONE
+    fixture.api.onBoundsChanged.addListener((window) => { closing.push(fixture.api.remove(window.id ?? WINDOW_ID_NONE)) })
+    expect(yield* windows.update(moved, { width: 10, focused: true })).toMatchObject({ id: moved, width: 10, focused: true })
+    yield* Effect.promise(() => Promise.all(closing))
+    expect(fixture.controls.window(moved)).toBeUndefined()
+    expect(fixture.controls.focused).toBe(kept)
+    expect(focused).toEqual([created, WINDOW_ID_NONE, kept, moved, kept])
+  }))
+
+  it.effect("lets a listener's own calls land after the call that fired it, as Chrome dispatches", () => Effect.gen(function*() {
+    const fixture = makeWindows()
+    const windows = service(fixture)
+    const focused: Array<number> = []
+    const opening: Array<Promise<chrome.windows.Window | undefined>> = []
+    fixture.api.onFocusChanged.addListener((windowId) => { focused.push(windowId) })
+
+    const openCompanion = (window: chrome.windows.Window) => {
+      if (window.type === "normal") opening.push(fixture.api.create({ type: "popup" }))
+    }
+
+    fixture.api.onCreated.addListener(openCompanion)
+    const main = Option.getOrThrow(yield* windows.create()).id ?? WINDOW_ID_NONE
+    const companion = (yield* Effect.promise(() => Promise.all(opening)))[0]?.id ?? WINDOW_ID_NONE
+    expect([main, companion]).toEqual([1, 2])
+    expect(fixture.controls.focused).toBe(companion)
+    expect(focused).toEqual([main, companion])
+    expect((yield* windows.getLastFocused()).id).toBe(companion)
+  }))
+
+  it.effect("rejects updating a locked fullscreen window, after Chrome's argument checks", () => Effect.gen(function*() {
+    const fixture = makeWindows()
+    const windows = service(fixture)
+    const locked = fixture.controls.seed({ state: "locked-fullscreen", focused: true }).id ?? WINDOW_ID_NONE
+
+    for (const updateInfo of [{ state: "normal" }, { focused: false }, { width: 10 }, {}] satisfies Array<chrome.windows.UpdateInfo>) {
+      const error = yield* Effect.flip(windows.update(locked, updateInfo))
+      expect(error).toMatchObject({ operation: "update", cause: { message: expect.stringMatching(/lockWindowFullscreenPrivate/) } })
+    }
+
+    expect(yield* Effect.flip(windows.update(locked, { state: "minimized", width: 1 }))).toMatchObject({ cause: new Error("Invalid value for state") })
+    expect(fixture.controls.window(locked)).toMatchObject({ state: "locked-fullscreen", focused: true, width: 1280 })
+    expect(fixture.controls.focused).toBe(locked)
   }))
 })
