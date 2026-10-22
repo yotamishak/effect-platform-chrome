@@ -62,9 +62,12 @@ ends, fails or is interrupted, with a 64-event sliding buffer. They cannot wake 
 `onDeterminingFilename` emits `{ item, suggest }` and returns `true` to Chrome, which then
 holds the download until `suggest` runs:
 
-- `suggest(suggestion?)` answers once; later calls succeed and do nothing. A suggestion
-  Chrome throws on fails with `operation: "suggest"` and leaves the event unanswered, so it
-  can be answered again.
+- `suggest(suggestion?)` answers once, as Chrome requires. Once the event is answered, by
+  an earlier `suggest` or by the default name the stream gives when it ends, a call fails
+  with `operation: "suggest"` without calling Chrome, so a late suggestion never vanishes
+  silently. Suggest inside the stream: `Stream.runHead` ends the stream, so suggesting on
+  the event it returns fails. A suggestion Chrome throws on fails the same way and leaves
+  the event unanswered, so it can be answered again.
 - An event the 64-event buffer drops is answered with Chrome's default name at once, so no
   download waits on an event no consumer will see.
 - When the stream ends, fails or is interrupted, every event still unanswered (including
@@ -80,7 +83,8 @@ per event leaving exactly the newest 64 in order and no listener (for
 `onDeterminingFilename`, the 4032 dropped downloads are answered with the default name
 before the first delivery, and every download is answered exactly once); 512 concurrent
 subscriptions per event stopped at seeded stages, ending with zero listeners; 1024
-filename events answered by racing pairs, each download answered once with its own name;
+filename events answered by racing pairs, each download answered once with its own name
+and the losing `suggest` of each pair failing typed;
 1560 concurrent calls across every operation and both gesture bridges with seeded
 rejections and throws settled in shuffled order, each typed; 1024 concurrent
 `showDefaultFolder` runs; 1024 concurrent `waitForComplete` waiters settled in shuffled

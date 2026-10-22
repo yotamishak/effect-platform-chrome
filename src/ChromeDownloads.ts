@@ -33,9 +33,11 @@ export interface DeterminingFilename {
   readonly item: DownloadItem
   /**
    * Answers Chrome with a filename (relative to the downloads folder), or with no argument
-   * to keep the default. Only the first accepted answer takes effect; later calls succeed and
-   * do nothing. A suggestion Chrome throws on fails with the typed error and leaves the event
-   * unanswered, so it can be answered again.
+   * to keep the default. Chrome takes exactly one answer per event: once the event is
+   * answered, by an earlier `suggest` or by the default name the stream gives when it ends,
+   * a call fails with operation `"suggest"` without calling Chrome, so a late suggestion
+   * cannot vanish silently. A suggestion Chrome throws on fails the same way and leaves the
+   * event unanswered, so it can be answered again.
    */
   readonly suggest: (suggestion?: FilenameSuggestion) => Effect.Effect<void, ChromeDownloadsError>
 }
@@ -177,6 +179,13 @@ const attempt = attempter(onError)
 
 const start = starter(onError)
 
+/** Who answered an `onDeterminingFilename` event: the consumer, or the stream's default. */
+type AnsweredBy = "suggest" | "default"
+
+const alreadyAnswered = (downloadId: number, by: AnsweredBy) => onError("suggest", new Error(by === "suggest"
+  ? `Download ${downloadId} was already answered by an earlier suggest; Chrome takes one answer per event.`
+  : `Download ${downloadId} was already answered with Chrome's default name, because its onDeterminingFilename stream ended or dropped it first; suggest before the stream ends.`))
+
 /** An `onDeterminingFilename` event this subscription has not answered yet. */
 interface Pending {
   readonly event: DeterminingFilename
@@ -200,28 +209,36 @@ const determiningFilename = (
   const undelivered: Array<Pending> = []
 
   const pending = (item: DownloadItem, suggest: SuggestCallback): Pending => {
-    let answered = false
+    let answeredBy: AnsweredBy | undefined
 
-    const answer = (suggestion: FilenameSuggestion | undefined) => {
-      if (answered) return
+    const settle = (by: AnsweredBy) => {
+      answeredBy = by
+      unanswered.delete(entry)
+    }
 
+    const answer = (suggestion: FilenameSuggestion | undefined, by: AnsweredBy) => {
       // Chrome may throw on an invalid suggestion; the event then stays unanswered.
       if (suggestion === undefined) suggest()
       else suggest(suggestion)
 
-      answered = true
-      unanswered.delete(entry)
+      settle(by)
     }
 
     const entry: Pending = {
-      event: { item, suggest: (suggestion) => attempt("suggest", () => answer(suggestion)) },
+      event: {
+        item,
+        suggest: (suggestion) => Effect.suspend(() => answeredBy === undefined
+          ? attempt("suggest", () => answer(suggestion, "suggest"))
+          : Effect.fail(alreadyAnswered(item.id, answeredBy)))
+      },
       keepDefault: () => {
+        if (answeredBy !== undefined) return
+
         try {
-          answer(undefined)
+          answer(undefined, "default")
         } catch {
           // Chrome already settled or dropped this download; nothing is left to answer.
-          answered = true
-          unanswered.delete(entry)
+          settle("default")
         }
       }
     }

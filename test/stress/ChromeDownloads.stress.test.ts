@@ -162,10 +162,10 @@ describe("ChromeDownloads stress", () => {
           if (flow.received === flow.target) Deferred.doneUnsafe(flow.batch, Exit.void)
         })),
         Stream.mapEffect((value) => Effect.all([
-          value.suggest({ filename: `first-${value.item.id}.bin` }),
-          value.suggest({ filename: `second-${value.item.id}.bin` })
-        ], { concurrency: "unbounded", discard: true }), { concurrency: "unbounded" }),
-        Stream.runDrain
+          settle(value.suggest({ filename: `first-${value.item.id}.bin` })),
+          settle(value.suggest({ filename: `second-${value.item.id}.bin` }))
+        ], { concurrency: "unbounded" }), { concurrency: "unbounded" }),
+        Stream.runCollect
       ))
 
       yield* Effect.promise(() => event.controls.waitForListener())
@@ -181,7 +181,16 @@ describe("ChromeDownloads stress", () => {
         yield* Deferred.await(flow.batch)
       }
 
-      yield* Fiber.join(consumer)
+      const pairs = yield* Fiber.join(consumer)
+      expect(pairs).toHaveLength(1024)
+
+      // Exactly one answer of each pair reaches Chrome; the loser fails typed instead of vanishing.
+      for (const pair of pairs) {
+        expect(pair.filter(Result.isSuccess)).toHaveLength(1)
+        const [lost] = pair.filter(Result.isFailure)
+        expect(lost?.failure).toBeInstanceOf(ChromeDownloadsError)
+        expect(lost?.failure.operation).toBe("suggest")
+      }
 
       suggests.forEach((suggest, index) => {
         expect(suggest).toHaveBeenCalledOnce()

@@ -172,6 +172,22 @@ describe("ChromeDownloads", () => {
     expect(String(error.cause)).toContain("downloads.setUiOptions is unavailable")
   }))
 
+  it.effect("types open on a build before Chrome 123, which returns nothing, as a TypeError", () => Effect.gen(function*() {
+    const { api } = mockApi()
+    // SAFETY: models Chrome before 123, whose downloads.open returns undefined where a Promise is declared.
+    api.open.mockImplementation(() => undefined as never)
+    const downloads = make(api)
+
+    for (const outcome of [downloads.open(7), downloads.openFromUserGesture(7)]) {
+      const error = yield* Effect.flip(outcome)
+      expect(error).toBeInstanceOf(ChromeDownloadsError)
+      expect(error.operation).toBe("open")
+      expect(error.cause).toBeInstanceOf(TypeError)
+    }
+
+    expect(api.open).toHaveBeenCalledTimes(2)
+  }))
+
   describe.each([["openFromUserGesture", "open"], ["acceptDangerFromUserGesture", "acceptDanger"]] as const)("%s", (bridge, method) => {
     it.effect("calls Chrome before the Effect runs and replays one outcome", () => Effect.gen(function*() {
       const { api } = mockApi()
@@ -304,8 +320,18 @@ describe("ChromeDownloads", () => {
       expect(event?.item).toEqual(item)
       expect(answered.mock.calls).toEqual([[suggestion]])
       expect(unanswered.mock.calls).toEqual([[]])
-      yield* event?.suggest({ filename: "again.pdf" }) ?? Effect.void
-      yield* event?.suggest() ?? Effect.void
+      expect(event).toBeDefined()
+
+      if (event === undefined) return
+
+      // Chrome takes exactly one answer per event: a repeat fails instead of vanishing silently.
+      for (const repeat of [event.suggest({ filename: "again.pdf" }), event.suggest()]) {
+        const error = yield* Effect.flip(repeat)
+        expect(error).toBeInstanceOf(ChromeDownloadsError)
+        expect(error.operation).toBe("suggest")
+        expect(String(error.cause)).toContain("Download 7 was already answered by an earlier suggest")
+      }
+
       expect(answered).toHaveBeenCalledOnce()
       expect(mock.onDeterminingFilename.listenerCount).toBe(0)
     }))
@@ -460,8 +486,46 @@ describe("ChromeDownloads", () => {
       mock.onDeterminingFilename.emit({ ...item, id: 8 }, second)
       yield* Fiber.join(next)
       expect(second.mock.calls).toEqual([[suggestion]])
-      yield* event?.suggest(suggestion) ?? Effect.void
+      expect(event).toBeDefined()
+
+      if (event === undefined) return
+      expect(yield* Effect.flip(event.suggest(suggestion))).toMatchObject({ operation: "suggest" })
       expect(first).toHaveBeenCalledOnce()
+    }))
+
+    it.effect("fails a suggestion made after runHead ended the stream, which kept the default name", () => Effect.gen(function*() {
+      const mock = mockApi()
+      const suggest = vi.fn<SuggestCallback>()
+      const fiber = yield* Effect.forkScoped(Stream.runHead(make(mock.api).onDeterminingFilename))
+      yield* Effect.promise(() => mock.onDeterminingFilename.waitForListener())
+      mock.onDeterminingFilename.emit(item, suggest)
+      const head = yield* Fiber.join(fiber)
+      // Ending the stream answered the taken event, so Chrome will not wait on it forever.
+      expect(suggest.mock.calls).toEqual([[]])
+      expect(Option.isSome(head)).toBe(true)
+
+      if (Option.isNone(head)) return
+      const error = yield* Effect.flip(head.value.suggest(suggestion))
+      expect(error).toBeInstanceOf(ChromeDownloadsError)
+      expect(error.operation).toBe("suggest")
+      expect(String(error.cause)).toContain("Download 7 was already answered with Chrome's default name")
+      expect(suggest).toHaveBeenCalledOnce()
+    }))
+
+    it.effect("fails a retry after a failed suggestion was defaulted when the stream ended", () => Effect.gen(function*() {
+      const mock = mockApi()
+      const cause = new Error("download already gone")
+      const suggest = vi.fn<SuggestCallback>(() => { throw cause })
+      const fiber = yield* Effect.forkScoped(Stream.runHead(make(mock.api).onDeterminingFilename))
+      yield* Effect.promise(() => mock.onDeterminingFilename.waitForListener())
+      mock.onDeterminingFilename.emit(item, suggest)
+      const head = yield* Fiber.join(fiber)
+      expect(Option.isSome(head)).toBe(true)
+
+      if (Option.isNone(head)) return
+      // The default answer at the end threw and was swallowed; the event still counts as answered.
+      expect(String((yield* Effect.flip(head.value.suggest(suggestion))).cause)).toContain("default name")
+      expect(suggest.mock.calls).toEqual([[]])
     }))
   })
 

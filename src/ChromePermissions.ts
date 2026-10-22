@@ -10,9 +10,20 @@ export class ChromePermissionsError extends Schema.TaggedError<ChromePermissions
 
 export type Permissions = chrome.permissions.Permissions
 
-export type AddHostAccessRequest = chrome.permissions.AddHostAccessRequest
+/**
+ * Where a host access request shows: exactly one of a tab or a top-level document. Chrome
+ * rejects a request naming both or neither ("Must specify either 'documentId' or 'tabId'."),
+ * which `chrome.permissions`' own optional fields allow.
+ */
+export type HostAccessTarget =
+  | { readonly tabId: number, readonly documentId?: never }
+  | { readonly documentId: string, readonly tabId?: never }
 
-export type RemoveHostAccessRequest = chrome.permissions.RemoveHostAccessRequest
+/** A host access request for one tab or document, optionally limited to URLs matching `pattern`. */
+export type AddHostAccessRequest = HostAccessTarget & { readonly pattern?: string }
+
+/** Withdraws the request for one tab or document; a given `pattern` must match the added one exactly. */
+export type RemoveHostAccessRequest = HostAccessTarget & { readonly pattern?: string }
 
 /**
  * The Promise-based MV3 subset this module needs. The host access request members are

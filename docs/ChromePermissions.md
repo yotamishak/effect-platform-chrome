@@ -106,8 +106,11 @@ to signal, in the toolbar and extensions menu, that the extension wants access t
 site in a tab; the user accepting it grants persistent access to that site's top
 origin. Unlike `request`, no user gesture is needed and nothing is granted by the call.
 
-- Address the request with `tabId` or `documentId` (a top-level document), and
-  optionally a URL `pattern` limiting where it shows. A new request for a tab replaces
+- Address the request with exactly one of `tabId` or `documentId` (a top-level
+  document), and optionally a URL `pattern` limiting where it shows. Chrome rejects both
+  or neither, so `AddHostAccessRequest` / `RemoveHostAccessRequest` (`HostAccessTarget`
+  plus `pattern`) are narrower than `chrome.permissions`' own types and reject them at
+  compile time. A new request for a tab replaces
   the existing one; Chrome removes it when the tab navigates cross-origin.
 - `removeHostAccessRequest` withdraws a request for the same tab or document; a given
   `pattern` must match the added one exactly.

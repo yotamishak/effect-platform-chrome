@@ -3,7 +3,9 @@
 import { Effect, Exit, Fiber, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromePermissions, ChromePermissionsError, layer, layerLive, make } from "../src/ChromePermissions.js"
-import type { ChromePermissionsApi, ChromePermissionsService, Permissions } from "../src/ChromePermissions.js"
+import type {
+  AddHostAccessRequest, ChromePermissionsApi, ChromePermissionsService, Permissions, RemoveHostAccessRequest
+} from "../src/ChromePermissions.js"
 import { makeEvent } from "../src/testing/Event.js"
 
 const permissions: Permissions = { permissions: ["tabs"], origins: ["https://example.com/*"] }
@@ -125,6 +127,28 @@ describe("ChromePermissions", () => {
     })
   )
 
+  it.effect("types host access requests as exactly one of a tab or a document, as Chrome requires", () => Effect.gen(function*() {
+    const { api } = mockApi()
+    const service = make(api)
+    const valid: ReadonlyArray<AddHostAccessRequest> = [{ tabId: 7 }, { documentId: "doc", pattern: "https://example.com/*" }]
+    const removals: ReadonlyArray<RemoveHostAccessRequest> = [{ tabId: 7, pattern: "https://example.com/*" }, { documentId: "doc" }]
+    // @ts-expect-error Chrome rejects a request naming neither: "Must specify either 'documentId' or 'tabId'."
+    const neither: AddHostAccessRequest = { pattern: "https://example.com/*" }
+    // @ts-expect-error Chrome rejects a request naming both a tab and a document.
+    const both: AddHostAccessRequest = { tabId: 7, documentId: "doc" }
+    // @ts-expect-error The same rule holds when withdrawing a request.
+    const removeBoth: RemoveHostAccessRequest = { tabId: 7, documentId: "doc" }
+    // @ts-expect-error The same rule holds when withdrawing a request.
+    const removeNeither: RemoveHostAccessRequest = {}
+
+    yield* Effect.forEach(valid, service.addHostAccessRequest, { discard: true })
+    yield* Effect.forEach(removals, service.removeHostAccessRequest, { discard: true })
+    expect(api.addHostAccessRequest.mock.calls).toEqual(valid.map((request) => [request]))
+    expect(api.removeHostAccessRequest.mock.calls).toEqual(removals.map((request) => [request]))
+    // Chrome still validates at runtime; a value that slips past the types is passed through unchanged.
+    expect([neither, both, removeBoth, removeNeither]).toHaveLength(4)
+  }))
+
   describe("requestFromUserGesture", () => {
     it.effect("calls Chrome before the Effect runs and replays one outcome", () => Effect.gen(function*() {
       const { api } = mockApi()
@@ -183,6 +207,14 @@ describe("ChromePermissions", () => {
 
         expect(api.request).toHaveBeenCalledOnce()
       }
+    }))
+
+    it.effect("never throws on the handler's stack when the request accessor throws", () => Effect.gen(function*() {
+      const { api } = mockApi()
+      const cause = new Error("Extension context invalidated.")
+      Object.defineProperty(api, "request", { get: () => { throw cause } })
+      const outcome = make(api).requestFromUserGesture(permissions)
+      expect(yield* Effect.flip(outcome)).toMatchObject({ operation: "request", cause })
     }))
 
     it.effect("stops waiting when interrupted and still reports the late outcome", () => Effect.gen(function*() {
