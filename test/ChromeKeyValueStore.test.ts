@@ -39,6 +39,28 @@ const keyedArea = () => {
   return { ...area, getKeys }
 }
 
+const utf8 = (text: string) => new TextDecoder().decode(new TextEncoder().encode(text))
+
+/**
+ * A storage area that, like Chrome, carries every key and string through UTF-8: the
+ * extension bindings convert strings with `v8::String::Utf8Value` and return them with
+ * `NewFromUtf8`, so a lone surrogate comes back as U+FFFD.
+ */
+const utf8Area = () => {
+  const area = keyedArea()
+
+  const reencode = (items: Record<string, unknown>) => Object.fromEntries(Object.entries(items).map(([name, value]) =>
+    [utf8(name), JSON.parse(JSON.stringify(value), (_, nested: string | number) => Predicate.isString(nested) ? utf8(nested) : nested)]))
+
+  const get = vi.fn((keys: string | null) => area.get(keys === null ? null : utf8(keys)))
+  const set = vi.fn((items: Record<string, unknown>) => area.set(reencode(items)))
+  const remove = vi.fn((keys: string | Array<string>) => area.remove(Predicate.isString(keys) ? utf8(keys) : keys.map(utf8)))
+
+  return { ...area, get, set, remove }
+}
+
+const illFormed = ["\ud800", "\udfff", "a\ud800b", "\udc00\ud800", "🌍".slice(0, 1), "🌍".slice(1)]
+
 const physical = (namespace: string, key: string) =>
   `effect-platform-chrome/KeyValueStore/v1:${namespace.length}:${namespace}:${key}`
 
@@ -292,6 +314,86 @@ describe("ChromeKeyValueStore", () => {
       const store = ChromeKeyValueStore.make(area, { namespace })
       expect(yield* store.size).toBe(namespace === "a:" ? 0 : keys.length)
     }
+  }))
+
+  it.effect("round trips well-formed astral names and values through Chrome's UTF-8 boundary", () => Effect.gen(function*() {
+    const area = utf8Area()
+    const store = ChromeKeyValueStore.make(area, { namespace: "🌍\u0000é" })
+    const other = ChromeKeyValueStore.make(area, { namespace: "🌎\u0000é" })
+    yield* store.set("𝄞:🌍", "value 𝄞\u0000\ufffd")
+    yield* other.set("𝄞:🌍", "other")
+    expect(yield* store.get("𝄞:🌍")).toBe("value 𝄞\u0000\ufffd")
+    expect(yield* store.has("𝄞:🌍")).toBe(true)
+    expect(yield* store.size).toBe(1)
+    yield* store.clear
+    expect(yield* store.isEmpty).toBe(true)
+    expect(yield* other.get("𝄞:🌍")).toBe("other")
+  }))
+
+  it.effect("rejects keys with lone surrogates, which Chrome would merge with other keys, without calling Chrome", () => Effect.gen(function*() {
+    const area = utf8Area()
+    const store = ChromeKeyValueStore.make(area)
+    yield* store.set("\ufffd", "replacement character")
+    area.get.mockClear()
+    area.set.mockClear()
+
+    for (const key of illFormed) {
+      const keyed = [
+        ["get", store.get(key)], ["getUint8Array", store.getUint8Array(key)], ["has", store.has(key)],
+        ["set", store.set(key, "value")], ["set", store.set(key, new Uint8Array([1]))], ["remove", store.remove(key)],
+        ["get", store.modify(key, (value) => value)], ["getUint8Array", store.modifyUint8Array(key, (value) => value)]
+      ] as const
+
+      for (const [method, effect] of keyed) {
+        const error = yield* failure(effect)
+        expect(error).toBeInstanceOf(KeyValueStore.KeyValueStoreError)
+        expect(error).toMatchObject({ method, key, message: `Chrome KeyValueStore ${method} failed` })
+        expect(error.cause).toBeInstanceOf(Error)
+      }
+    }
+
+    expect(area.get).not.toHaveBeenCalled()
+    expect(area.set).not.toHaveBeenCalled()
+    expect(area.remove).not.toHaveBeenCalled()
+    expect(yield* store.get("\ufffd")).toBe("replacement character")
+    expect(yield* store.size).toBe(1)
+  }))
+
+  it.effect("rejects a namespace with lone surrogates, which clear and size could never find, without calling Chrome", () => Effect.gen(function*() {
+    for (const namespace of illFormed) {
+      const area = utf8Area()
+      const store = ChromeKeyValueStore.make(area, { namespace })
+
+      for (const [method, effect] of operations(store)) {
+        const error = yield* failure(effect)
+        expect(error).toBeInstanceOf(KeyValueStore.KeyValueStoreError)
+        expect(error.method).toBe(method)
+        expect(error.key).toBe(keyless.has(method) ? undefined : "key")
+        expect(error.cause).toBeInstanceOf(Error)
+      }
+
+      expect(area.get).not.toHaveBeenCalled()
+      expect(area.getKeys).not.toHaveBeenCalled()
+      expect(area.set).not.toHaveBeenCalled()
+      expect(area.remove).not.toHaveBeenCalled()
+    }
+  }))
+
+  it.effect("rejects string values with lone surrogates instead of letting Chrome replace them", () => Effect.gen(function*() {
+    const area = utf8Area()
+    const store = ChromeKeyValueStore.make(area)
+    yield* store.set("key", "original")
+    area.set.mockClear()
+
+    for (const value of illFormed) {
+      const error = yield* failure(store.set("key", value))
+      expect(error).toMatchObject({ method: "set", key: "key" })
+      expect(error.cause).toBeInstanceOf(Error)
+      expect(yield* failure(store.modify("key", () => value))).toMatchObject({ method: "set", key: "key" })
+    }
+
+    expect(area.set).not.toHaveBeenCalled()
+    expect(yield* store.get("key")).toBe("original")
   }))
 
   it.effect.each([256, 65_537])("round trips all byte values in a bounded %i-byte payload without aliasing", (length) => Effect.gen(function*() {

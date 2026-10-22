@@ -58,6 +58,19 @@ const storageError = (method: string, cause: unknown, key?: string) => {
 
 const invokeKeyless = invoker((method, cause) => storageError(method, cause))
 
+// With the `u` flag a surrogate pair is one code point, so this matches only lone surrogates.
+const loneSurrogate = /[\ud800-\udfff]/u
+
+/**
+ * Chrome carries storage keys and strings through UTF-8, replacing each lone surrogate with
+ * U+FFFD, so such a name or value would come back as, or overwrite, a different one.
+ */
+const unrepresentable = (method: string, part: "namespace" | "key" | "value", key?: string) => storageError(
+  method,
+  new Error(`The ${part} contains a lone surrogate, which Chrome storage would replace with U+FFFD`),
+  key
+)
+
 /**
  * Creates an independent, namespaced store over `api` without accessing global Chrome APIs.
  * Namespace lengths make the key encoding unambiguous, even for empty names, colons,
@@ -68,6 +81,10 @@ const invokeKeyless = invoker((method, cause) => storageError(method, cause))
  * UTF-8. Invalid envelopes fail with `KeyValueStoreError`; `has`, `size` and `isEmpty`
  * report physical key existence. Every error's `method` names the store operation and,
  * for single-key operations, its `key`.
+ *
+ * Chrome stores keys and strings as UTF-8, so a namespace, key or string value containing a
+ * lone surrogate would silently become, or overwrite, a different one. Every operation on
+ * such a namespace or key, and `set` of such a string, fails before calling Chrome.
  *
  * `clear` removes only this namespace's keys, in one `remove` call, and never calls
  * `StorageArea.clear`. `size`, `isEmpty` and `clear` list keys with `getKeys` where the
@@ -80,18 +97,31 @@ export const make = (api: ChromeKeyValueStoreApi, options: Options = {}): KeyVal
   const namespace = options.namespace ?? defaultNamespace
   const prefix = `effect-platform-chrome/KeyValueStore/v1:${namespace.length}:${namespace}:`
   const encodedKey = (key: string) => prefix + key
+  const namespaceInvalid = loneSurrogate.test(namespace)
 
-  const invokeKeyed = <A>(method: string, key: string, run: () => Promise<A>) =>
-    invoker((operation, cause) => storageError(operation, cause, key))(method, run)
+  /** Fails before calling Chrome when the namespace, key or string value is not well-formed. */
+  const checked = <A>(method: string, key: string | undefined, effect: Effect.Effect<A, KeyValueStore.KeyValueStoreError>, value?: string) =>
+    Effect.suspend(() => {
+      if (namespaceInvalid) return Effect.fail(unrepresentable(method, "namespace", key))
 
-  const namespacedKeys = (method: string) => Effect.map(
+      if (key !== undefined && loneSurrogate.test(key)) return Effect.fail(unrepresentable(method, "key", key))
+
+      if (value !== undefined && loneSurrogate.test(value)) return Effect.fail(unrepresentable(method, "value", key))
+
+      return effect
+    })
+
+  const invokeKeyed = <A>(method: string, key: string, run: () => Promise<A>, value?: string) =>
+    checked(method, key, invoker((operation, cause) => storageError(operation, cause, key))(method, run), value)
+
+  const namespacedKeys = (method: string) => checked(method, undefined, Effect.map(
     invokeKeyless(method, async () => {
       if (api.getKeys === undefined) return Object.keys(await api.get(null))
 
       return api.getKeys()
     }),
     (keys) => keys.filter((key) => key.startsWith(prefix))
-  )
+  ))
 
   const read = (method: string, key: string) => {
     const name = encodedKey(key)
@@ -113,7 +143,7 @@ export const make = (api: ChromeKeyValueStoreApi, options: Options = {}): KeyVal
       [encodedKey(key)]: Predicate.isString(value)
         ? { version: 1, type: "string", value }
         : { version: 1, type: "uint8array", value: Base64.encode(value) }
-    })),
+    }), Predicate.isString(value) ? value : undefined),
     remove: (key) => invokeKeyed("remove", key, () => api.remove(encodedKey(key))),
     has: (key) => {
       const name = encodedKey(key)

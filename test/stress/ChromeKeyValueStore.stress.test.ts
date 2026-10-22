@@ -297,6 +297,77 @@ describe("ChromeKeyValueStore stress", () => {
     expect(area.removed).toHaveLength(count)
   }))
 
+  it.effect("keeps 3,000 seeded random UTF-16 names and values exact across Chrome's UTF-8 boundary, rejecting lone surrogates", () => Effect.gen(function*() {
+    const area = heldArea()
+    const utf8 = (text: string) => new TextDecoder().decode(new TextEncoder().encode(text))
+
+    // Chrome converts every key and string through UTF-8, so a lone surrogate becomes U+FFFD.
+    const api: ChromeKeyValueStoreApi = {
+      get: (keys) => area.api.get(keys === null ? null : utf8(keys)),
+      set: (items) => area.api.set(Object.fromEntries(Object.entries(items).map(([name, value]) =>
+        [utf8(name), JSON.parse(JSON.stringify(value), (_, nested: string | number) => Predicate.isString(nested) ? utf8(nested) : nested)]))),
+      remove: (keys) => area.api.remove(Predicate.isString(keys) ? utf8(keys) : keys.map(utf8)),
+      getKeys: () => area.api.getKeys!()
+    }
+
+    const units = ["a", ":", "\u0000", "\ufffd", "é", "\ud83c", "\udf0d", "\ud800", "\udfff"]
+    const random = seeded(3_000)
+    const text = () => Array.from({ length: random(4) }, () => units[random(units.length)]!).join("")
+    const wellFormed = (value: string) => value === utf8(value)
+    // U+FFFD and both lone surrogates would all reach Chrome as the same namespace.
+    const namespaces = ["", "\ufffd", "\ud800", "\udfff", "🌍", "\ud83c"]
+    const stores = namespaces.map((namespace) => make(api, { namespace }))
+    const model = namespaces.map(() => new Map<string, string>())
+    let rejected = 0
+
+    for (let step = 0; step < 3_000; step++) {
+      const which = random(stores.length)
+      const store = stores[which]!
+      const entries = model[which]!
+      const key = text()
+      const value = text()
+      const valid = wellFormed(namespaces[which]!) && wellFormed(key)
+
+      switch (random(3)) {
+        case 0: {
+          const result = yield* Effect.result(store.set(key, value))
+
+          if (valid && wellFormed(value)) {
+            expect(Result.isSuccess(result)).toBe(true)
+            entries.set(key, value)
+          } else {
+            expect(Result.isFailure(result) && result.failure.method === "set").toBe(true)
+            rejected++
+          }
+
+          break
+        }
+
+        case 1: {
+          const result = yield* Effect.result(store.remove(key))
+          expect(Result.isSuccess(result)).toBe(valid)
+
+          if (valid) entries.delete(key)
+          break
+        }
+
+        default: {
+          const result = yield* Effect.result(store.get(key))
+
+          if (valid) expect(result).toEqual(Result.succeed(entries.get(key)))
+          else expect(Result.isFailure(result) && result.failure.method === "get").toBe(true)
+        }
+      }
+    }
+
+    for (const [index, store] of stores.entries()) {
+      const size = yield* Effect.result(store.size)
+      expect(Result.isSuccess(size) ? size.success : undefined).toBe(wellFormed(namespaces[index]!) ? model[index]!.size : undefined)
+    }
+
+    expect(rejected).toBeGreaterThan(0)
+  }))
+
   it.effect.each([true, false])("matches a reference model over 4,000 seeded operations on adversarial names (getKeys: %s)", (getKeys) => Effect.gen(function*() {
     const area = heldArea({ getKeys })
     const namespaces = ["", "a", "a:", "a:b", "0:", "🌍", "__proto__", defaultNamespace]
