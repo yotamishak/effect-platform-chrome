@@ -151,8 +151,9 @@ export interface FilterTarget {
 }
 
 /**
- * Whether Chrome would deliver a request to a listener registered with `filter`: an empty
- * `urls` list or any matching pattern, an empty or absent `types` list or a listed type,
+ * Whether Chrome would deliver a request to a listener registered with `filter`: a URL with
+ * a scheme webRequest reports (never `chrome:` or `data:`, say) and an empty `urls` list or
+ * any matching pattern, an empty or absent `types` list or a listed type,
  * and `tabId` and `windowId` when given and not -1. `windowId` is the window holding the
  * request's tab, -1 for requests outside a tab.
  */
@@ -178,8 +179,10 @@ const compileFilter = (filter: ChromeWebRequest.RequestFilter): CompiledFilter =
   const tabId = filter.tabId ?? -1
   const windowId = filter.windowId ?? -1
 
+  // Chrome never reports requests for other schemes, so even an empty `urls` list skips them.
   return (target, url, targetWindowId) =>
-    (anyUrl || (url !== undefined && patterns.some((pattern) => matchesParsed(pattern, url))))
+    url !== undefined && reportedSchemes.has(url.protocol.slice(0, -1))
+    && (anyUrl || patterns.some((pattern) => matchesParsed(pattern, url)))
     && (types === undefined || types.has(target.type))
     && (tabId === -1 || tabId === target.tabId)
     && (windowId === -1 || windowId === targetWindowId)
@@ -231,12 +234,23 @@ interface EventContext {
 
 const asError = (cause: unknown): Error => cause instanceof Error ? cause : new Error(String(cause))
 
-/** Runs each delivery, collecting listener exceptions as Chrome logs them. */
+/**
+ * Runs each delivery whose listener is still registered, collecting listener exceptions as
+ * Chrome logs them, and returns how many listeners ran. Like Chrome, a listener removed by
+ * an earlier one during the same dispatch is skipped.
+ */
 const dispatch = <Details>(
   deliveries: ReadonlyArray<readonly [Listening<Details>, Details]>,
+  isRegistered: (listening: Listening<Details>) => boolean,
   errors: Array<Error>
 ): number => {
+  let delivered = 0
+
   for (const [listening, details] of deliveries) {
+    if (!isRegistered(listening)) continue
+
+    delivered++
+
     try {
       listening.listener(details)
     } catch (cause) {
@@ -244,7 +258,7 @@ const dispatch = <Details>(
     }
   }
 
-  return deliveries.length
+  return delivered
 }
 
 const invalid = (name: RequestEventName, message: string) =>
@@ -301,6 +315,9 @@ const makeRequestEvent = <Details extends FilterTarget>(
   strip: (details: Details, spec: ReadonlySet<string>) => void
 ) => {
   const listeners: Array<Listening<Details>> = []
+  // The same registrations as a set, so dispatch can skip removed ones cheaply.
+  const active = new Set<Listening<Details>>()
+  const isRegistered = (listening: Listening<Details>) => active.has(listening)
   const waiting = new Set<{ readonly count: number, readonly resolve: () => void }>()
   const failures = new Map<"addListener" | "removeListener", Array<Error>>()
   const calls: Array<Registration> = []
@@ -331,7 +348,9 @@ const makeRequestEvent = <Details extends FilterTarget>(
 
       // Like Chrome, each call is its own registration, even for a function already registered.
       const copy = structuredClone(filter)
-      listeners.push({ listener, filter: copy, matches: compileFilter(copy), spec: new Set(spec) })
+      const listening: Listening<Details> = { listener, filter: copy, matches: compileFilter(copy), spec: new Set(spec) }
+      listeners.push(listening)
+      active.add(listening)
 
       for (const waiter of waiting) {
         if (listeners.length >= waiter.count) {
@@ -346,6 +365,7 @@ const makeRequestEvent = <Details extends FilterTarget>(
       // Chrome removes every registration of the function.
       for (const listening of listeners.filter((each) => each.listener === listener)) {
         listeners.splice(listeners.indexOf(listening), 1)
+        active.delete(listening)
 
         for (const notify of removed) notify(listening)
       }
@@ -370,6 +390,7 @@ const makeRequestEvent = <Details extends FilterTarget>(
   return {
     api,
     deliveries,
+    isRegistered,
     onRemoved: (notify: (listener: Listening<Details>) => void) => { removed.push(notify) },
     controls: {
       /** Active registrations; a function registered twice counts twice. */
@@ -391,7 +412,7 @@ const makeRequestEvent = <Details extends FilterTarget>(
         failures.set(operation, queue)
       },
       /** Delivers one event to the matching listeners and returns how many received it. */
-      emit: (details: Details): number => dispatch(deliveries(details), context.listenerErrors)
+      emit: (details: Details): number => dispatch(deliveries(details), isRegistered, context.listenerErrors)
     }
   }
 }
@@ -497,7 +518,9 @@ const statusLine = (statusCode: number) => `HTTP/1.1 ${statusCode} ${statusLines
  * onAuthRequired may block, and only with `options.authProvider` (the default).
  *
  * `controls.request` drives a request through its lifecycle, and each event's `emit`
- * delivers single events. `onAuthRequired.challenge` resolves with the answers of its
+ * delivers single events. Requests for schemes webRequest does not report (`chrome:`,
+ * `data:`, ...) reach no listener, and a listener removed by an earlier one during the
+ * same dispatch is skipped. `onAuthRequired.challenge` resolves with the answers of its
  * `"asyncBlocking"` listeners; one removed while its challenge is pending, or one that
  * throws, counts as `{}`, as Chrome unblocks the request. Other onAuthRequired listeners,
  * synchronous `"blocking"` ones included, are only notified. Timestamps come from a counter and request ids are
@@ -562,8 +585,11 @@ export const makeWebRequest = (
     const answers: Array<Promise<ChromeWebRequest.AuthAnswer>> = []
 
     for (const [listening, copy] of authRequired.deliveries(details)) {
+      // A listener an earlier one removed during this dispatch neither runs nor blocks.
+      if (!authRequired.isRegistered(listening)) continue
+
       if (!listening.spec.has("asyncBlocking")) {
-        dispatch([[listening, copy]], listenerErrors)
+        dispatch([[listening, copy]], authRequired.isRegistered, listenerErrors)
         continue
       }
 
@@ -630,7 +656,13 @@ export const makeWebRequest = (
     }
 
     for (const [index, hop] of hops.entries()) {
-      const isFile = new URL(hop.url).protocol === "file:"
+      const scheme = new URL(hop.url).protocol.slice(0, -1)
+
+      // Chrome reports nothing for other schemes; after a redirect to one, such as `data:`,
+      // onBeforeRedirect is the request's last event.
+      if (!reportedSchemes.has(scheme)) break
+
+      const isFile = scheme === "file"
       const final = index === hops.length - 1
       const before = base(hop.url)
 

@@ -181,7 +181,8 @@ export interface ChromeWebRequestService {
   /**
    * Answers authentication challenges for matching requests until the scope closes,
    * registering an `"asyncBlocking"` listener (plus any `extraInfoSpec` flags). Each
-   * challenge runs `answer` in its own fiber with the caller's services and is answered
+   * challenge runs `answer` in its own fiber and scope (closed once Chrome has the answer)
+   * with the caller's services, and is answered
    * exactly once: with the answer's credentials or cancellation, or with no action (`{}`)
    * when `answer` dies, is interrupted, or is still running when the scope closes, and for
    * challenges that arrive while the listener is being removed. Handle failures inside
@@ -303,8 +304,11 @@ const answerer = (getEvent: () => AuthRequiredEvent | undefined) => <R>(
     if (!active) return fallback()
 
     unanswered.add(fallback)
+    // Each challenge gets its own scope, so resources an answer acquires are released once
+    // Chrome has its answer rather than piling up until the registration closes.
     run(Effect.suspend(() => answer(details)).pipe(
       Effect.onExit((exit) => Effect.sync(() => settle(Exit.isSuccess(exit) ? responseOf(exit.value) : noAction()))),
+      Effect.scoped,
       Effect.exit
     ))
   }

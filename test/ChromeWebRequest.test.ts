@@ -1105,3 +1105,146 @@ describe("makeWebRequest fixture: authentication", () => {
     expect(fixture.controls.onCompleted.listenerCount).toBe(0)
   }))
 })
+
+describe("ChromeWebRequest edge cases", () => {
+  it.effect("closes each challenge's own scope once it is answered, not when the registration closes", () => Effect.gen(function*() {
+    const api = mockApi()
+    const order: Array<string> = []
+    const released = yield* Deferred.make<void>()
+
+    const answer = (details: WebRequest.AuthRequired) => Effect.addFinalizer(() => Effect.sync(() => {
+      order.push(`released ${details.requestId}`)
+      Deferred.doneUnsafe(released, Exit.void)
+    })).pipe(Effect.as({ cancel: true }))
+
+    const { scope } = yield* register(api, answer)
+    const callback = vi.fn((_response: chrome.webRequest.BlockingResponse) => { order.push(`answered ${challenge.requestId}`) })
+    api.onAuthRequired.controls.emit(challenge, callback)
+    yield* Deferred.await(released)
+    // Chrome gets its answer before the challenge's resources are released.
+    expect(order).toStrictEqual(["answered 1", "released 1"])
+    yield* Scope.close(scope, Exit.void)
+    expect(order).toStrictEqual(["answered 1", "released 1"])
+  }))
+
+  it.effect("releases an interrupted challenge's resources after answering it with no action", () => Effect.gen(function*() {
+    const api = mockApi()
+    const order: Array<string> = []
+    const started = yield* Deferred.make<void>()
+
+    const answer = () => Effect.addFinalizer(() => Effect.sync(() => { order.push("released") })).pipe(
+      Effect.andThen(Deferred.succeed(started, undefined)),
+      Effect.andThen(Effect.never)
+    )
+
+    const { scope } = yield* register(api, answer)
+    api.onAuthRequired.controls.emit(challenge, (response) => { order.push(`answered ${JSON.stringify(response)}`) })
+    yield* Deferred.await(started)
+    yield* Scope.close(scope, Exit.void)
+    expect(order).toStrictEqual(["answered {}", "released"])
+  }))
+
+  it.effect("answers pending challenges and removes the listener when a parallel scope closes", () => Effect.gen(function*() {
+    const api = mockApi()
+    const scope = yield* Scope.make("parallel")
+    const started = yield* Deferred.make<void>()
+    const answer = () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never))
+    yield* make(api).answerAuthRequired(filter, answer).pipe(Scope.provide(scope))
+    const listener = api.onAuthRequired.addListener.mock.calls[0]?.[0]
+    const { callback } = yield* answerCallback
+    api.onAuthRequired.controls.emit(challenge, callback)
+    yield* Deferred.await(started)
+    const late = vi.fn((_response: chrome.webRequest.BlockingResponse) => {})
+    api.onAuthRequired.removeListener.mockImplementationOnce((removed) => { removed(challenge, late) })
+    yield* Scope.close(scope, Exit.void)
+    expect([callback.mock.calls, late.mock.calls]).toStrictEqual([[[{}]], [[{}]]])
+    expect(api.onAuthRequired.removeListener).toHaveBeenCalledExactlyOnceWith(listener)
+  }))
+
+  it.effect("registers nothing that outlives a scope that was already closed", () => Effect.gen(function*() {
+    const api = mockApi()
+    const scope = yield* Scope.make()
+    yield* Scope.close(scope, Exit.void)
+    const answer = vi.fn((_details: WebRequest.AuthRequired) => Effect.succeed({ cancel: true }))
+    yield* make(api).answerAuthRequired(filter, answer).pipe(Scope.provide(scope))
+    expect(api.onAuthRequired.controls.listenerCount).toBe(0)
+    const late = vi.fn((_response: chrome.webRequest.BlockingResponse) => {})
+    api.onAuthRequired.addListener.mock.calls[0]?.[0](challenge, late)
+    expect(late.mock.calls).toStrictEqual([[{}]])
+    expect(answer).not.toHaveBeenCalled()
+  }))
+
+  it.effect("answers a challenge Chrome raises again from inside the answer callback", () => Effect.gen(function*() {
+    const api = mockApi()
+    const { scope, listener } = yield* register(api, (details) => Effect.succeed(details.requestId === "1" ? { cancel: false } : { cancel: true }))
+    const retried = yield* answerCallback
+
+    // Rejected credentials make Chrome raise the next challenge for the same request.
+    const first = vi.fn((_response: chrome.webRequest.BlockingResponse) => { listener({ ...challenge, requestId: "2" }, retried.callback) })
+
+    api.onAuthRequired.controls.emit(challenge, first)
+    expect(yield* Deferred.await(retried.answered)).toStrictEqual({ cancel: true })
+    expect(first.mock.calls).toStrictEqual([[{ cancel: false }]])
+    yield* Scope.close(scope, Exit.void)
+    expect(retried.callback).toHaveBeenCalledTimes(1)
+  }))
+
+  it("never matches a scheme webRequest does not report, even with an empty urls list", () => {
+    for (const url of ["chrome://settings/", "data:text/plain,hi", "blob:https://a.example/1", "not a url"]) {
+      expect(matchesRequestFilter({ urls: [] }, { url, type: "other", tabId: -1 })).toBe(false)
+    }
+
+    expect(matchesRequestFilter({ urls: [] }, { url: "wss://a.example/", type: "websocket", tabId: -1 })).toBe(true)
+  })
+
+  it("reports nothing for an unreported scheme and ends at onBeforeRedirect for a redirect to data:", () => {
+    const fixture = makeWebRequest()
+    const seen: Array<string> = []
+
+    for (const name of filteredNames) {
+      if (name !== "onAuthRequired") fixture.api[name].addListener(() => { seen.push(name) }, { urls: [] })
+    }
+
+    expect(fixture.controls.request({ url: "data:text/plain,hi" }).events).toStrictEqual([])
+    expect(fixture.controls.request({ url: "chrome://settings/", error: "net::ERR_FAILED" }).events).toStrictEqual([])
+    expect(seen).toStrictEqual([])
+    const redirected = fixture.controls.request({ url: "data:text/plain,hi", redirects: [{ url: "https://a.example/", statusCode: 307 }] })
+    const hop = ["onBeforeRequest", "onBeforeSendHeaders", "onSendHeaders", "onHeadersReceived", "onBeforeRedirect"]
+    expect(redirected.events).toStrictEqual(hop)
+    expect(seen).toStrictEqual(hop)
+  })
+
+  it("does not call a listener removed earlier in the same dispatch", () => {
+    const { api, controls } = makeWebRequest()
+    const all: WebRequest.RequestFilter = { urls: ["<all_urls>"] }
+    const removed = vi.fn()
+    api.onCompleted.addListener(() => { api.onCompleted.removeListener(removed) }, all)
+    api.onCompleted.addListener(removed, all)
+    expect(controls.onCompleted.emit(samples.onCompleted)).toBe(1)
+    expect(removed).not.toHaveBeenCalled()
+  })
+
+  it("settles a challenge at once for an asyncBlocking listener removed earlier in the same dispatch", async () => {
+    const { api, controls } = makeWebRequest()
+    const all: WebRequest.RequestFilter = { urls: ["<all_urls>"] }
+    const parked = vi.fn()
+    api.onAuthRequired.addListener(() => { api.onAuthRequired.removeListener(parked) }, all)
+    api.onAuthRequired.addListener(parked, all, ["asyncBlocking"])
+    const answers = controls.onAuthRequired.challenge(challenge)
+    expect(controls.onAuthRequired.pendingChallenges).toBe(0)
+    expect(await answers).toStrictEqual([])
+    expect(parked).not.toHaveBeenCalled()
+  })
+
+  it.effect("restarts a stream after a registration failure with a fresh listener", () => Effect.gen(function*() {
+    const api = mockApi()
+    const stream = make(api).onCompleted(filter)
+    api.onCompleted.controls.failNext("addListener", new Error("transient"))
+    expect(yield* Effect.flip(Stream.runDrain(stream))).toMatchObject({ operation: "onCompleted" })
+    const fiber = yield* Effect.forkScoped(Stream.runCollect(Stream.take(stream, 1)))
+    yield* Effect.promise(() => api.onCompleted.waitForRegistrations(1))
+    api.onCompleted.controls.emit(samples.onCompleted)
+    expect(yield* Fiber.join(fiber)).toStrictEqual([samples.onCompleted])
+    expect(api.onCompleted.controls.listenerCount).toBe(0)
+  }))
+})

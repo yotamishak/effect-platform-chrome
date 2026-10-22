@@ -507,6 +507,44 @@ describe("ChromeWebRequest stress: authentication", () => {
     expect(events.onAuthRequired.listeners.size).toBe(0)
   }))
 
+  it.effect("releases each of 1,024 challenges' resources once answered while the registration stays open", () => Effect.gen(function*() {
+    const random = seeded(0x5c0)
+    const { api, events } = stressApi()
+    const held = new Set<string>()
+    const plan = range(1024).map((index) => ({ index, gate: Deferred.makeUnsafe<void>(), done: Deferred.makeUnsafe<void>() }))
+    const steps = new Map(plan.map((entry) => [String(entry.index), entry]))
+
+    const answer = (challenge: WebRequest.AuthRequired) => {
+      const step = required(steps, challenge.requestId)
+
+      return Effect.acquireRelease(
+        Effect.sync(() => { held.add(challenge.requestId) }),
+        () => Effect.sync(() => {
+          held.delete(challenge.requestId)
+          Deferred.doneUnsafe(step.done, Exit.void)
+        })
+      ).pipe(Effect.andThen(Deferred.await(step.gate)), Effect.as({ cancel: true }))
+    }
+
+    const scope = yield* Scope.make()
+    yield* make(api).answerAuthRequired({ urls: ["<all_urls>"] }, answer).pipe(Scope.provide(scope))
+    const listener = yield* events.onAuthRequired.registration(-1)
+    const answered = vi.fn((_response: chrome.webRequest.BlockingResponse) => {})
+
+    for (const { index } of plan) listener(details(index), answered)
+
+    const released = shuffle(random, plan).slice(0, 768)
+
+    for (const { gate } of released) yield* Deferred.succeed(gate, undefined)
+
+    yield* Effect.forEach(released, ({ done }) => Deferred.await(done), { discard: true })
+    expect(answered).toHaveBeenCalledTimes(768)
+    expect(held.size).toBe(256)
+    yield* Scope.close(scope, Exit.void)
+    expect(held.size).toBe(0)
+    expect(answered.mock.calls.slice(768)).toStrictEqual(range(256).map(() => [{}]))
+  }))
+
   it.effect("keeps 256 concurrent registrations independent while their scopes close in seeded order", () => Effect.gen(function*() {
     const random = seeded(0x256)
     const { api, events } = stressApi()

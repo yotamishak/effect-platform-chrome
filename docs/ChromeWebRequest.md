@@ -85,8 +85,9 @@ const proxyCredentials = Effect.gen(function*() {
 }).pipe(Effect.scoped)
 ```
 
-Each challenge runs `answer` in its own fiber with the caller's services and is answered
-exactly once:
+Each challenge runs `answer` in its own fiber and scope with the caller's services, and is
+answered exactly once; resources the answer acquires are released right after Chrome
+receives the answer, not when the registration closes:
 
 | `answer` | Chrome receives |
 | --- | --- |
@@ -117,7 +118,9 @@ returning `{ api, layer, controls }`:
 - Listeners are matched like Chrome's: match patterns via `matchesUrlPattern` (`<all_urls>`,
   the `*` scheme for http and https, `*.host` subdomain wildcards, ports, and glob paths
   including the query), `types`, `tabId`, and `windowId` (place tabs in windows with
-  `controls.setTabWindow`). `matchesRequestFilter` and `parseUrlPattern` are exported too.
+  `controls.setTabWindow`). Requests for schemes webRequest does not report (`chrome:`,
+  `data:`, ...) match no filter, even an empty `urls` list. `matchesRequestFilter` and
+  `parseUrlPattern` are exported too.
 - Each listener receives its own copy of the details, without the optional fields its
   flags did not ask for (`requestBody`, `requestHeaders`, `responseHeaders`,
   `securityInfo`, and certificate bytes without `"securityInfoRawDer"`).
@@ -126,9 +129,11 @@ returning `{ api, layer, controls }`:
   blocking registration without permission (only onAuthRequired may block, and only with
   `options.authProvider`, the default).
 - `controls.request({ url, redirects?, response?, error?, ... })` drives a request through
-  its lifecycle in Chrome's order, following redirects with Fetch's method rules;
+  its lifecycle in Chrome's order, following redirects with Fetch's method rules (a
+  redirect to an unreported scheme such as `data:` ends at onBeforeRedirect);
   `controls.<event>.emit(details)` delivers single events; and
   `controls.onAuthRequired.challenge(details)` resolves with each `"asyncBlocking"`
-  listener's answer (`{}` for a listener that throws or is removed first).
+  listener's answer (`{}` for a listener that throws or is removed while pending). A
+  listener removed by an earlier one during the same dispatch is skipped.
 - `controls.listenerErrors` collects exceptions thrown by listeners, and
   `controls.handlerBehaviorChangedCalls` counts flushes.
