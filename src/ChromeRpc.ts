@@ -9,6 +9,7 @@ import * as RpcMessage from "effect/rpc/RpcMessage"
 import type * as Rpc from "effect/rpc/Rpc"
 import type * as RpcGroup from "effect/rpc/RpcGroup"
 import type { NativePort, Ownership, RuntimeApi } from "./ChromePort.js"
+import * as PortLink from "./internal/port.js"
 
 /** Limits apply per port. Overflow terminates the transport rather than losing frames. */
 export interface Options {
@@ -83,21 +84,16 @@ const transport = Effect.fnUntraced(function*(
   const closed = yield* Deferred.make<void>()
   const parser = RpcSerialization.json.makeUnsafe()
   let failure: ChromeRpcError | undefined
-  let released = false
 
-  const detach = () => {
-    try { native.onMessage.removeListener(onMessage) } finally { native.onDisconnect.removeListener(onDisconnect) }
-  }
-
+  // Every termination, including Chrome's own disconnect, also disconnects an owned port.
   const stop = (error: ChromeRpcError) => {
     if (failure !== undefined) return
     failure = error
+    link.close()
 
-    try { detach() } catch { /* Preserve the first transport failure. */ }
+    try { link.detach() } catch { /* Preserve the first transport failure. */ }
 
-    if (ownership === "owned") {
-      try { native.disconnect() } catch { /* Best-effort terminal disconnect. */ }
-    }
+    try { link.disconnect() } catch { /* Best-effort terminal disconnect. */ }
 
     // Unsafe completion may resume waiting effects reentrantly. Publish only after cleanup.
     Deferred.doneUnsafe(ready, Effect.fail(error))
@@ -105,54 +101,31 @@ const transport = Effect.fnUntraced(function*(
     Queue.failCauseUnsafe(queue, Cause.fail(error))
   }
 
-  // Native Chrome message callbacks are an untrusted I/O boundary.
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters
-  const onMessage = (message: unknown) => {
-    if (failure !== undefined || released) return
-
-    if (!Predicate.isString(message) || message.length > maxFrameLength) {
-      stop(new ChromeRpcError({ message: "Invalid or oversized RPC frame", cause: undefined }))
-    } else if (!Queue.offerUnsafe(queue, message)) {
-      stop(new ChromeRpcError({ message: "RPC receive buffer overflow", cause: undefined }))
+  const link = PortLink.make(native, ownership, () => api.lastError, {
+    onMessage: (message) => {
+      if (!Predicate.isString(message) || message.length > maxFrameLength) {
+        stop(new ChromeRpcError({ message: "Invalid or oversized RPC frame", cause: undefined }))
+      } else if (!Queue.offerUnsafe(queue, message)) {
+        stop(new ChromeRpcError({ message: "RPC receive buffer overflow", cause: undefined }))
+      }
+    },
+    onDisconnect: (lastError) => {
+      stop(new ChromeRpcError({ message: lastError?.message ?? "Chrome RPC port disconnected", cause: undefined }))
     }
-  }
-
-  const onDisconnect = () => {
-    const lastError = api.lastError
-    stop(new ChromeRpcError({ message: lastError?.message ?? "Chrome RPC port disconnected", cause: undefined }))
-  }
+  })
 
   yield* Effect.addFinalizer(() => Effect.sync(() => {
-    released = true
     stop(new ChromeRpcError({ message: "Chrome RPC scope closed", cause: undefined }))
     Queue.shutdownUnsafe(queue)
   }))
   yield* Effect.try({
-    try: () => {
-      native.onDisconnect.addListener(onDisconnect)
-
-      if (failure === undefined) native.onMessage.addListener(onMessage)
-    },
-    catch: (cause) => {
-      if (failure !== undefined) {
-        // A callback can close the wire before a hostile registration inserts and throws.
-        try { detach() } catch { /* Preserve the first transport failure. */ }
-
-        return failure
-      }
-
-      return new ChromeRpcError({ message: "Chrome RPC listener registration failed", cause })
-    }
+    try: link.register,
+    // A callback can close the wire before a hostile registration inserts and throws.
+    catch: (cause) => failure ?? new ChromeRpcError({ message: "Chrome RPC listener registration failed", cause })
   }).pipe(Effect.tapError((error) => Effect.sync(() => stop(error))))
 
   // Registration callbacks may synchronously report an already-dead port.
-  if (failure !== undefined) {
-    yield* Effect.sync(() => {
-      try { detach() } catch { /* Preserve the first transport failure. */ }
-    })
-
-    return yield* failure
-  }
+  if (failure !== undefined) return yield* failure
 
   // The serializer accepts protocol envelopes whose schema payload holes are unknown.
   // oxlint-disable-next-line anti-slop/no-unknown-parameters
