@@ -19,12 +19,21 @@ export type ScriptSource = chrome.userScripts.ScriptSource
 export type ExecutionWorld = NonNullable<RegisteredUserScript["world"]>
 
 /**
- * What `register` needs: Chrome rejects a script without `matches` or with an empty `js`.
- * The id must not be empty or start with `_`, and must not already be registered.
+ * Chrome rejects any `worldId`, even `""`, together with the `MAIN` world; only `USER_SCRIPT`
+ * worlds (the default) are named.
  */
-export type UserScriptRegistration = RegisteredUserScript & {
+export type WorldSelection =
+  | { world?: "USER_SCRIPT" | undefined, worldId?: string | undefined }
+  | { world: "MAIN", worldId?: undefined }
+
+/**
+ * What `register` needs: Chrome rejects a script without `matches`, with an empty `matches`
+ * or `js`, or with a `worldId` in the `MAIN` world. The id must not be empty or start with
+ * `_`, and must not already be registered.
+ */
+export type UserScriptRegistration = RegisteredUserScript & WorldSelection & {
   js: [ScriptSource, ...Array<ScriptSource>]
-  matches: Array<string>
+  matches: [string, ...Array<string>]
 }
 
 /** Selects scripts by id. Omitted `ids` selects every script; an empty list selects none. */
@@ -39,7 +48,8 @@ export type WorldProperties = chrome.userScripts.WorldProperties
 /** The tab, and optionally `allFrames`, `frameIds` or `documentIds` (at most one of them). */
 export type InjectionTarget = chrome.userScripts.InjectionTarget
 
-export type UserScriptInjection = chrome.userScripts.UserScriptInjection
+/** A one-off injection; like a registration, it names a world only in `USER_SCRIPT`. */
+export type UserScriptInjection = chrome.userScripts.UserScriptInjection & WorldSelection
 
 /**
  * One frame's outcome of `execute`. Code-string results are an untyped browser I/O
@@ -74,13 +84,15 @@ export interface ChromeUserScriptsService {
   /**
    * Registers scripts atomically: Chrome rejects the whole call for a duplicate or reserved
    * id, a source with both or neither of `code` and `file`, a `worldId` with the `MAIN`
-   * world, or a file it cannot load. Registrations are cleared when the extension updates.
+   * world, an empty or invalid `matches`, or a file it cannot load. Registrations are cleared
+   * when the extension updates.
    */
   readonly register: (scripts: Array<UserScriptRegistration>) => Effect.Effect<void, ChromeUserScriptsError>
   /**
-   * Changes only the supplied properties; if any id is unknown or any result is invalid,
-   * nothing changes. Chrome never updates `includeGlobs` or `excludeGlobs`, and
-   * `worldId: ""` moves a script back to the default world.
+   * Changes only the supplied properties; if any id is empty, reserved, repeated or unknown,
+   * or any result is invalid, nothing changes. Chrome never updates `includeGlobs` or
+   * `excludeGlobs`, and `worldId: ""` moves a script back to the default world. Chrome
+   * re-adds updated scripts, so they move to the end of `getScripts` in batch order.
    */
   readonly update: (scripts: Array<RegisteredUserScript>) => Effect.Effect<void, ChromeUserScriptsError>
   /**
@@ -89,8 +101,8 @@ export interface ChromeUserScriptsService {
    */
   readonly unregister: (filter?: UserScriptFilter) => Effect.Effect<void, ChromeUserScriptsError>
   /**
-   * Registered scripts in registration order, with Chrome's defaults filled in, optionally
-   * only those with the filter's ids.
+   * Registered scripts in registration order (an updated script moves to the end), with
+   * Chrome's defaults filled in, optionally only those with the filter's ids.
    */
   readonly getScripts: (filter?: UserScriptFilter) => Effect.Effect<Array<RegisteredUserScript>, ChromeUserScriptsError>
   /**
@@ -99,11 +111,14 @@ export interface ChromeUserScriptsService {
    * with `messaging: true`. Chrome refuses once 100 worlds are configured.
    */
   readonly configureWorld: (properties: WorldProperties) => Effect.Effect<void, ChromeUserScriptsError>
-  /** Every configured world; the default world's entry has no `worldId` (Chrome 133+). */
+  /**
+   * Every configured world, ordered by the UTF-8 bytes of its id, with the default world's
+   * entry (which has no `worldId`) sorted as `"_default"` (Chrome 133+).
+   */
   readonly getWorldConfigurations: Effect.Effect<Array<WorldProperties>, ChromeUserScriptsError>
   /**
-   * Forgets `worldId`'s configuration, or the default world's when omitted, so it uses the
-   * default configuration. Resetting an unconfigured world succeeds (Chrome 133+).
+   * Forgets `worldId`'s configuration, or the default world's when omitted or `""`, so it
+   * uses the default configuration. Resetting an unconfigured world succeeds (Chrome 133+).
    */
   readonly resetWorldConfiguration: (worldId?: string) => Effect.Effect<void, ChromeUserScriptsError>
   /**

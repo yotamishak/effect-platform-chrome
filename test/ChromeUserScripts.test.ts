@@ -163,8 +163,35 @@ describe("ChromeUserScripts", () => {
     const emptyJs: UserScriptRegistration = { id: "a", matches: [], js: [] }
     // @ts-expect-error negative test: Chrome rejects a registration without matches
     const withoutMatches: UserScriptRegistration = { id: "a", js: [{ file: "a.js" }] }
-    expect([withoutJs, emptyJs, withoutMatches].map((registration) => registration.id)).toEqual(["a", "a", "a"])
-    yield* userScripts.register([{ id: "minimal", matches: [], js: [{ file: "minimal.js" }] }])
+    // @ts-expect-error negative test: Chrome rejects an empty matches list
+    const emptyMatches: UserScriptRegistration = { id: "a", matches: [], js: [{ file: "a.js" }] }
+    // @ts-expect-error negative test: Chrome rejects a world id with the MAIN world
+    const mainWithWorldId: UserScriptRegistration = { id: "a", matches: ["<all_urls>"], js: [{ file: "a.js" }], world: "MAIN", worldId: "w" }
+    expect([withoutJs, emptyJs, withoutMatches, emptyMatches, mainWithWorldId].map((registration) => registration.id)).toEqual(["a", "a", "a", "a", "a"])
+    yield* userScripts.register([{ id: "minimal", matches: ["<all_urls>"], js: [{ file: "minimal.js" }] }])
+    yield* userScripts.register([{ id: "main", matches: ["<all_urls>"], js: [{ file: "main.js" }], world: "MAIN" }])
+    yield* userScripts.register([{ id: "isolated", matches: ["<all_urls>"], js: [{ file: "w.js" }], world: "USER_SCRIPT", worldId: "w" }])
+  }))
+
+  it.effect("types injections to keep world ids out of the MAIN world", () => Effect.gen(function*() {
+    const userScripts = make(mockApi())
+    // @ts-expect-error negative test: Chrome rejects a world id with the MAIN world
+    const mainWithWorldId: UserScriptInjection = { target: { tabId: 1 }, js: [{ code: "1" }], world: "MAIN", worldId: "" }
+    expect(mainWithWorldId.world).toBe("MAIN")
+    yield* userScripts.execute({ target: { tabId: 1 }, js: [{ code: "1" }], world: "MAIN" })
+    yield* userScripts.execute({ target: { tabId: 1 }, js: [{ code: "1" }], worldId: "w" })
+  }))
+
+  it.effect("fails every call with the typed error when reading a member of the API throws", () => Effect.gen(function*() {
+    const revoked = new Error("The userScripts API is only available for users in developer mode.")
+    // A namespace whose every member read throws, as an access check on property access would.
+    const throwing: ChromeUserScriptsApi = new Proxy(mockApi(), { get: () => { throw revoked } })
+    const userScripts = make(throwing)
+    expect(yield* userScripts.isAvailable).toBe(false)
+
+    for (const [operation, run] of calls) {
+      expect(yield* Effect.flip(run(userScripts))).toMatchObject({ operation, cause: revoked })
+    }
   }))
 
   it.effect("probes the injected API for availability on every run and never fails", () => Effect.gen(function*() {
@@ -290,8 +317,8 @@ describe("makeUserScripts", () => {
       [[registration("ok"), { id: "bare", matches: [], js: [] }], "User script with ID 'bare' must specify at least one js source."],
       [loaded(`[{ "id": "both", "matches": [], "js": [{ "code": "1", "file": "a.js" }] }]`), "User script with ID 'both' must specify exactly one of 'code' or 'file' as a js source."],
       [loaded(`[{ "id": "neither", "matches": [], "js": [{}] }]`), "User script with ID 'neither' must specify exactly one of 'code' or 'file' as a js source."],
-      [[registration("main", { world: "MAIN", worldId: "w" })], "World ID can only be specified for USER_SCRIPT worlds."],
-      [[registration("main", { world: "MAIN", worldId: "" })], "World ID can only be specified for USER_SCRIPT worlds."],
+      [[{ id: "main", matches: ["https://example.com/*"], js: [{ code: "1" }], world: "MAIN", worldId: "w" }], "World ID can only be specified for USER_SCRIPT worlds."],
+      [[{ id: "main", matches: ["https://example.com/*"], js: [{ code: "1" }], world: "MAIN", worldId: "" }], "World ID can only be specified for USER_SCRIPT worlds."],
       [[registration("reserved", { worldId: "_w" })], "World IDs beginning with '_' are reserved."],
       [[registration("long", { worldId: "w".repeat(257) })], "World IDs must be at most 256 characters."]
     ]
@@ -307,12 +334,12 @@ describe("makeUserScripts", () => {
     expect(fixture.controls.scripts().map(({ id }) => id)).toEqual(["kept", "long"])
   }))
 
-  it.effect("updates supplied fields atomically, keeping globs and registration order", () => Effect.gen(function*() {
+  it.effect("updates supplied fields atomically, keeping globs", () => Effect.gen(function*() {
     const fixture = makeUserScripts()
     const userScripts = make(fixture.api)
     yield* userScripts.register([registration("a", { includeGlobs: ["*a*"], worldId: "w" }), registration("b")])
     yield* userScripts.update([{ id: "a", runAt: "document_end", includeGlobs: ["*changed*"], excludeGlobs: ["*x*"], allFrames: true }])
-    expect(fixture.controls.scripts()[0]).toEqual({
+    expect(fixture.controls.scripts().find(({ id }) => id === "a")).toEqual({
       id: "a", matches: ["https://example.com/*"], js: [{ code: "\"a\"" }], allFrames: true, runAt: "document_end",
       world: "USER_SCRIPT", worldId: "w", includeGlobs: ["*a*"]
     })
@@ -326,7 +353,88 @@ describe("makeUserScripts", () => {
     expect(fixture.controls.scripts()).toEqual(before)
     yield* userScripts.update([{ id: "a", worldId: "" }])
     yield* userScripts.update([{ id: "a", world: "MAIN" }])
-    expect(fixture.controls.scripts().map(({ id, world, worldId }) => [id, world, worldId])).toEqual([["a", "MAIN", undefined], ["b", "USER_SCRIPT", undefined]])
+    expect(fixture.controls.scripts().map(({ id, world, worldId }) => [id, world, worldId])).toEqual([["b", "USER_SCRIPT", undefined], ["a", "MAIN", undefined]])
+  }))
+
+  it.effect("moves updated scripts to the end in update order, as Chrome removes and re-adds them", () => Effect.gen(function*() {
+    const fixture = makeUserScripts()
+    const userScripts = make(fixture.api)
+    yield* userScripts.register(["a", "b", "c", "d"].map((id) => registration(id)))
+    yield* userScripts.update([{ id: "c" }, { id: "a", runAt: "document_start" }])
+    expect((yield* userScripts.getScripts()).map(({ id }) => id)).toEqual(["b", "d", "c", "a"])
+    expect((yield* userScripts.getScripts({ ids: ["a", "b"] })).map(({ id }) => id)).toEqual(["b", "a"])
+    yield* rejection(userScripts.update([{ id: "b" }, { id: "missing" }]))
+    expect(fixture.controls.scripts().map(({ id }) => id)).toEqual(["b", "d", "c", "a"])
+  }))
+
+  it.effect("validates update ids like Chrome before looking any script up", () => Effect.gen(function*() {
+    const fixture = makeUserScripts()
+    const userScripts = make(fixture.api)
+    yield* userScripts.register([registration("a"), registration("b")])
+    const before = fixture.controls.scripts()
+    expect(yield* rejection(userScripts.update([{ id: "missing" }, { id: "" }]))).toEqual(["update", "Script's ID must not be empty"])
+    expect(yield* rejection(userScripts.update([{ id: "a" }, { id: "_a" }]))).toEqual(["update", "Script's ID '_a' must not start with '_'"])
+    expect(yield* rejection(userScripts.update([{ id: "a", runAt: "document_start" }, { id: "b" }, { id: "a", allFrames: true }])))
+      .toEqual(["update", "Duplicate script ID 'a'"])
+    expect(yield* rejection(userScripts.update([{ id: "missing" }, { id: "missing" }]))).toEqual(["update", "Duplicate script ID 'missing'"])
+    expect(fixture.controls.scripts()).toEqual(before)
+  }))
+
+  it.effect("rejects an empty matches list on register and update, after the source and world checks", () => Effect.gen(function*() {
+    const fixture = makeUserScripts()
+    const userScripts = make(fixture.api)
+    yield* userScripts.register([registration("kept")])
+    // Definitions loaded from storage: the type forbids an empty matches list; Chrome rejects it.
+    const unmatched = loaded(`[{ "id": "kept-too", "matches": ["https://example.com/*"], "js": [{ "code": "1" }] }, { "id": "none", "matches": [], "js": [{ "code": "1" }] }]`)
+    // SAFETY: invalid registrations are the subject here; the fixture, like Chrome, must reject them.
+    expect(yield* rejection(userScripts.register(unmatched as Array<UserScriptRegistration>)))
+      .toEqual(["register", "Script with ID 'none' must specify at least one match."])
+    const worldFirst = loaded(`[{ "id": "none", "matches": [], "js": [{ "code": "1" }], "worldId": "_w" }]`)
+    // SAFETY: as above.
+    expect(yield* rejection(userScripts.register(worldFirst as Array<UserScriptRegistration>)))
+      .toEqual(["register", "World IDs beginning with '_' are reserved."])
+    yield* userScripts.register([registration("other")])
+    expect(yield* rejection(userScripts.update([{ id: "other", runAt: "document_start" }, { id: "kept", matches: [] }])))
+      .toEqual(["update", "Script with ID 'kept' must specify at least one match."])
+    expect(fixture.controls.scripts().map(({ id, runAt }) => [id, runAt])).toEqual([["kept", "document_idle"], ["other", "document_idle"]])
+  }))
+
+  it.effect("lists world configurations in Chrome's byte-wise key order, the default world as \"_default\"", () => Effect.gen(function*() {
+    const fixture = makeUserScripts()
+    const userScripts = make(fixture.api)
+
+    for (const worldId of ["b", "\u{1F600}", "a", "～", "B", undefined, "1"]) {
+      yield* userScripts.configureWorld(worldId === undefined ? { messaging: true } : { worldId, messaging: true })
+    }
+
+    // UTF-8 bytes order U+FF5E (EF BD BE) before U+1F600 (F0 9F 98 80), unlike UTF-16 code units.
+    expect((yield* userScripts.getWorldConfigurations).map(({ worldId }) => worldId ?? "_default"))
+      .toEqual(["1", "B", "_default", "a", "b", "～", "\u{1F600}"])
+    expect(fixture.controls.worlds().map(({ worldId }) => worldId ?? "_default")).toEqual(["1", "B", "_default", "a", "b", "～", "\u{1F600}"])
+  }))
+
+  it.effect("checks the tab before the target, and allFrames before mixed frame and document ids", () => Effect.gen(function*() {
+    const fixture = makeUserScripts()
+    const userScripts = make(fixture.api)
+    const mixed = decoded(`{ "target": { "tabId": 1, "allFrames": true, "frameIds": [0], "documentIds": ["d"] }, "js": [{ "code": "1" }] }`)
+    expect(yield* rejection(userScripts.execute(mixed))).toEqual(["execute", "No tab with id: 1"])
+    fixture.controls.respond(() => [])
+    expect(yield* rejection(userScripts.execute(mixed)))
+      .toEqual(["execute", "Cannot specify 'allFrames' if either 'frameIds' or 'documentIds' is specified."])
+  }))
+
+  it.effect("returns serialized copies of frame results, never the responder's objects", () => Effect.gen(function*() {
+    const fixture = makeUserScripts()
+    const userScripts = make(fixture.api)
+    const shared = { title: "Example", tags: ["a"] }
+    fixture.controls.respond(() => [{ frameId: 0, documentId: "top", result: shared }])
+    const [first] = yield* userScripts.execute(injection)
+    expect(first?.result).toEqual(shared)
+    expect(first?.result).not.toBe(shared)
+    shared.tags.push("mutated")
+    const [second] = yield* userScripts.execute(injection)
+    expect(second?.result).toEqual({ title: "Example", tags: ["a", "mutated"] })
+    expect(first?.result).toEqual({ title: "Example", tags: ["a"] })
   }))
 
   it.effect("unregisters by id atomically, everything without ids, and nothing for an empty list", () => Effect.gen(function*() {
@@ -410,7 +518,7 @@ describe("makeUserScripts", () => {
     const invalid: ReadonlyArray<readonly [UserScriptInjection, string]> = [
       [decoded(`{ "target": { "tabId": 1 }, "js": [] }`), "User script must specify at least one js source."],
       [decoded(`{ "target": { "tabId": 1 }, "js": [{ "code": "1", "file": "a.js" }] }`), "User script must specify exactly one of 'code' or 'file' as a js source."],
-      [{ target: { tabId: 1 }, js: [{ code: "1" }], world: "MAIN", worldId: "w" }, "World ID can only be specified for USER_SCRIPT worlds."],
+      [decoded(`{ "target": { "tabId": 1 }, "js": [{ "code": "1" }], "world": "MAIN", "worldId": "w" }`), "World ID can only be specified for USER_SCRIPT worlds."],
       [{ target: { tabId: 1 }, js: [{ code: "1" }], worldId: "_w" }, "World IDs beginning with '_' are reserved."],
       [decoded(`{ "target": { "tabId": 1, "frameIds": [0], "documentIds": ["d"] }, "js": [{ "code": "1" }] }`), "Cannot specify both 'frameIds' and 'documentIds'."],
       [decoded(`{ "target": { "tabId": 1, "allFrames": true, "frameIds": [0] }, "js": [{ "code": "1" }] }`), "Cannot specify 'allFrames' if either 'frameIds' or 'documentIds' is specified."]

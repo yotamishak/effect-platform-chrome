@@ -69,6 +69,9 @@ const parse = (script: ChromeUserScripts.RegisteredUserScript): ChromeUserScript
 
   const worldId = worldIdOf(script.world, script.worldId)
 
+  // Chrome parses match patterns after its own user-script checks.
+  if (script.matches.length === 0) throw new Error(`Script with ID '${script.id}' must specify at least one match.`)
+
   const parsed: ChromeUserScripts.RegisteredUserScript = {
     id: script.id,
     matches: [...script.matches],
@@ -113,15 +116,16 @@ const merge = (
   return merged
 }
 
+/** Chrome's `CanAccessTarget` order: `allFrames` with ids is refused before mixed ids. */
 const checkTarget = (target: ChromeUserScripts.InjectionTarget) => {
   const frameIds = "frameIds" in target ? target.frameIds : undefined
   const documentIds = "documentIds" in target ? target.documentIds : undefined
 
-  if (frameIds !== undefined && documentIds !== undefined) throw new Error("Cannot specify both 'frameIds' and 'documentIds'.")
-
   if (target.allFrames === true && (frameIds !== undefined || documentIds !== undefined)) {
     throw new Error("Cannot specify 'allFrames' if either 'frameIds' or 'documentIds' is specified.")
   }
+
+  if (frameIds !== undefined && documentIds !== undefined) throw new Error("Cannot specify both 'frameIds' and 'documentIds'.")
 }
 
 /** Chrome's result shaping: one failed frame fails the call; otherwise failed frames are dropped, top frame first. */
@@ -135,8 +139,10 @@ const reportFrames = (outcomes: ReadonlyArray<FrameOutcome>): Array<ChromeUserSc
   for (const outcome of outcomes) {
     if (outcome.error !== undefined) continue
 
-    // Chrome serializes an undefined completion value as null.
-    const result: ChromeUserScripts.InjectionResult = { frameId: outcome.frameId, documentId: outcome.documentId, result: outcome.result ?? null }
+    // Chrome serializes the completion value, reporting undefined as null and never sharing objects.
+    const result: ChromeUserScripts.InjectionResult = {
+      frameId: outcome.frameId, documentId: outcome.documentId, result: structuredClone(outcome.result ?? null)
+    }
 
     if (outcome.frameId === 0) results.unshift(result)
     else results.push(result)
@@ -144,6 +150,25 @@ const reportFrames = (outcomes: ReadonlyArray<FrameOutcome>): Array<ChromeUserSc
 
   return results
 }
+
+const encoder = new TextEncoder()
+
+/** Chrome keeps world configurations in a dictionary, so it lists them by the key's UTF-8 bytes. */
+const byteOrder = (left: string, right: string): number => {
+  const leftBytes = encoder.encode(left)
+  const rightBytes = encoder.encode(right)
+
+  for (let index = 0; index < Math.min(leftBytes.length, rightBytes.length); index++) {
+    const difference = (leftBytes[index] ?? 0) - (rightBytes[index] ?? 0)
+
+    if (difference !== 0) return difference
+  }
+
+  return leftBytes.length - rightBytes.length
+}
+
+/** The dictionary key Chrome stores a world under; the default world's is `_default`. */
+const worldKey = (worldId: string) => worldId === "" ? "_default" : worldId
 
 const worldEntry = (worldId: string, properties: { readonly csp: string | undefined, readonly messaging: boolean }) => {
   const entry: ChromeUserScripts.WorldProperties = { messaging: properties.messaging }
@@ -158,16 +183,18 @@ const worldEntry = (worldId: string, properties: { readonly csp: string | undefi
 /**
  * An in-memory `chrome.userScripts` (Chrome 135+) with Chrome's validation: `register`
  * rejects empty, reserved (`_`) and duplicate ids, a missing `matches`, an empty `js`, a
- * source with both or neither of `code` and `file`, and an invalid `worldId`, all before
- * registering anything; stored scripts get Chrome's defaults (`allFrames: false`,
- * `runAt: "document_idle"`, `world: "USER_SCRIPT"`). `update` is atomic, rejects unknown ids
- * and, like Chrome, never changes `includeGlobs` or `excludeGlobs`. `unregister` rejects
- * unknown ids atomically and removes everything without `ids`. Worlds follow Chrome: a
- * configuration is stored only when it differs from the default, `configureWorld` refuses
- * once `maxWorlds` are configured, and resets of unconfigured worlds succeed. `execute`
- * validates the injection, asks `controls.respond`'s responder for per-frame outcomes
- * (without one it rejects with `No tab with id`), then shapes them like Chrome. Match
- * patterns and file paths are not validated. `controls.setAccess(false)` makes every call
+ * source with both or neither of `code` and `file`, an invalid `worldId` and an empty
+ * `matches`, all before registering anything; stored scripts get Chrome's defaults
+ * (`allFrames: false`, `runAt: "document_idle"`, `world: "USER_SCRIPT"`). `update` checks its
+ * ids like `register` (repeats included), is atomic, rejects unknown ids, moves updated
+ * scripts to the end and, like Chrome, never changes `includeGlobs` or `excludeGlobs`. `unregister` rejects unknown ids atomically
+ * and removes everything without `ids`. Worlds follow Chrome: a configuration is stored only
+ * when it differs from the default, worlds are listed by the UTF-8 bytes of their key (the
+ * default world's is `_default`), `configureWorld` refuses once `maxWorlds` are configured,
+ * and resets of unconfigured worlds succeed. `execute` validates the injection, rejects with
+ * `No tab with id` without a `controls.respond` responder, validates the target, asks the
+ * responder for per-frame outcomes, then shapes them like Chrome, cloning each result. The
+ * syntax of match patterns and file paths is not validated. `controls.setAccess(false)` makes every call
  * throw synchronously, as Chrome does once the user revokes access.
  */
 export const makeUserScripts = (overrides: Partial<ChromeUserScripts.ChromeUserScriptsApi> = {}) => {
@@ -201,6 +228,17 @@ export const makeUserScripts = (overrides: Partial<ChromeUserScripts.ChromeUserS
   }
 
   const update = async (batch: Array<ChromeUserScripts.RegisteredUserScript>) => {
+    const ids = new Set<string>()
+
+    // Like register, Chrome validates every id, and refuses repeats, before looking any script up.
+    for (const script of batch) {
+      checkScriptId(script.id)
+
+      if (ids.has(script.id)) throw new Error(`Duplicate script ID '${script.id}'`)
+
+      ids.add(script.id)
+    }
+
     const merged = batch.map((script) => {
       const current = scripts.get(script.id)
 
@@ -209,7 +247,9 @@ export const makeUserScripts = (overrides: Partial<ChromeUserScripts.ChromeUserS
       return { current, next: script }
     }).map(({ current, next }) => parse(merge(current, next)))
 
-    // Map.set keeps an existing key's position, so registration order survives updates.
+    // Chrome removes the old scripts and adds the updated ones after the rest, in batch order.
+    for (const script of merged) scripts.delete(script.id)
+
     for (const script of merged) scripts.set(script.id, script)
   }
 
@@ -246,7 +286,9 @@ export const makeUserScripts = (overrides: Partial<ChromeUserScripts.ChromeUserS
     if (next.csp !== current.csp || next.messaging !== current.messaging) worlds.set(key, next)
   }
 
-  const listWorlds = () => Array.from(worlds, ([worldId, properties]) => worldEntry(worldId, properties))
+  const listWorlds = () => Array.from(worlds)
+    .sort(([left], [right]) => byteOrder(worldKey(left), worldKey(right)))
+    .map(([worldId, properties]) => worldEntry(worldId, properties))
 
   const resetWorldConfiguration = async (worldId?: string) => {
     worlds.delete(worldIdOf("USER_SCRIPT", worldId) ?? "")
@@ -255,9 +297,11 @@ export const makeUserScripts = (overrides: Partial<ChromeUserScripts.ChromeUserS
   const execute = async (injection: ChromeUserScripts.UserScriptInjection) => {
     checkSources(injection.js, "User script")
     worldIdOf(injection.world, injection.worldId)
-    checkTarget(injection.target)
 
+    // Chrome looks the tab up before validating the rest of the target.
     if (responder === undefined) throw new Error(`No tab with id: ${injection.target.tabId}`)
+
+    checkTarget(injection.target)
 
     return reportFrames(await responder(structuredClone(injection)))
   }
@@ -278,7 +322,7 @@ export const makeUserScripts = (overrides: Partial<ChromeUserScripts.ChromeUserS
     api,
     layer: ChromeUserScripts.layer(api),
     controls: {
-      /** A snapshot of every registered script, in registration order, as `getScripts` reports them. */
+      /** A snapshot of every registered script, in `getScripts` order (updated scripts move to the end). */
       scripts: (): Array<ChromeUserScripts.RegisteredUserScript> => structuredClone(Array.from(scripts.values())),
       /** A snapshot of every configured world, as `getWorldConfigurations` reports them. */
       worlds: (): Array<ChromeUserScripts.WorldProperties> => listWorlds(),

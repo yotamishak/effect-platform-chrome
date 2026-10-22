@@ -47,16 +47,19 @@ revoked its calls fail with the typed error; run the service's `isAvailable` to 
 
 ## Registering scripts
 
-- `register(scripts)` takes `UserScriptRegistration`s: Chrome rejects a script without `matches`
-  or with an empty `js`, and each source has exactly one of `code` or `file`. Ids must be
-  non-empty, must not start with `_`, and must not already be registered. Chrome validates the
-  whole batch first and registers nothing when any script is invalid.
+- `register(scripts)` takes `UserScriptRegistration`s, typed the way Chrome validates them: it
+  rejects a script without `matches`, with an empty `matches` or `js`, or with a `worldId`
+  (even `""`) in the `MAIN` world, and each source has exactly one of `code` or `file`. Ids
+  must be non-empty, must not start with `_`, and must not already be registered. Chrome
+  validates the whole batch first and registers nothing when any script is invalid.
 - `update(scripts)` changes only the supplied properties of existing scripts and is atomic: an
-  unknown id or an invalid result changes nothing. Chrome never updates `includeGlobs` or
-  `excludeGlobs`; unregister and register again to change them. `worldId: ""` moves a script
-  back to the default world, and a script with a `worldId` cannot move to `MAIN` by update.
-- `getScripts(filter?)` lists scripts in registration order with Chrome's defaults filled in
-  (`allFrames`, `runAt: "document_idle"`, `world: "USER_SCRIPT"`).
+  empty, reserved, repeated or unknown id, or an invalid result, changes nothing. Chrome never
+  updates `includeGlobs` or `excludeGlobs`; unregister and register again to change them.
+  `worldId: ""` moves a script back to the default world, and a script with a `worldId`
+  cannot move to `MAIN` by update. Chrome removes and re-adds updated scripts, so they move
+  to the end of `getScripts` in the batch's order.
+- `getScripts(filter?)` lists scripts in registration order (updated scripts last) with
+  Chrome's defaults filled in (`allFrames`, `runAt: "document_idle"`, `world: "USER_SCRIPT"`).
 - `unregister(filter?)`: **without a filter, or without `ids`, it removes every user script of
   the extension.** `{ ids: [] }` removes nothing, and an unknown id fails the call and removes
   nothing.
@@ -75,9 +78,11 @@ hidden from the page; `MAIN` shares the page's JavaScript environment. Since Chr
 - `configureWorld(properties)` sets `csp` and `messaging` for the default world or the one
   named by `worldId`. Chrome stores at most 100 world configurations and refuses any
   `configureWorld` call once 100 exist, even for a configured world; reset some first.
-- `getWorldConfigurations` (Chrome 133+) lists them; the default world's entry has no `worldId`.
+- `getWorldConfigurations` (Chrome 133+) lists them ordered by the UTF-8 bytes of the world
+  id, not by configuration time; the default world's entry has no `worldId` and sorts as
+  `"_default"`.
 - `resetWorldConfiguration(worldId?)` (Chrome 133+) forgets one, or the default world's
-  configuration; an unconfigured world resets without error.
+  configuration when omitted or `""`; an unconfigured world resets without error.
 
 User scripts can call `chrome.runtime.sendMessage` and `connect` only in a world configured
 with `messaging: true`; the extension receives those messages through
@@ -87,10 +92,12 @@ with `messaging: true`; the extension receives those messages through
 
 `execute(injection)` (Chrome 135+) injects code or files once into a tab: at `document_idle`,
 or as soon as possible with `injectImmediately`. A script evaluating to a promise is awaited.
-The target is a tab plus at most one of `allFrames`, `frameIds` or `documentIds`. Results list
+The target is a tab plus at most one of `allFrames`, `frameIds` or `documentIds`, and
+`UserScriptInjection`, like a registration, admits a `worldId` only outside `MAIN`. Results list
 the top frame first and leave out frames Chrome could not inject into; when the injection
 targets a single frame that fails, the call fails instead. Current Chrome never sets the
-`error` field the typings declare. `result` is untyped: decode it with a schema.
+`error` field the typings declare. `result` is a serialized copy (undefined becomes `null`)
+and untyped: decode it with a schema.
 
 ## Errors and versions
 
@@ -105,11 +112,12 @@ error (`userScripts.execute is unavailable`).
 
 `makeUserScripts` (`effect-platform-chrome/testing/UserScripts`) returns `{ api, layer, controls }`
 over an in-memory `chrome.userScripts` that applies the validation and atomicity above with
-Chrome's error messages, the 100-world limit, and Chrome's `execute` result rules over
-per-frame outcomes from `controls.respond`. `controls.setAccess(false)` makes every call throw
+Chrome's error messages and ordering, the 100-world limit, and Chrome's `execute` result
+rules over per-frame outcomes from `controls.respond`, whose results it clones. `controls.setAccess(false)` makes every call throw
 synchronously, as revoked access does; `controls.failNext(operation, cause)` rejects one call;
-`controls.scripts()` and `controls.worlds()` snapshot the state. Match patterns and file paths
-are not validated, and nothing is injected into pages.
+`controls.scripts()` and `controls.worlds()` snapshot the state. An empty `matches` is
+rejected, but the syntax of match patterns and file paths is not validated, and nothing is
+injected into pages.
 
 Unit tests cover every operation's argument passing, rejection and synchronous throw; the
 stress suite runs 2,048 concurrent calls with seeded interleaved throws and rejections,
