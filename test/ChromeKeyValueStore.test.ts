@@ -314,4 +314,26 @@ describe("ChromeKeyValueStore", () => {
     const injected = yield* Effect.provide(KeyValueStore.KeyValueStore, ChromeKeyValueStore.layer(local))
     expect(yield* injected.get("key")).toBe("value")
   }))
+
+  it.effect("lists keys with getKeys for size and clear instead of reading every value", () => Effect.gen(function*() {
+    const area = storageArea()
+    const getKeys = vi.fn(async () => Object.keys(area.data))
+    const store = ChromeKeyValueStore.make({ ...area, getKeys })
+    const other = ChromeKeyValueStore.make({ ...area, getKeys }, { namespace: "other" })
+    yield* store.set("a", "1")
+    yield* store.set("b", "2")
+    yield* other.set("a", "keep")
+    area.data["unrelated"] = "keep"
+    area.get.mockClear()
+    expect(yield* store.size).toBe(2)
+    yield* store.clear
+    expect(yield* store.size).toBe(0)
+    expect(yield* other.size).toBe(1)
+    expect(area.get).not.toHaveBeenCalled()
+    expect(getKeys).toHaveBeenCalledTimes(4)
+    expect(area.data["unrelated"]).toBe("keep")
+    const cause = new Error("getKeys failed")
+    getKeys.mockRejectedValueOnce(cause)
+    expect(yield* failure(other.size)).toMatchObject({ method: "size", cause })
+  }))
 })

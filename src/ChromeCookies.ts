@@ -1,5 +1,6 @@
-import { Context, Effect, Layer, Option, Schema } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { invoker, liveLayer } from "./internal/api.js"
+import { observe } from "./internal/event.js"
 
 export class ChromeCookiesError extends Schema.TaggedError<ChromeCookiesError>()("ChromeCookiesError", {
   operation: Schema.String,
@@ -8,12 +9,26 @@ export class ChromeCookiesError extends Schema.TaggedError<ChromeCookiesError>()
 
 export type Cookie = chrome.cookies.Cookie
 
+export type CookieStore = chrome.cookies.CookieStore
+
+/** Why a cookie changed: `"explicit"` for a set/remove call, otherwise overwrite, expiry or eviction. */
+export type ChangeCause = chrome.cookies.CookieChangeInfo["cause"]
+
+/** One `onChanged` notification. Overwriting a cookie reports the old one removed, then the new one added. */
+export interface CookieChange {
+  readonly cookie: Cookie
+  readonly cause: ChangeCause
+  readonly removed: boolean
+}
+
 /** The Promise-based MV3 subset this module needs. */
 export interface ChromeCookiesApi {
   getAll(details: chrome.cookies.GetAllDetails): Promise<Array<Cookie>>
   get(details: chrome.cookies.CookieDetails): Promise<Cookie | null>
   set(details: chrome.cookies.SetDetails): Promise<Cookie | null>
   remove(details: chrome.cookies.CookieDetails): Promise<chrome.cookies.CookieDetails | null>
+  getAllCookieStores(): Promise<Array<CookieStore>>
+  readonly onChanged: Pick<typeof chrome.cookies.onChanged, "addListener" | "removeListener">
 }
 
 export interface ChromeCookiesService {
@@ -28,6 +43,14 @@ export interface ChromeCookiesService {
    * path and secure flag, and keeping its store and partition.
    */
   readonly removeCookie: (cookie: Cookie) => Effect.Effect<void, ChromeCookiesError>
+  /** The regular store, plus incognito stores and their tab ids while incognito windows are open. */
+  readonly getAllCookieStores: Effect.Effect<Array<CookieStore>, ChromeCookiesError>
+  /**
+   * Cookie changes the extension has host access to. Each consumption owns a scoped
+   * listener and retains at most 64 pending events, dropping the oldest. This is an
+   * observation, not an MV3 wake listener; use ChromeServiceWorker.listen for that.
+   */
+  readonly onChanged: Stream.Stream<CookieChange, ChromeCookiesError>
 }
 
 export class ChromeCookies extends Context.Service<ChromeCookies, ChromeCookiesService>()("effect-platform-chrome/ChromeCookies") {}
@@ -56,7 +79,13 @@ export const make = (api: ChromeCookiesApi): ChromeCookiesService => {
     get: (details) => invoke("get", () => api.get(details)).pipe(Effect.map(Option.fromNullishOr)),
     set: (details) => invoke("set", () => api.set(details)).pipe(Effect.map(Option.fromNullishOr)),
     remove,
-    removeCookie: (cookie) => remove(detailsOf(cookie))
+    removeCookie: (cookie) => remove(detailsOf(cookie)),
+    getAllCookieStores: invoke("getAllCookieStores", () => api.getAllCookieStores()),
+    onChanged: observe(
+      () => api.onChanged,
+      ({ cookie, cause, removed }: chrome.cookies.CookieChangeInfo): CookieChange => ({ cookie, cause, removed }),
+      (cause) => new ChromeCookiesError({ operation: "onChanged", cause })
+    )
   })
 }
 
