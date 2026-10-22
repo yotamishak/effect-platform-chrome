@@ -75,6 +75,11 @@ const operations = (store: KeyValueStore.KeyValueStore) => [
 
 const keyless = new Set(["clear", "size", "isEmpty"])
 
+/** The cause of a lone-surrogate rejection, which names the part of the request Chrome would rewrite. */
+const rejected = (part: "namespace" | "key" | "value") => ({
+  cause: { message: `The ${part} contains a lone surrogate, which Chrome storage would replace with U+FFFD` }
+})
+
 describe("ChromeKeyValueStore", () => {
   it.effect("round trips strings and binary with Effect-compatible cross-type reads", () => Effect.gen(function*() {
     const area = storageArea()
@@ -213,6 +218,11 @@ describe("ChromeKeyValueStore", () => {
     area.set.mockRejectedValueOnce(write)
     expect(yield* failure(store.modify("text", (value) => value + "!"))).toMatchObject({ method: "set", key: "text", cause: write })
     expect(yield* store.get("text")).toBe("value")
+    yield* store.set("bin", new Uint8Array([1]))
+    area.set.mockRejectedValueOnce(write)
+    expect(yield* failure(store.modifyUint8Array("bin", (value) => new Uint8Array([...value, 2]))))
+      .toMatchObject({ method: "set", key: "bin", cause: write })
+    expect(yield* store.getUint8Array("bin")).toEqual(new Uint8Array([1]))
   }))
 
   it.effect.each([
@@ -349,7 +359,11 @@ describe("ChromeKeyValueStore", () => {
         expect(error).toBeInstanceOf(KeyValueStore.KeyValueStoreError)
         expect(error).toMatchObject({ method, key, message: `Chrome KeyValueStore ${method} failed` })
         expect(error.cause).toBeInstanceOf(Error)
+        expect(error).toMatchObject(rejected("key"))
       }
+
+      // The key is checked before the value, so a request with both ill-formed names the key.
+      expect(yield* failure(store.set(key, key))).toMatchObject({ method: "set", key, ...rejected("key") })
     }
 
     expect(area.get).not.toHaveBeenCalled()
@@ -370,7 +384,11 @@ describe("ChromeKeyValueStore", () => {
         expect(error.method).toBe(method)
         expect(error.key).toBe(keyless.has(method) ? undefined : "key")
         expect(error.cause).toBeInstanceOf(Error)
+        expect(error).toMatchObject(rejected("namespace"))
       }
+
+      // The namespace is checked first, so it is named even when the key and value are ill-formed too.
+      expect(yield* failure(store.set(namespace, namespace))).toMatchObject({ method: "set", key: namespace, ...rejected("namespace") })
 
       expect(area.get).not.toHaveBeenCalled()
       expect(area.getKeys).not.toHaveBeenCalled()
@@ -387,9 +405,9 @@ describe("ChromeKeyValueStore", () => {
 
     for (const value of illFormed) {
       const error = yield* failure(store.set("key", value))
-      expect(error).toMatchObject({ method: "set", key: "key" })
+      expect(error).toMatchObject({ method: "set", key: "key", ...rejected("value") })
       expect(error.cause).toBeInstanceOf(Error)
-      expect(yield* failure(store.modify("key", () => value))).toMatchObject({ method: "set", key: "key" })
+      expect(yield* failure(store.modify("key", () => value))).toMatchObject({ method: "set", key: "key", ...rejected("value") })
     }
 
     expect(area.set).not.toHaveBeenCalled()

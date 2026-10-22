@@ -80,7 +80,8 @@ const unrepresentable = (method: string, part: "namespace" | "key" | "value", ke
  * memory store, `get` reads binary values as base64 and `getUint8Array` reads strings as
  * UTF-8. Invalid envelopes fail with `KeyValueStoreError`; `has`, `size` and `isEmpty`
  * report physical key existence. Every error's `method` names the store operation and,
- * for single-key operations, its `key`.
+ * for single-key operations, its `key`. The derived `modify` and `modifyUint8Array` report
+ * the primitive that failed: `get` or `getUint8Array` for the read, `set` for the write.
  *
  * Chrome stores keys and strings as UTF-8, so a namespace, key or string value containing a
  * lone surrogate would silently become, or overwrite, a different one. Every operation on
