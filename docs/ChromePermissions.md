@@ -10,7 +10,10 @@ typed initialization error boundary.
 - `getAll` is an Effect value: each execution queries fresh permissions.
 - `contains(permissions)`, `request(permissions)`, and `remove(permissions)` are
   lazy Effects returning Chrome's boolean unchanged. Missing access, user denial,
-  or unsuccessful removal (`false`) is not an exception.
+  or unsuccessful removal (`false`) is not an exception. Chrome rejects removing
+  required permissions, and rejects `request` outside a user gesture.
+- `ChromePermissionsApi` types `onAdded` / `onRemoved` as `EventSource`s, so injected
+  events need only `addListener` and `removeListener`.
 - API synchronous throws and promise rejections become `ChromePermissionsError`,
   preserving `operation` and the original `cause`; live initialization uses
   `operation: "initialize"`.
@@ -39,7 +42,10 @@ user-activation guarantee.
 Use **`requestFromUserGesture` directly on the synchronous handler stack**, before
 any `await`, timer, message hop, or Effect scheduling. This explicitly imperative
 bridge calls Chrome immediately and returns an Effect for the already-started
-request's outcome. Do not invoke it while composing reusable programs. It does not
+request's outcome. It is the same bridge as `ChromeSidePanel.openFromUserGesture` and
+`ChromeDownloads.openFromUserGesture` / `acceptDangerFromUserGesture`: a synchronous throw,
+a rejection, or a non-Promise result becomes `ChromePermissionsError` with
+`operation: "request"`. Do not invoke it while composing reusable programs. It does not
 create a gesture; Chrome still decides whether the current call is eligible.
 
 ```ts
@@ -128,9 +134,15 @@ const askForSite = (tabId: number) => Effect.gen(function*() {
 
 ## Stress coverage
 
-Injected tests cover each event's newest-64 retention after 4096 synchronous
-startup events, then 16 rounds of 32 concurrent subscriptions with 4096-event
-bursts per round (512 subscriptions and 65536 emissions per event). Registration
-gates and joined interruptions verify cleanup without sleeps. Another test runs
-4096 observers of one immediate gesture outcome and verifies a single native call.
-No test prompts for real permissions.
+`test/stress/ChromePermissions.stress.test.ts` runs without real prompts:
+
+- a 4096-event burst on each event leaves exactly the newest 64, in order, and no listener;
+- 512 concurrent subscriptions per event, each stopped at a seeded stage (interrupted before
+  or after registration, interrupted mid-element, completed, or failed by a partial
+  registration), end with zero listeners and one removal per addition;
+- 1536 concurrent calls across `contains`, `request`, `requestFromUserGesture`, `remove` and
+  both host access request members, with seeded resolutions, rejections and synchronous throws
+  settled in shuffled order, each matched to its own typed error and `operation`;
+- 1024 concurrent `getAll` runs whose failures match the planned causes one to one;
+- 4096 observers of one gesture outcome share a single native request, and 1024 gesture
+  requests interrupted mid-wait still replay their late outcomes.
