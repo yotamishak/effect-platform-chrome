@@ -95,7 +95,10 @@ export interface ReceivedMessage {
 }
 
 export interface SendMessageOptions {
-  /** Another extension to message; without it the message goes to this extension. */
+  /**
+   * Another extension to message; without it the message goes to this extension. Chrome
+   * reads an empty string as omitted, so `""` messages this extension too.
+   */
   readonly extensionId?: string
   readonly options?: chrome.runtime.MessageOptions
 }
@@ -114,7 +117,8 @@ export interface ChromeRuntimeService {
    * sender's) or, with `extensionId`, to another extension's `onMessageExternal`. It never
    * reaches content scripts; use `ChromeTabs.sendMessage` for those. Succeeds with the first
    * listener's answer, unvalidated, and fails when nothing receives the message. Extension
-   * id and options reach Chrome only when given.
+   * id and options reach Chrome only when given. A function message fails before reaching
+   * Chrome, which would take it for its response callback.
    */
   readonly sendMessage: (
     message: unknown,
@@ -135,7 +139,8 @@ export interface ChromeRuntimeService {
    * Like `sendMessageSchema`, for a receiver that answers with the ChromeMessage envelope,
    * as `ChromeServiceWorker.start` does: the reply is unwrapped and its value decoded with
    * `value`. A failure envelope fails with `ChromeMessageError`; anything that is not an
-   * envelope of `value` (including no answer) with `"sendMessage.decodeResponse"`.
+   * envelope of `value` (including no answer) with `"sendMessage.decodeResponse"`. Chrome's
+   * JSON serialization turns a void success into `{ ok: true }`; it decodes as `undefined`.
    */
   readonly request: <Request extends Schema.Constraint, Value extends Schema.Constraint>(
     request: Request,
@@ -283,10 +288,24 @@ const voidEvent = () => undefined
 
 const port = (value: chrome.runtime.Port) => value
 
+const isSuccessEnvelope = Schema.is(Schema.Struct({ ok: Schema.Literal(true) }))
+
+/**
+ * Chrome serializes replies as JSON, which drops an `undefined` property, so a receiver's
+ * `{ ok: true, value: undefined }` arrives as `{ ok: true }`. Restores the key so a void
+ * success still decodes; anything else is left for the envelope schema to judge.
+ */
+const restoreUndefinedValue = (reply: unknown): unknown =>
+  isSuccessEnvelope(reply) && !("value" in reply) ? { ...reply, value: undefined } : reply
+
 /** Creates the service without reading browser globals or registering listeners. */
 export const make = (runtime: ChromeRuntimeApi): ChromeRuntimeService => {
   const sendMessage: ChromeRuntimeService["sendMessage"] = (message, options) =>
     invoke("sendMessage", () => {
+      // Chrome takes a trailing function for the response callback: it would re-read the
+      // remaining arguments, sending the extension id to this extension as the message.
+      if (message instanceof Function) throw new TypeError("A function cannot be sent as a runtime message")
+
       const extensionId = options?.extensionId
       const messageOptions = options?.options
 
@@ -312,7 +331,7 @@ export const make = (runtime: ChromeRuntimeApi): ChromeRuntimeService => {
 
   const request: ChromeRuntimeService["request"] = (requestSchema, value, message, options) =>
     sendMessageSchema(requestSchema, Schema.Unknown, message, options).pipe(
-      Effect.flatMap(decodeResponse(value)),
+      Effect.flatMap((reply) => decodeResponse(value)(restoreUndefinedValue(reply))),
       Effect.catchTag("SchemaError", (cause) => Effect.fail(runtimeError("sendMessage.decodeResponse", cause)))
     )
 

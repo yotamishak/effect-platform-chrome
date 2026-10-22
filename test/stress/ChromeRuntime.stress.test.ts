@@ -482,6 +482,68 @@ describe("ChromeRuntime stress", () => {
       .toEqual(Array.from({ length: 1024 }, (_, index) => index).filter((index) => index % 5 !== 4).map(String))
   }))
 
+  it.effect("runs 2,048 concurrent requests whose replies cross Chrome's JSON serialization, with seeded void, value and failure envelopes", () => Effect.gen(function*() {
+    const { api } = fixture()
+    const random = seeded(0x1d0d)
+    const kinds = Array.from({ length: 2048 }, () => Math.floor(random() * 5))
+    const sent: Array<number> = []
+
+    const viaChrome: ChromeRuntimeApi = {
+      ...api,
+      // Chrome's overloads also pass an extension id first; this call never does.
+      sendMessage: async (message: number | string | null | undefined) => {
+        if (!Schema.is(Schema.Finite)(message)) throw new Error("sendMessage received an unexpected first argument")
+
+        sent.push(message)
+
+        const replies = [
+          succeed(undefined),
+          succeed(null),
+          fail({ code: "HandlerFailed", message: `failed-${message}` }),
+          { ok: true, value: undefined, extra: message },
+          { ok: false }
+        ]
+
+        // Replies are JSON-serialized between contexts, dropping undefined properties.
+        return JSON.parse(JSON.stringify(replies[kinds[message]!]))
+      }
+    }
+
+    const service = make(viaChrome)
+    const value = Schema.UndefinedOr(Schema.Null)
+
+    const results = yield* Effect.forEach(kinds, (_, index) => Effect.result(service.request(Schema.Finite, value, index)), {
+      concurrency: "unbounded"
+    })
+
+    for (const [index, result] of results.entries()) {
+      switch (kinds[index]) {
+        case 0:
+        case 3: {
+          expect(result, `${index}`).toEqual(Result.succeed(undefined))
+          break
+        }
+
+        case 1: {
+          expect(result, `${index}`).toEqual(Result.succeed(null))
+          break
+        }
+
+        case 2: {
+          expect(Result.isFailure(result) && result.failure).toEqual(new ChromeMessageError({ code: "HandlerFailed", message: `failed-${index}` }))
+          break
+        }
+
+        default: {
+          expectRuntimeFailure(result, "sendMessage.decodeResponse")
+        }
+      }
+    }
+
+    expect(new Set(kinds).size).toBe(5)
+    expect([...sent].sort((left, right) => left - right)).toEqual(kinds.map((_, index) => index))
+  }))
+
   it.effect("256 subscribers racing a live message stream each see an ordered, duplicate-free run ending at the sentinel", () => Effect.gen(function*() {
     const { service, events } = fixture()
     const sentinel = -1

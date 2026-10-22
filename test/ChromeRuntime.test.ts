@@ -4,7 +4,7 @@ import { Effect, Exit, Fiber, Schema, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeMessageError, fail, succeed } from "../src/ChromeMessage.js"
 import { ChromeRuntime, ChromeRuntimeError, layer, layerLive, make } from "../src/ChromeRuntime.js"
-import type { ChromeRuntimeApi, ChromeRuntimeService, MessageListenerArguments } from "../src/ChromeRuntime.js"
+import type { ChromeRuntimeApi, ChromeRuntimeService, JsonValue, MessageListenerArguments } from "../src/ChromeRuntime.js"
 import { makePortPair } from "../src/testing/Port.js"
 import { gatedEvent } from "./stress/support.js"
 
@@ -278,6 +278,25 @@ describe("ChromeRuntime", () => {
     }))
   })
 
+  it.effect("fails with the typed error, not a hang or defect, when an older Chrome returns no Promise", () => Effect.gen(function*() {
+    const api = fake()
+
+    // A callback-only Chrome method called without a callback returns undefined, which the
+    // Promise-typed Api cannot express.
+    for (const member of ["getPackageDirectoryEntry", "getContexts"]) Object.defineProperty(api, member, { value: () => undefined })
+
+    const service = make(api)
+
+    for (const [operation, effect] of [
+      ["getPackageDirectoryEntry", Effect.asVoid(service.getPackageDirectoryEntry)],
+      ["getContexts", Effect.asVoid(service.getContexts({}))]
+    ] as const) {
+      const exit = yield* Effect.exit(effect)
+      expect(Exit.hasDies(exit), operation).toBe(false)
+      expect((yield* Effect.flip(effect)).operation).toBe(operation)
+    }
+  }))
+
   describe("sendMessage", () => {
     it.effect("passes the extension id and options only when given, never in an ambiguous two-argument form", () => Effect.gen(function*() {
       const api = fake()
@@ -301,6 +320,43 @@ describe("ChromeRuntime", () => {
       yield* service.sendMessage(null, {})
       expect(api.sendMessage.mock.lastCall).toEqual([null])
       expect(api.sendMessage.mock.contexts.every((receiver) => receiver === api)).toBe(true)
+    }))
+
+    it.effect("never lets Chrome take a function message for its response callback and misroute the extension id", () => Effect.gen(function*() {
+      const delivered: Array<{ readonly target: unknown; readonly message: unknown }> = []
+
+      // Chrome's argument massaging (messaging_util.cc MassageSendMessageArguments): a
+      // trailing function is the response callback, which switches the call to callback
+      // mode (no Promise), and the remaining arguments are re-read by count.
+      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- emulates Chrome's untyped native argument parsing
+      const sendMessage = (...args: Array<unknown>): Promise<string> | undefined => {
+        const rest = [...args]
+        const callback = rest.at(-1) instanceof Function ? rest.pop() : undefined
+        const [first, second] = rest
+
+        if (rest.length === 0) throw new TypeError("No matching signature.")
+
+        const idFirst = rest.length === 3 || (rest.length === 2 && Schema.is(Schema.NullishOr(Schema.String))(first))
+        delivered.push(idFirst ? { target: first, message: second } : { target: null, message: first })
+
+        return callback === undefined ? Promise.resolve("reply") : undefined
+      }
+
+      const api = fake()
+      // The native method's callback mode returns no Promise, which the Promise-typed Api cannot express.
+      Object.defineProperty(api, "sendMessage", { value: sendMessage })
+      const service = make(api)
+      const handler = () => "not a message"
+
+      for (const options of [undefined, { extensionId: "peer" }, { options: {} }, { extensionId: "peer", options: {} }]) {
+        const error = yield* Effect.flip(Effect.asVoid(service.sendMessage(handler, options)))
+        expect(error).toBeInstanceOf(ChromeRuntimeError)
+        expect(error.operation).toBe("sendMessage")
+      }
+
+      expect(delivered).toEqual([])
+      expect(yield* service.sendMessage("hello", { extensionId: "peer" })).toBe("reply")
+      expect(delivered).toEqual([{ target: "peer", message: "hello" }])
     }))
 
     it.effect("returns the unvalidated reply, including no reply", () => Effect.gen(function*() {
@@ -365,6 +421,33 @@ describe("ChromeRuntime", () => {
       const cause = new Error("disconnected")
       api.sendMessage.mockRejectedValueOnce(cause)
       expect(yield* Effect.flip(service.request(request, value, { ping: 1 }))).toMatchObject({ operation: "sendMessage", cause })
+    }))
+
+    it.effect("request decodes a void reply after Chrome's JSON serialization drops its undefined value", () => Effect.gen(function*() {
+      const api = fake()
+      const service = make(api)
+      // Chrome serializes replies as JSON, so `{ ok: true, value: undefined }` arrives as `{ ok: true }`.
+      const viaChrome = <A>(reply: A): JsonValue => JSON.parse(JSON.stringify(reply))
+
+      for (const value of [Schema.Void, Schema.Undefined, Schema.UndefinedOr(Schema.String), Schema.Unknown] as const) {
+        api.sendMessage.mockResolvedValueOnce(viaChrome(succeed(undefined)))
+        expect(yield* service.request(Schema.String, value, "ping")).toBeUndefined()
+      }
+
+      // A value schema that does not accept undefined still rejects the empty envelope.
+      api.sendMessage.mockResolvedValueOnce(viaChrome(succeed(undefined)))
+      expect(yield* Effect.flip(service.request(Schema.String, Schema.String, "ping")))
+        .toMatchObject({ operation: "sendMessage.decodeResponse" })
+
+      // Failure envelopes and non-envelopes are not mistaken for a void success.
+      for (const reply of [{ ok: false }, {}, [], "ok", null, { ok: "true" }]) {
+        api.sendMessage.mockResolvedValueOnce(reply)
+        expect(yield* Effect.flip(service.request(Schema.String, Schema.Void, "ping")), JSON.stringify(reply))
+          .toMatchObject({ operation: "sendMessage.decodeResponse" })
+      }
+
+      api.sendMessage.mockResolvedValueOnce(viaChrome(fail({ code: "HandlerFailed", message: "boom" })))
+      expect(yield* Effect.flip(service.request(Schema.String, Schema.Void, "ping"))).toBeInstanceOf(ChromeMessageError)
     }))
   })
 

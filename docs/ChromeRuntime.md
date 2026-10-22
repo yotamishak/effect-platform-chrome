@@ -19,7 +19,7 @@ whose `cause` is the rejection or throw unchanged. The schema helpers add two ph
 | `getURL(path)` | The `chrome-extension://` URL of a packaged file. |
 | `sendMessage(message, { extensionId?, options? })` | The unvalidated reply; fails when nothing receives the message. See below for how the arguments reach Chrome. |
 | `sendMessageSchema(request, response, message, options?)` | Encodes, sends, decodes. |
-| `request(request, value, message, options?)` | For receivers answering with the `ChromeMessage` envelope (`ChromeServiceWorker.start`); a failure envelope is a `ChromeMessageError`. |
+| `request(request, value, message, options?)` | For receivers answering with the `ChromeMessage` envelope (`ChromeServiceWorker.start`); a failure envelope is a `ChromeMessageError`. Chrome's JSON serialization drops an `undefined` value, so a void success arrives as `{ ok: true }` and decodes as `undefined`. |
 | `sendNativeMessage(application, message)` | One message to a native host (`"nativeMessaging"` permission); `message` is a JSON object. |
 | `getContexts(filter)` | Chrome 116+. `{}` matches every context. |
 | `getPackageDirectoryEntry` | Extension pages only (not service workers); a legacy FileSystem `DirectoryEntry`. |
@@ -37,6 +37,10 @@ Chrome reads a two-argument `sendMessage(a, b)` as `(extensionId, message)` only
 calls `sendMessage(message)`, `sendMessage(extensionId, message)` or, whenever options
 are given, the unambiguous three-argument form with an explicit `undefined` extension id.
 A string message sent with options can never be mistaken for an extension id.
+Chrome takes a trailing function for its response callback and re-reads the remaining
+arguments, so a function message fails with the typed error before reaching Chrome
+instead of sending the extension id to this extension. Chrome reads an empty
+`extensionId` as omitted: `""` messages this extension.
 
 ## Events
 
