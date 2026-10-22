@@ -10,3 +10,23 @@ export * from "./testing/Storage.js"
 export * from "./testing/Port.js"
 
 export * from "./testing/Tabs.js"
+
+export * from "./testing/Action.js"
+
+export * from "./testing/ContextMenus.js"
+
+export * from "./testing/Omnibox.js"
+
+export * from "./testing/Offscreen.js"
+
+export * from "./testing/Cookies.js"
+
+export * from "./testing/Identity.js"
+
+export * from "./testing/WebNavigation.js"
+
+export * from "./testing/Notifications.js"
+
+export * from "./testing/DeclarativeNetRequest.js"
+
+export * from "./testing/Bookmarks.js"

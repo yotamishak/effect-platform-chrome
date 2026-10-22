@@ -1,13 +1,11 @@
 # ChromeTesting
 
 Import `effect-platform-chrome/ChromeTesting` for every fixture, or one adapter's
-module: `effect-platform-chrome/testing/Event` (`makeEvent`), `testing/Storage`
-(`makeStorage`), `testing/Port` (`makePortPair`) or `testing/Tabs` (`makeTabs`).
+module from `effect-platform-chrome/testing/<Name>` (see [Fixture modules](#fixture-modules)).
 A fixture for a new adapter goes in its own `testing/` module and is re-exported
 from `ChromeTesting`. These injected fixtures have no
-Vitest runtime dependency and never access Chrome globals. They cover the
-`ChromeStorage`, `ChromeTabs` and `ChromePort` adapters, not every Chrome service;
-the other services take a plain object through `make(api)` or `layer(api)`.
+Vitest runtime dependency and never access Chrome globals. They do not cover every
+Chrome service; the others take a plain object through `make(api)` or `layer(api)`.
 Create a fixture **inside each test**. Its layer and raw API intentionally share
 that fixture's state; calling the factory again creates independent state.
 
@@ -155,3 +153,28 @@ receiver.
 - `captureVisibleTab` resolves to an empty JPEG data URL.
 - `overrides` replaces any member, for behaviour the strip does not model, such as a
   `get` that reports `about:blank` until a navigation commits.
+
+## Fixture modules
+
+Every adapter fixture returns `{ api, layer, controls }`: `api` fits the module's
+`make(api)`, `layer` provides its service over the same state, and most factories take
+`overrides` to replace any member. `makeEvent` returns `{ api, controls }` and
+`makePortPair` returns `{ left, right, controls }`. Each module's doc comment states exactly what it models.
+
+| Module | Factory | Models |
+| --- | --- | --- |
+| `testing/Event` | `makeEvent` | A typed Chrome event with emission and registration-failure controls. |
+| `testing/Storage` | `makeStorage` | All storage areas, `getKeys`, access levels and change events (above). |
+| `testing/Port` | `makePortPair` | Two connected ports with manual delivery (above). |
+| `testing/Tabs` | `makeTabs` | An in-memory tab strip (above). |
+| `testing/Action` | `makeAction` | Per-tab badge, title, popup and enabled state falling back to defaults; `controls.click(tab)` opens the popup or fires `onClicked`. |
+| `testing/ContextMenus` | `makeContextMenus` | A menu tree; `create` reports duplicate ids and unknown parents through `lastError` like Chrome; `controls.click`. |
+| `testing/Omnibox` | `makeOmnibox` | A keyword session; `controls.change(text)` returns the suggestion batches listeners send. |
+| `testing/Offscreen` | `makeOffscreen` | Chrome's single-document rule, `getContexts`, and gates to hold or fail the next creation. |
+| `testing/Cookies` | `makeCookies` | A cookie jar keyed like Chrome's (store, name, domain, path, partition) emitting `onChanged`. |
+| `testing/Identity` | `makeIdentity` | Scripted web auth flows, a scope-keyed token cache, and sign-in changes. |
+| `testing/WebNavigation` | `makeWebNavigation`, `matchesNavigationFilter` | Frames per tab, simulated navigations emitting Chrome's event sequence, and URL filters (host, URL, path and query keys; RE2 and CIDR keys are rejected). |
+| `testing/Notifications` | `makeNotifications` | Showing notifications, the permission level, and simulated clicks, button clicks and closes. |
+| `testing/DeclarativeNetRequest` | `makeDeclarativeNetRequest` | Dynamic and session rule sets with Chrome's atomic updates and id collisions; requests are never matched. |
+| `testing/Bookmarks` | `makeBookmarks` | A bookmark tree with the permanent folders, Chrome's errors and events. |
+

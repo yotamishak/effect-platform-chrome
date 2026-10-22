@@ -4,10 +4,20 @@ import { Effect, Exit, Fiber, Schema, Stream } from "effect"
 import { describe, expect, it } from "@effect/vitest"
 import * as ChromeTesting from "../src/ChromeTesting.js"
 import { makeEvent, makePortPair, makeStorage, makeTabs } from "../src/ChromeTesting.js"
+import * as TestAction from "../src/testing/Action.js"
+import * as TestBookmarks from "../src/testing/Bookmarks.js"
+import * as TestContextMenus from "../src/testing/ContextMenus.js"
+import * as TestCookies from "../src/testing/Cookies.js"
+import * as TestDeclarativeNetRequest from "../src/testing/DeclarativeNetRequest.js"
 import * as TestEvent from "../src/testing/Event.js"
+import * as TestIdentity from "../src/testing/Identity.js"
+import * as TestNotifications from "../src/testing/Notifications.js"
+import * as TestOffscreen from "../src/testing/Offscreen.js"
+import * as TestOmnibox from "../src/testing/Omnibox.js"
 import * as TestPort from "../src/testing/Port.js"
 import * as TestStorage from "../src/testing/Storage.js"
 import * as TestTabs from "../src/testing/Tabs.js"
+import * as TestWebNavigation from "../src/testing/WebNavigation.js"
 import * as ChromeTabs from "../src/ChromeTabs.js"
 import * as ChromeStorage from "../src/ChromeStorage.js"
 import * as ChromePort from "../src/ChromePort.js"
@@ -17,11 +27,16 @@ interface CyclicMessage {
 }
 
 describe("ChromeTesting events", () => {
-  it("re-exports each per-adapter fixture module unchanged", () => {
-    expect(ChromeTesting.makeEvent).toBe(TestEvent.makeEvent)
-    expect(ChromeTesting.makeStorage).toBe(TestStorage.makeStorage)
-    expect(ChromeTesting.makePortPair).toBe(TestPort.makePortPair)
-    expect(ChromeTesting.makeTabs).toBe(TestTabs.makeTabs)
+  it.each([
+    TestAction, TestBookmarks, TestContextMenus, TestCookies, TestDeclarativeNetRequest, TestEvent, TestIdentity,
+    TestNotifications, TestOffscreen, TestOmnibox, TestPort, TestStorage, TestTabs, TestWebNavigation
+  ])("re-exports every value of each per-adapter fixture module unchanged", (fixture) => {
+    const barrel = new Map(Object.entries(ChromeTesting))
+    const entries = Object.entries(fixture)
+
+    expect(entries.length).toBeGreaterThan(0)
+
+    for (const [name, value] of entries) expect(barrel.get(name)).toBe(value)
   })
 
   it.effect("keeps 4096-listener snapshots intact across reentrant removal and thrown callbacks", () => Effect.sync(() => {

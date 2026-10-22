@@ -3,7 +3,7 @@
 Standalone TypeScript ESM library for **Effect v4** and **Chrome
 Manifest V3**, modeled after `@effect/platform-browser`.
 
-**Status:** initial implementation with eighteen public modules and mocked behavior
+**Status:** initial implementation with thirty-six public modules and mocked behavior
 tests. The library focuses on platform services rather than UI APIs.
 
 This is an independent community project, not an official Effect package.
@@ -109,8 +109,10 @@ second standalone tsgo language server or the legacy JS patcher alongside it.
 Other editors can use the patched compiler's language server; see the
 [@effect/tsgo README](https://github.com/Effect-TS/tsgo#readme) for editor setup.
 
-Strict NodeNext configuration includes forced module detection and separate
-incremental typecheck/build caches under `node_modules/.cache/`. Library type
+Strict NodeNext configuration includes forced module detection and an incremental
+typecheck cache under `node_modules/.cache/`. `npm run build` is not incremental: it
+removes `dist/` first, so a deleted or partial output, or files left from renamed
+sources, never survive into a build. Library type
 checking remains enabled (`skipLibCheck: false`); composite project references
 are unnecessary for this standalone library.
 
@@ -137,9 +139,9 @@ CLI is not a library runtime dependency; use it only with trusted documentation.
 
 | Module | Responsibility |
 | --- | --- |
-| `ChromeStorage` | Typed access to Chrome storage areas and change events. |
+| `ChromeStorage` | Typed access to Chrome storage areas (including `getKeys`, Chrome 130+) and change events. |
 | `ChromeKeyValueStore` | Adapter for `effect/persistence/KeyValueStore`. |
-| `ChromeRuntime` | Runtime messaging, lifecycle events, and extension metadata; `request` unwraps the worker's reply envelope. |
+| `ChromeRuntime` | Runtime messaging, lifecycle, update and external message/connection events, extension contexts and metadata; `request` unwraps the worker's reply envelope. |
 | `ChromeMessage` | The `{ ok, value \| error }` reply envelope shared by `ChromeServiceWorker` and senders: its schema, `succeed`/`fail`, and `decodeResponse`. |
 | `ChromePort` | Scoped long-lived messaging ports and streams. |
 | `ChromeTabs` | Tab operations and event streams. |
@@ -147,14 +149,32 @@ CLI is not a library runtime dependency; use it only with trusted documentation.
 | `ChromeServiceWorker` | Manifest V3 service-worker lifecycle integration, with wake listeners for any event (optionally filtered) via `listen`. |
 | [`ChromeRpc`](docs/ChromeRpc.md) | Effect RPC client/server protocols over Chrome ports. |
 | [`ChromeSchemaStorage`](docs/ChromeSchemaStorage.md) | Schema validation, defaults, version migrations, and latest-state observation. |
-| [`ChromePermissions`](docs/ChromePermissions.md) | Permission checks, requests, revocation, and change events. |
+| [`ChromePermissions`](docs/ChromePermissions.md) | Permission checks, requests, revocation, host access requests (Chrome 133+), and change events. |
 | [`ChromeScripting`](docs/ChromeScripting.md) | Typed script injection, CSS, and dynamic content-script registration. |
-| `ChromeIdentity` | Web auth flows (`launchWebAuthFlow`) and the extension's OAuth redirect URL. |
-| `ChromeWebNavigation` | A tab's frames (`getAllFrames`, `getFrame`) and committed/history navigations. |
-| `ChromeCookies` | Reading, setting and removing cookies, including removing a cookie read from `getAll`. |
-| `ChromeNotifications` | Creating and clearing notifications, and their click/close events. |
+| `ChromeIdentity` | Web auth flows (`launchWebAuthFlow`), the OAuth redirect URL, Google account tokens (`getAuthToken`, cache removal), profile user info and sign-in change events. |
+| `ChromeWebNavigation` | A tab's frames (`getAllFrames`, `getFrame`) and every navigation event (before-navigate, committed, DOMContentLoaded, completed, errors, created targets, fragment/history updates, tab replacement), each filterable by URL through `filtered(filter)`. |
+| `ChromeCookies` | Reading, setting and removing cookies (including removing a cookie read from `getAll`), listing cookie stores, and cookie change events. |
+| `ChromeNotifications` | Creating, updating, clearing and listing notifications, the permission level, and click, button, close and permission-change events. |
 | `ChromeWindows` | Reading and updating windows, including bringing one to the front. |
-| [`ChromeTesting`](docs/ChromeTesting.md) | Isolated storage and tab fixtures, event simulators, and paired ports; one module per adapter under `testing/`. |
+| [`ChromeOffscreen`](docs/ChromeOffscreen.md) | The single offscreen document: concurrency-safe `ensureDocument` and a scoped `document`. |
+| `ChromeAction` | Toolbar action: per-tab badge text/colors, icon, title, popup, enable/disable, `openPopup`, user settings; `onClicked` / `onUserSettingsChanged` streams. |
+| `ChromeCommands` | Keyboard commands: `getAll` and the `onCommand` stream (command name and optional tab). |
+| [`ChromeSidePanel`](docs/ChromeSidePanel.md) | Side panel options, behavior, layout and `close`; lazy `open` plus `openFromUserGesture`; `onOpened` / `onClosed` streams. |
+| [`ChromeContextMenus`](docs/ChromeContextMenus.md) | Creating (with lastError-checked confirmation), updating and removing menu items, scoped items, and click events. |
+| [`ChromeOmnibox`](docs/ChromeOmnibox.md) | The omnibox default suggestion and keyword-session events, answering input through an Effect-returning `suggest`. |
+| [`ChromeDeclarativeNetRequest`](docs/ChromeDeclarativeNetRequest.md) | Dynamic, session and static request rules, atomic `replaceDynamicRules`, matched-rule feedback and debug matches. |
+| `ChromeWebRequest` | Observational request-lifecycle streams with a required `RequestFilter`; blocking belongs in `ChromeDeclarativeNetRequest`. |
+| `ChromeIdle` | Idle/locked state queries, the detection interval, the ChromeOS auto-lock delay, and state-change events. |
+| `ChromeI18n` | Localized messages as `Option` (missing key is none), UI and accept languages, and language detection. |
+| `ChromeDownloads` | Starting, searching and controlling downloads, `waitForComplete`, choosing filenames, and download events. |
+| `ChromeHistory` | Searching, adding and deleting browser history, and visit events. |
+| `ChromeBookmarks` | Reading, searching and editing the bookmark tree, and its change/import events. |
+| `ChromeSessions` | Recently closed tabs and windows, other devices' sessions, restoring them, and change events. |
+| `ChromeManagement` | Installed extensions (`getSelf`, `getAll`, `get`), permission warnings, enabling and uninstalling, and install/uninstall/enable/disable events. |
+| `ChromeUserScripts` | User-script registration, world configuration and one-off `execute`, with an `isAvailable` probe for the user's "Allow User Scripts" toggle. |
+| [`ChromeDebugger`](docs/ChromeDebugger.md) | Chrome DevTools Protocol commands and events, with scoped sessions that attach on acquire and detach on release. |
+| `ChromeTabCapture` | Tab-capture stream ids for offscreen documents, captured tabs, and capture status events. |
+| [`ChromeTesting`](docs/ChromeTesting.md) | In-memory fixtures for storage, tabs, ports, action, context menus, omnibox, offscreen, cookies, identity, web navigation, notifications, declarativeNetRequest and bookmarks, plus event simulators; one module per adapter under `testing/`. |
 
 Modules use Effect v4 services, tagged errors, layers, and scoped streams.
 Manifest V3 wakeup listeners must
