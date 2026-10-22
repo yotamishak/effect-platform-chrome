@@ -15,9 +15,9 @@ it; talk to it with `ChromeRuntime` or `ChromePort`. `chrome.offscreen` has no e
 | Member | Behaviour |
 | --- | --- |
 | `createDocument(parameters)` | Plain `offscreen.createDocument`; resolves once the page has finished its initial load. Fails while any offscreen document is open or still loading. |
-| `closeDocument` | Plain `offscreen.closeDocument` (an `Effect` value). Fails when none is open. |
-| `hasDocument` | Chrome 150+: whether any offscreen document is open, whatever its URL. Fails with `operation: "hasDocument"` in older Chrome. |
-| `ensureDocument(parameters)` | Creates the document unless it is already open; resolves to whether this call created it. |
+| `closeDocument` | Plain `offscreen.closeDocument` (an `Effect` value). Fails when none exists; closes a document that is still loading, whose `createDocument` then fails. |
+| `hasDocument` | Chrome 150+: whether any offscreen document exists, open or still loading, whatever its URL. Fails with `operation: "hasDocument"` in older Chrome. |
+| `ensureDocument(parameters)` | Creates the document unless it is already open; resolves to whether this call created it. An open page is reused as it is, whatever its reasons. |
 | `document(parameters)` | Scoped `ensureDocument`: the last overlapping scope to close closes the document. |
 
 Failures are `ChromeOffscreenError` with the Chrome call as `operation`
@@ -53,7 +53,10 @@ const parameters: ChromeOffscreen.CreateParameters = {
   page as an HTML entrypoint in your bundler so it ships in the build.
 - `reasons` (`ChromeOffscreen.Reason`) declares which capabilities the document needs.
   Pick the narrowest ones that are true; Chrome closes `AUDIO_PLAYBACK` documents after
-  about 30 seconds without audio, and sets no lifetime for the other reasons.
+  about 30 seconds without audio, and sets no lifetime for the other reasons. Chrome
+  rejects an empty list, so the type requires at least one reason; readonly (`as const`)
+  parameters are accepted. The reasons are fixed at creation: `ensureDocument` reuses an
+  open page without comparing them.
 - `justification` is a human-readable explanation Chrome may show the user. Make it
   specific to what your extension does.
 
@@ -75,10 +78,19 @@ The semaphore covers one service instance in one JavaScript context. Another ext
 context (a popup, or a second service instance) can still create the document between the
 lookup and the creation. When `createDocument` fails, `ensureDocument` looks again and
 treats a document now open at the same URL as success, so that race is also absorbed. A
-creation that the other context has started but whose page is still loading is not
-visible yet; `ensureDocument` then fails with `createDocument`'s error, and a retry once
-it has loaded finds the document. Build the service once (one layer) per context so every
-caller shares the permit.
+creation that the other context has started is not visible to `getContexts` until its
+page commits; `ensureDocument` then fails with `createDocument`'s error, and a retry once
+it has loaded finds the document. After the page commits, `getContexts` lists it although
+it may still be loading, so an `ensureDocument` that found another context's document can
+resolve before the page's message listeners exist; have the page announce that it is
+ready if several contexts create it. A document this service created has always finished
+its initial load. Build the service once (one layer) per context so every caller shares
+the permit.
+
+Chrome closes a document that another context closes while it loads, and one whose page
+fails to load; the pending `createDocument` then fails ("Offscreen document closed before
+fully loading.", "Page failed to load."), as does an `ensureDocument` or `document`
+relying on it, without leaving a holder behind.
 
 `chrome.offscreen.hasDocument` would avoid the URL lookup, but only exists from Chrome
 150, and it cannot tell which page is open. `getContexts` works from Chrome 116 and
@@ -129,15 +141,18 @@ then. An offscreen document can outlive the worker that created it; on the next 
 ## Testing
 
 `makeOffscreen(overrides?, extensionId?)` from `effect-platform-chrome/testing/Offscreen`
-is an in-memory API with Chrome's single-document rule; it rejects pages outside the
-extension, and its `getContexts` honours every `ContextFilter` field. `overrides` replace
+is an in-memory API with Chrome's single-document rule and error messages; it rejects
+pages outside the extension and an empty `reasons` list. As in Chrome, a document still
+loading exists for `hasDocument` and `closeDocument` (closing it rejects the pending
+`createDocument`) but not for `getContexts`, which honours every `ContextFilter` field. `overrides` replace
 API members (`{ hasDocument: undefined }` models Chrome before 150). Its `controls` expose
-the open document URL, whether a creation is pending, every `createDocument` call, the
-number of closes, `open`/`close` to simulate another context or Chrome, `failNext` for
+the loaded document's URL, whether a creation is pending, every `createDocument` call, the
+number of closes, `open`/`close` to simulate another context or Chrome (`close` also
+closes a loading document), `failNext` for
 any call (queued in order; `getURL` throws synchronously), and `holdNextCreate` /
 `holdNextClose` to keep a call pending while concurrent callers queue.
 
 Deterministic stress cases live in `test/stress/ChromeOffscreen.stress.test.ts`: thousands
 of concurrent calls with interleaved rejections and throws, scoped documents interrupted at
-every stage, seeded races with interruption while Chrome works, competing contexts, and
-long create/close runs.
+every stage, seeded races with interruption while Chrome works, competing contexts,
+documents Chrome closes while loading or after, and long create/close runs.

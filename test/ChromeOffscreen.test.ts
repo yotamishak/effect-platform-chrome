@@ -3,7 +3,7 @@
 import { Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeOffscreen, ChromeOffscreenError, layer, layerLive, make } from "../src/ChromeOffscreen.js"
-import type { ChromeOffscreenApi, ChromeOffscreenService, CreateParameters } from "../src/ChromeOffscreen.js"
+import type { ChromeOffscreenApi, ChromeOffscreenService, CreateParameters, Reason } from "../src/ChromeOffscreen.js"
 import { makeOffscreen } from "../src/testing/Offscreen.js"
 
 const parameters: CreateParameters = {
@@ -205,7 +205,9 @@ describe("ChromeOffscreen calls", () => {
     const hold = fixture.controls.holdNextCreate()
     const creating = yield* Effect.forkChild(offscreen.ensureDocument(parameters), { startImmediately: true })
     yield* Effect.promise(() => hold.entered)
-    expect(yield* offscreen.hasDocument).toBe(false)
+    // It answers while the creation holds the permit; Chrome counts the loading document.
+    expect(yield* offscreen.hasDocument).toBe(true)
+    expect(fixture.controls.creating).toBe(true)
     hold.release()
     expect(yield* Fiber.join(creating)).toBe(true)
     expect(yield* offscreen.hasDocument).toBe(true)
@@ -259,7 +261,7 @@ describe("ChromeOffscreen.ensureDocument", () => {
     const error = yield* Effect.flip(make(fixture.api).ensureDocument({ ...parameters, url: "https://example.com/page.html" }))
     expect(getContexts).toHaveBeenCalledWith({ contextTypes: ["OFFSCREEN_DOCUMENT"], documentUrls: ["https://example.com/page.html"] })
     expect(error.operation).toBe("createDocument")
-    expect(String(error.cause)).toContain("extension pages")
+    expect(String(error.cause)).toContain("Invalid URL.")
     expect(fixture.controls.documentUrl).toBeUndefined()
   }))
 
@@ -921,5 +923,146 @@ describe("makeOffscreen", () => {
     const fixture = makeOffscreen({ hasDocument: () => Promise.resolve(true) })
     expect(yield* Effect.flatMap(ChromeOffscreen, (service) => service.hasDocument).pipe(Effect.provide(fixture.layer))).toBe(true)
     expect(fixture.controls.documentUrl).toBeUndefined()
+  }))
+})
+
+describe("ChromeOffscreen edge cases", () => {
+  it.effect("CreateParameters requires a reason and accepts readonly parameters", () => Effect.gen(function*() {
+    const fixture = makeOffscreen()
+    const createDocument = vi.spyOn(fixture.api, "createDocument")
+    const service = make(fixture.api)
+    const frozen = { url: "offscreen.html", reasons: ["DOM_PARSER", "CLIPBOARD"], justification: "Parse and copy" } as const
+    expect(yield* service.ensureDocument(frozen)).toBe(true)
+    expect(createDocument).toHaveBeenCalledExactlyOnceWith(frozen)
+
+    // @ts-expect-error Chrome rejects an empty list: "A `reason` must be provided."
+    const empty: CreateParameters = { url: "audio.html", reasons: [], justification: "No reason" }
+    yield* service.closeDocument
+    const error = yield* Effect.flip(service.ensureDocument(empty))
+    expect(error.operation).toBe("createDocument")
+    expect(String(error.cause)).toContain("A `reason` must be provided.")
+  }))
+
+  it.effect("ensureDocument reuses an open page whatever reasons it was created with", () => Effect.gen(function*() {
+    const fixture = makeOffscreen()
+    const service = make(fixture.api)
+    yield* service.createDocument(parameters)
+    expect(yield* service.ensureDocument({ ...parameters, reasons: ["AUDIO_PLAYBACK"], justification: "Other" })).toBe(false)
+    expect(fixture.controls.created).toEqual([parameters])
+  }))
+
+  it.effect("hasDocument reports a document that another context is still loading, as Chrome does", () => Effect.gen(function*() {
+    const fixture = makeOffscreen()
+    const hold = fixture.controls.holdNextCreate()
+    const elsewhere = fixture.api.createDocument(parameters)
+    yield* Effect.promise(() => hold.entered)
+    const service = make(fixture.api)
+    expect(yield* service.hasDocument).toBe(true)
+    // getContexts does not see the page before it commits, so ensureDocument cannot find it yet.
+    expect(yield* Effect.flip(service.ensureDocument(parameters))).toMatchObject({ operation: "createDocument" })
+    hold.release()
+    yield* Effect.promise(() => elsewhere)
+    expect(yield* service.ensureDocument(parameters)).toBe(false)
+  }))
+
+  it.effect("a document closed by another context while loading fails ensureDocument and frees the permit", () => Effect.gen(function*() {
+    const fixture = makeOffscreen()
+    const service = make(fixture.api)
+    const hold = fixture.controls.holdNextCreate()
+    const creating = yield* Effect.forkChild(service.ensureDocument(parameters), { startImmediately: true })
+    yield* Effect.promise(() => hold.entered)
+
+    // Another context's closeDocument closes the loading page; Chrome rejects the creation.
+    yield* Effect.promise(() => fixture.api.closeDocument())
+    const error = yield* Effect.flip(Fiber.join(creating))
+    expect(error.operation).toBe("createDocument")
+    expect(String(error.cause)).toContain("closed before fully loading")
+    expect(fixture.controls.creating).toBe(false)
+    expect(fixture.controls.documentUrl).toBeUndefined()
+    expect(fixture.controls.closed).toBe(1)
+    hold.release()
+
+    expect(yield* service.ensureDocument(parameters)).toBe(true)
+    expect(fixture.controls.documentUrl).toBe(documentUrl)
+  }))
+
+  it.effect("a scoped document closed by Chrome while loading holds nothing", () => Effect.gen(function*() {
+    const fixture = makeOffscreen()
+    const service = make(fixture.api)
+    const hold = fixture.controls.holdNextCreate()
+    const scope = yield* Scope.make()
+    const user = yield* Effect.forkChild(Scope.provide(service.document(parameters), scope), { startImmediately: true })
+    yield* Effect.promise(() => hold.entered)
+    fixture.controls.close()
+    expect(yield* Effect.flip(Fiber.join(user))).toMatchObject({ operation: "createDocument" })
+    hold.release()
+    yield* Scope.close(scope, Exit.void)
+    expect(fixture.controls.closed).toBe(0)
+
+    // No holder was counted: a fresh scope opens and closes its own document.
+    yield* Effect.scoped(service.document(parameters))
+    expect(fixture.controls.created).toHaveLength(2)
+    expect(fixture.controls.closed).toBe(1)
+    expect(fixture.controls.documentUrl).toBeUndefined()
+  }))
+
+  it.effect("layerLive before Chrome 116 (no runtime.getContexts) fails the lookup with the typed error", () => Effect.gen(function*() {
+    const fixture = makeOffscreen()
+    const offscreen = new FakeOffscreen()
+    vi.stubGlobal("chrome", { offscreen, runtime: { getURL: (path: string) => fixture.api.getURL(path) } })
+    const service = yield* ChromeOffscreen.pipe(Effect.provide(layerLive))
+    const error = yield* Effect.flip(service.ensureDocument(parameters))
+    expect(error).toBeInstanceOf(ChromeOffscreenError)
+    expect(error.operation).toBe("getContexts")
+    expect(error.cause).toBeInstanceOf(TypeError)
+    expect(offscreen.created).toHaveLength(0)
+    // The plain calls do not need the lookup.
+    yield* service.createDocument(parameters)
+    yield* service.closeDocument
+    expect(offscreen.open).toBe(false)
+  }))
+})
+
+describe("makeOffscreen Chrome fidelity", () => {
+  const outcome = (promise: Promise<void>) => Effect.promise(() => promise.then(() => undefined, (error: Error) => error))
+
+  it.effect("rejects with Chrome's messages", () => Effect.gen(function*() {
+    const fixture = makeOffscreen()
+    expect(yield* outcome(fixture.api.createDocument({ ...parameters, url: "https://example.com/" }))).toMatchObject({ message: "Invalid URL." })
+    const none: ReadonlyArray<Reason> = []
+    // SAFETY: models a JavaScript caller passing the empty list the type forbids; Chrome validates it.
+    const empty = { ...parameters, reasons: none } as CreateParameters
+    expect(yield* outcome(fixture.api.createDocument(empty))).toMatchObject({ message: "A `reason` must be provided." })
+    expect(yield* outcome(fixture.api.closeDocument())).toMatchObject({ message: "No current offscreen document." })
+    yield* Effect.promise(() => fixture.api.createDocument(parameters))
+    expect(yield* outcome(fixture.api.createDocument(parameters))).toMatchObject({ message: "Only a single offscreen document may be created." })
+  }))
+
+  it.effect("a loading document counts for hasDocument and closeDocument but not getContexts", () => Effect.gen(function*() {
+    const fixture = makeOffscreen()
+    const hold = fixture.controls.holdNextCreate()
+    const creating = outcome(fixture.api.createDocument(parameters))
+    yield* Effect.promise(() => hold.entered)
+    expect(yield* Effect.promise(() => fixture.api.hasDocument?.() ?? Promise.resolve(false))).toBe(true)
+    expect(yield* Effect.promise(() => fixture.api.getContexts({}))).toEqual([])
+    expect(yield* outcome(fixture.api.closeDocument())).toBeUndefined()
+    expect(yield* creating).toMatchObject({ message: "Offscreen document closed before fully loading." })
+    expect(fixture.controls.creating).toBe(false)
+    expect(fixture.controls.closed).toBe(1)
+    hold.release()
+    expect(fixture.controls.documentUrl).toBeUndefined()
+    expect(yield* Effect.promise(() => fixture.api.hasDocument?.() ?? Promise.resolve(true))).toBe(false)
+  }))
+
+  it.effect("controls.close also closes a loading document", () => Effect.gen(function*() {
+    const fixture = makeOffscreen()
+    const hold = fixture.controls.holdNextCreate()
+    const creating = outcome(fixture.api.createDocument(parameters))
+    yield* Effect.promise(() => hold.entered)
+    fixture.controls.close()
+    expect(yield* creating).toMatchObject({ message: "Offscreen document closed before fully loading." })
+    hold.release()
+    expect(fixture.controls.documentUrl).toBeUndefined()
+    expect(fixture.controls.closed).toBe(0)
   }))
 })

@@ -608,4 +608,53 @@ describe("ChromeOffscreen stress", () => {
     expect(yield* query({ documentUrls: [...urls, documentUrl] })).toHaveLength(1)
     expect(yield* query({ contextIds: Array.from({ length: 4096 }, (_, index) => `offscreen-${index}`) })).toHaveLength(1)
   }))
+
+  it.effect("512 seeded rounds where Chrome closes the document while loading or after: typed failures, no holder leaked", () => Effect.gen(function*() {
+    const random = seeded(0x0FF5C2EE)
+    const fixture = makeOffscreen()
+    const service = make(fixture.api)
+    const tally = { loading: 0, loaded: 0, kept: 0 }
+    let closes = 0
+
+    for (let round = 0; round < 512; round++) {
+      const stage = (["loading", "loaded", "kept"] as const)[Math.floor(random() * 3)] ?? "kept"
+      const hold = fixture.controls.holdNextCreate()
+      const acquired = yield* Deferred.make<void>()
+      const user = yield* Effect.forkChild(Effect.exit(holding(service, parameters, acquired)), { startImmediately: true })
+      yield* Effect.promise(() => hold.entered)
+      // Queued on the permit behind the acquisition.
+      const waiter = yield* Effect.forkChild(service.ensureDocument(parameters), { startImmediately: true })
+      tally[stage] += 1
+
+      if (stage === "loading") {
+        fixture.controls.close()
+        const exit = yield* Fiber.join(user)
+        const error = errorOf(exit)
+        expect(error).toBeInstanceOf(ChromeOffscreenError)
+        expect(error?.operation).toBe("createDocument")
+        expect(String(error?.cause)).toContain("closed before fully loading")
+        hold.release()
+        // The waiter finds nothing open and creates the page itself.
+        expect(yield* Fiber.join(waiter)).toBe(true)
+        yield* service.closeDocument
+        closes += 1
+      } else {
+        hold.release()
+        yield* Deferred.await(acquired)
+        expect(yield* Fiber.join(waiter)).toBe(false)
+
+        if (stage === "loaded") fixture.controls.close()
+        else closes += 1
+
+        yield* Fiber.interrupt(user)
+      }
+
+      expect(fixture.controls.documentUrl).toBeUndefined()
+      expect(fixture.controls.creating).toBe(false)
+      expect(fixture.controls.closed).toBe(closes)
+    }
+
+    expect(Object.values(tally).every((count) => count > 100)).toBe(true)
+    yield* expectNoHolders(service, fixture)
+  }))
 })

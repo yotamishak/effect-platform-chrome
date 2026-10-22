@@ -29,13 +29,15 @@ const makeGate = (queue: Array<Gate>): OffscreenHold => {
 }
 
 /**
- * An in-memory `chrome.offscreen` with Chrome's single-document rule: `createDocument`
- * fails for a page outside the extension and while a document is open or still being
- * created, and `closeDocument` fails when none is open. `hasDocument` (Chrome 150+) and `getContexts` report the open document,
- * the latter as an `OFFSCREEN_DOCUMENT` context honouring every `ContextFilter` field;
- * neither sees a document still being created. `getURL` resolves against
- * `chrome-extension://<extensionId>/`. Pass `overrides` to replace any API member, for
- * example `{ hasDocument: undefined }` for Chrome before 150.
+ * An in-memory `chrome.offscreen` with Chrome's single-document rule and error messages:
+ * `createDocument` fails for a page outside the extension, without a reason, and while a
+ * document is open or still loading. As in Chrome, a loading document already exists for
+ * `hasDocument` (Chrome 150+) and `closeDocument`; closing it rejects the pending
+ * `createDocument` with "Offscreen document closed before fully loading.". `getContexts`
+ * reports only a loaded document, as an `OFFSCREEN_DOCUMENT` context honouring every
+ * `ContextFilter` field. `getURL` resolves against `chrome-extension://<extensionId>/`.
+ * Pass `overrides` to replace any API member, for example `{ hasDocument: undefined }` for
+ * Chrome before 150.
  */
 export const makeOffscreen = (
   overrides: Partial<ChromeOffscreen.ChromeOffscreenApi> = {},
@@ -46,7 +48,8 @@ export const makeOffscreen = (
   const createHolds: Array<Gate> = []
   const closeHolds: Array<Gate> = []
   const failures = new Map<OffscreenOperation, Array<Error>>()
-  let creating = false
+  // Aborts the pending creation while a document is loading.
+  let loading: (() => void) | undefined
   let closes = 0
   let current: chrome.runtime.ExtensionContext | undefined
   let nextId = 0
@@ -75,6 +78,18 @@ export const makeOffscreen = (
     }
   }
 
+  /** Closes the open or loading document, reporting whether there was one. */
+  const discard = () => {
+    const abort = loading
+    const existed = current !== undefined || abort !== undefined
+
+    current = undefined
+    loading = undefined
+    abort?.()
+
+    return existed
+  }
+
   const pass = async (queue: Array<Gate>) => {
     const hold = queue.shift()
 
@@ -88,33 +103,35 @@ export const makeOffscreen = (
       check("createDocument")
 
       // URL#origin is "null" for chrome-extension: in Node, so compare the prefix.
-      if (!resolve(parameters.url).startsWith(`${origin}/`)) throw new Error("Offscreen documents must be extension pages.")
+      if (!resolve(parameters.url).startsWith(`${origin}/`)) throw new Error("Invalid URL.")
 
-      if (current !== undefined || creating) throw new Error("Only a single offscreen document may be created.")
+      if (parameters.reasons.length === 0) throw new Error("A `reason` must be provided.")
 
-      creating = true
+      if (current !== undefined || loading !== undefined) throw new Error("Only a single offscreen document may be created.")
 
-      try {
-        await pass(createHolds)
-      } finally {
-        creating = false
-      }
+      let abort!: () => void
+      const closed = new Promise<"closed">((settle) => { abort = () => { settle("closed") } })
+      loading = abort
+      const outcome = await Promise.race([pass(createHolds).then(() => "loaded" as const), closed])
 
+      if (outcome === "closed") throw new Error("Offscreen document closed before fully loading.")
+
+      loading = undefined
       open(parameters.url)
     },
     closeDocument: async () => {
       check("closeDocument")
 
-      if (current === undefined) throw new Error("No current offscreen document.")
+      if (current === undefined && loading === undefined) throw new Error("No current offscreen document.")
 
       await pass(closeHolds)
-      current = undefined
-      closes += 1
+
+      if (discard()) closes += 1
     },
     hasDocument: async () => {
       check("hasDocument")
 
-      return current !== undefined
+      return current !== undefined || loading !== undefined
     },
     getContexts: async (filter) => {
       check("getContexts")
@@ -147,18 +164,21 @@ export const makeOffscreen = (
     api,
     layer: ChromeOffscreen.layer(api),
     controls: {
-      /** The open document's absolute URL, if any. */
+      /** The loaded document's absolute URL, if any. */
       get documentUrl() { return current?.documentUrl },
-      /** Whether a `createDocument` call is pending. */
-      get creating() { return creating },
+      /** Whether a document is loading: a `createDocument` call is pending. */
+      get creating() { return loading !== undefined },
       /** Every `createDocument` call, including failed ones. */
       get created(): ReadonlyArray<ChromeOffscreen.CreateParameters> { return created },
       /** How many documents `closeDocument` has closed. */
       get closed() { return closes },
       /** Opens a document as another extension context would, bypassing the API. */
       open,
-      /** Closes the document as Chrome or another context would, bypassing the API. */
-      close: () => { current = undefined },
+      /**
+       * Closes the open or loading document as Chrome or another context would, bypassing
+       * the API; a pending `createDocument` then rejects.
+       */
+      close: () => { discard() },
       /**
        * Holds the next `createDocument` that passes Chrome's checks pending until the
        * returned `release` is called; `entered` resolves once that call is pending.

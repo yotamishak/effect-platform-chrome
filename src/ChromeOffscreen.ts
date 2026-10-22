@@ -6,11 +6,19 @@ export class ChromeOffscreenError extends Schema.TaggedError<ChromeOffscreenErro
   cause: Schema.Defect()
 }) {}
 
-/** The document's page (relative to the extension root), reasons, and justification. */
-export type CreateParameters = chrome.offscreen.CreateParameters
-
 /** Why the extension needs the document; Chrome may close it once the reason lapses. */
 export type Reason = `${chrome.offscreen.Reason}`
+
+/**
+ * The document's page (relative to the extension root), reasons, and justification.
+ * Chrome rejects an empty `reasons` list ("A `reason` must be provided."), so at least one
+ * is required; readonly (`as const`) values are accepted.
+ */
+export interface CreateParameters {
+  readonly url: string
+  readonly reasons: readonly [Reason, ...Array<Reason>]
+  readonly justification: string
+}
 
 /**
  * The Promise-based MV3 subset this module needs. `getContexts` and `getURL` come from
@@ -37,17 +45,22 @@ export interface ChromeOffscreenService {
    * while any offscreen document is open or still loading; prefer `ensureDocument`.
    */
   readonly createDocument: (parameters: CreateParameters) => Effect.Effect<void, ChromeOffscreenError>
-  /** Closes the open offscreen document; fails when none is open. */
+  /**
+   * Closes the offscreen document; fails when none exists. Chrome also closes a document
+   * another context is still loading, whose `createDocument` then fails.
+   */
   readonly closeDocument: Effect.Effect<void, ChromeOffscreenError>
   /**
-   * Chrome 150+: whether this extension has an open offscreen document, whatever its URL.
-   * Fails with operation `"hasDocument"` in older Chrome; `ensureDocument` does not need it.
+   * Chrome 150+: whether this extension has an offscreen document, open or still loading,
+   * whatever its URL. Fails with operation `"hasDocument"` in older Chrome; `ensureDocument`
+   * does not need it.
    */
   readonly hasDocument: Effect.Effect<boolean, ChromeOffscreenError>
   /**
    * Creates the document at `parameters.url` unless it is already open, resolving to
-   * whether this call created it. Calls on one service are serialised, so concurrent
-   * callers create it once. If creation still fails because another extension context
+   * whether this call created it. An open document is reused as it is, whatever reasons
+   * and justification it was created with. Calls on one service are serialised, so
+   * concurrent callers create it once. If creation still fails because another extension context
    * created the same document meanwhile, that counts as already open. Fails while an
    * offscreen document with a different URL is open (close that one first), or while
    * another context's creation is still loading. A `url` that does not resolve against
@@ -219,7 +232,8 @@ export const layerLive: Layer.Layer<ChromeOffscreen, ChromeOffscreenError> = liv
     if (offscreen === undefined || runtime === undefined) return undefined
 
     return {
-      createDocument: (parameters) => offscreen.createDocument(parameters),
+      // Chrome's declaration wants a mutable list; it reads the values without keeping them.
+      createDocument: ({ url, reasons, justification }) => offscreen.createDocument({ url, reasons: [...reasons], justification }),
       closeDocument: () => offscreen.closeDocument(),
       hasDocument: "hasDocument" in offscreen ? () => offscreen.hasDocument() : undefined,
       getContexts: (filter) => runtime.getContexts(filter),
