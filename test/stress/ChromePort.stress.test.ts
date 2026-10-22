@@ -547,6 +547,77 @@ describe("ChromePort stress", () => {
     expect(native.listeners).toBe(0)
   }))
 
+  it.effect("hands 4,096 messages in random bursts to 1,024 sequential partial consumers without losing or reordering any", () => Effect.gen(function*() {
+    const host = runtime()
+    const next = seeded(0x5eed)
+    // The sliding buffer as the module documents it: the newest 64 not yet taken.
+    const model: Array<number> = []
+    const expected: Array<number> = []
+    const received: Array<unknown> = []
+    let emitted = 0
+    let consumers = 0
+
+    yield* Effect.scoped(Effect.gen(function*() {
+      const port = yield* make(host.api).connect()
+      const native = host.opened[0]!
+
+      while (emitted < burst) {
+        // Mostly short bursts; one in 16 overflows the buffer.
+        for (let count = next(16) === 0 ? 65 + next(64) : 1 + next(8); count > 0 && emitted < burst; count--) {
+          native.emit(emitted)
+          model.push(emitted++)
+
+          if (model.length > 64) model.shift()
+        }
+
+        while (model.length > 0 && next(4) !== 0) {
+          const size = 1 + next(Math.min(model.length, 4))
+          consumers++
+          expected.push(...model.splice(0, size))
+
+          switch (next(3)) {
+            case 0: {
+              for (let index = 0; index < size; index++) {
+                received.push(...Option.toArray(yield* Stream.runHead(port.messages)))
+              }
+
+              break
+            }
+
+            case 1: {
+              received.push(...(yield* Stream.runCollect(Stream.take(port.messages, size))))
+
+              break
+            }
+
+            default: {
+              // The consumer takes `size` messages and is interrupted while handling the last.
+              const handled = yield* Deferred.make<void>()
+              let seen = 0
+
+              const consumer = yield* Effect.forkScoped(Stream.runForEach(port.messages, (value) => Effect.suspend(() => {
+                received.push(value)
+
+                return ++seen === size ? Deferred.succeed(handled, undefined).pipe(Effect.andThen(Effect.never)) : Effect.void
+              })))
+
+              yield* Deferred.await(handled)
+              yield* Fiber.interrupt(consumer)
+            }
+          }
+        }
+      }
+
+      native.hostDisconnect()
+      expected.push(...model.splice(0))
+      received.push(...(yield* Stream.runCollect(port.messages)))
+    }))
+
+    expect(consumers).toBeGreaterThan(1000)
+    expect(received).toEqual(expected)
+    expect(host.opened[0]!.listeners).toBe(0)
+  }))
+
   it.effect("moves 8,192 messages across 512 fixture pairs and releases every endpoint", () => Effect.gen(function*() {
     const pairs = Array.from({ length: 512 }, (_, index) => makePortPair(`pair-${index}`, { sender: { id: "extension", frameId: index } }))
 

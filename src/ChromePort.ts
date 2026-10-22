@@ -44,7 +44,9 @@ export interface Port {
    * The port's `onMessage` events, ending with its `onDisconnect`. Unlike the observational
    * `on*` streams of other modules, this is a single-consumer stream (concurrent consumers
    * compete, not broadcast) whose listeners are installed during acquisition, so messages
-   * arriving before it is consumed are kept. The buffer holds 64 messages, dropping the
+   * arriving before it is consumed are kept. Each pull takes a single message, so a consumer
+   * that stops early (`runHead`, `take`, interruption) leaves the rest buffered for the next
+   * consumption. The buffer holds 64 messages, dropping the
    * oldest on overflow. A clean disconnect drains buffered messages then ends; a disconnect
    * reporting `lastError` drains them then fails with operation `"disconnect"`.
    * Closing the acquisition scope discards the buffer and interrupts consumers.
@@ -175,6 +177,21 @@ const acquire = (
           }
         })
 
+        // Read before registering: once listeners are attached, a throw here would leak them.
+        let name: string
+        let sender: Option.Option<chrome.runtime.MessageSender>
+
+        try {
+          name = native.name
+          sender = Option.fromNullishOr(native.sender)
+        } catch (cause) {
+          Queue.shutdownUnsafe(queue)
+
+          try { link.disconnect() } catch { /* Preserve the property failure. */ }
+
+          throw cause
+        }
+
         try {
           link.register()
         } catch (cause) {
@@ -184,9 +201,11 @@ const acquire = (
         }
 
         const port: Port = {
-          name: native.name,
-          sender: Option.fromNullishOr(native.sender),
-          messages: Stream.fromQueue(queue),
+          name,
+          sender,
+          // One message per pull: a consumer that stops early (`runHead`, `take`, interruption)
+          // leaves the rest buffered for the next one, instead of discarding a taken batch.
+          messages: Stream.fromEffectRepeat(Queue.take(queue)),
           send: (message) => Effect.try({
             try: () => {
               if (!link.isOpen()) throw disconnectError ?? error("send", undefined, "Chrome port is closed")

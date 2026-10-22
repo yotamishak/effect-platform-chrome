@@ -1,6 +1,6 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Cause, Effect, Exit, Fiber, Option, Scope, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Option, Scope, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromePort, ChromePortError, layer, layerLive, make } from "../src/ChromePort.js"
 import type { ChromePortApi, ConnectOptions, NativePort } from "../src/ChromePort.js"
@@ -646,5 +646,64 @@ describe("ChromePort fixture", () => {
     expect(yield* Effect.scoped(Effect.flip(make(pair.left.api).connect()))).toMatchObject({ operation: "connect", cause })
     pair.left.port.disconnect()
     expect((yield* Effect.scoped(Effect.flip(make(pair.left.api).connect()))).operation).toBe("connect")
+  }))
+})
+
+describe("ChromePort edge cases", () => {
+  it.effect("sequential partial consumers resume where the previous one stopped", () => Effect.gen(function*() {
+    const f = fixture()
+
+    const [first, second, middle, rest] = yield* Effect.scoped(Effect.gen(function*() {
+      const port = yield* make(f.api).connect()
+
+      for (let index = 0; index < 8; index++) f.emit(index)
+
+      const head = yield* Stream.runHead(port.messages)
+      const next = yield* Stream.runHead(port.messages)
+      const taken = yield* Stream.runCollect(Stream.take(port.messages, 2))
+      f.close()
+
+      return [head, next, taken, yield* Stream.runCollect(port.messages)] as const
+    }))
+
+    expect(first).toEqual(Option.some(0))
+    expect(second).toEqual(Option.some(1))
+    expect(middle).toEqual([2, 3])
+    expect(rest).toEqual([4, 5, 6, 7])
+  }))
+
+  it.effect("a consumer interrupted while handling one message leaves the later ones buffered", () => Effect.gen(function*() {
+    const f = fixture()
+
+    yield* Effect.scoped(Effect.gen(function*() {
+      const port = yield* make(f.api).adopt(f.native, "borrowed")
+
+      for (let index = 0; index < 4; index++) f.emit(index)
+
+      const handling = yield* Deferred.make<unknown>()
+
+      const consumer = yield* Effect.forkScoped(Stream.runForEach(port.messages, (value) =>
+        Deferred.succeed(handling, value).pipe(Effect.andThen(Effect.never))
+      ))
+
+      expect(yield* Deferred.await(handling)).toBe(0)
+      yield* Fiber.interrupt(consumer)
+      f.close()
+      expect(yield* Stream.runCollect(port.messages)).toEqual([1, 2, 3])
+    }))
+  }))
+
+  it.effect("a port whose properties throw fails acquisition without leaving listeners or an open owned port", () => Effect.gen(function*() {
+    for (const property of ["name", "sender"] as const) {
+      const f = fixture()
+      const cause = new Error(`${property} getter failed`)
+      Object.defineProperty(f.native, property, { get: () => { throw cause } })
+
+      const failure = yield* Effect.scoped(Effect.flip(make(f.api).connect()))
+
+      expect(failure).toMatchObject({ operation: "connect", cause })
+      expect(f.messages.size + f.disconnects.size).toBe(0)
+      expect(f.disconnect).toHaveBeenCalledOnce()
+    }
   }))
 })
