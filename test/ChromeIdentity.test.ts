@@ -3,7 +3,7 @@
 import { Effect, Exit, Fiber, Option, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeIdentity, ChromeIdentityError, layer, layerLive, make } from "../src/ChromeIdentity.js"
-import type { ChromeIdentityApi, ChromeIdentityService } from "../src/ChromeIdentity.js"
+import type { ChromeIdentityApi, ChromeIdentityService, SignInChange } from "../src/ChromeIdentity.js"
 import { makeEvent } from "../src/testing/Event.js"
 import { makeIdentity } from "../src/testing/Identity.js"
 
@@ -318,6 +318,18 @@ describe("ChromeIdentity onSignInChanged", () => {
     expect(signInChanged.listenerCount).toBe(0)
   }))
 
+  it.effect("subscribes again with the same stream value after a failed registration", () => Effect.gen(function*() {
+    const { api, signInChanged } = mockApi()
+    const stream = make(api).onSignInChanged
+    signInChanged.failNext("addListener", new Error("registration failed"))
+    expect((yield* Effect.flip(Stream.runDrain(stream))).operation).toBe("onSignInChanged")
+    const fiber = yield* Effect.forkScoped(Stream.runCollect(Stream.take(stream, 1)))
+    yield* Effect.promise(() => signInChanged.waitForListener())
+    signInChanged.emit({ id: "a" }, true)
+    expect(yield* Fiber.join(fiber)).toEqual([{ account: { id: "a" }, signedIn: true }])
+    expect(signInChanged.listenerCount).toBe(0)
+  }))
+
   it.effect("removes a listener whose registration threw after adding it", () => Effect.gen(function*() {
     const { api, signInChanged } = mockApi()
     const cause = new Error("added, then threw")
@@ -513,6 +525,61 @@ describe("makeIdentity", () => {
       { account: { id: "b" }, signedIn: false }
     ])
     expect(fixture.controls.onSignInChanged.listenerCount).toBe(0)
+  }))
+
+  it.effect("keeps sign-in events consistent with the profile when a listener switches accounts re-entrantly", () => Effect.gen(function*() {
+    const fixture = makeIdentity()
+    const identity = make(fixture.api)
+    const seen: Array<SignInChange> = []
+    fixture.controls.signIn({ email: "a@example.com", id: "a" })
+
+    // A raw listener that answers a's sign-out by signing c in, while b's sign-in is still running.
+    fixture.api.onSignInChanged?.addListener((account, signedIn) => {
+      seen.push({ account, signedIn })
+
+      if (account.id === "a" && !signedIn) fixture.controls.signIn({ email: "c@example.com", id: "c" })
+    })
+
+    fixture.controls.signIn({ email: "b@example.com", id: "b" })
+    // Every event describes a transition from the state the previous one left, and the last
+    // one leaves the account the profile reports.
+    expect(seen).toEqual([
+      { account: { id: "a" }, signedIn: false },
+      { account: { id: "b" }, signedIn: true },
+      { account: { id: "b" }, signedIn: false },
+      { account: { id: "c" }, signedIn: true }
+    ])
+    expect(yield* identity.getAccounts).toEqual([{ id: "c" }])
+    expect(yield* identity.getProfileUserInfo()).toEqual({ email: "c@example.com", id: "c" })
+  }))
+
+  it.effect("rejects an explicitly empty scope list as Chrome does, even with a manifest-scope token cached", () => Effect.gen(function*() {
+    const fixture = makeIdentity()
+    const identity = make(fixture.api)
+    fixture.controls.signIn({ email: "user@example.com", id: "user" })
+    fixture.controls.cacheToken("manifest")
+    fixture.controls.grantNext("granted")
+    expect(yield* identity.getAuthToken()).toEqual({ token: "manifest", grantedScopes: [] })
+    expect((yield* Effect.flip(identity.getAuthToken({ interactive: true, scopes: [] })))
+      .cause).toEqual(new Error("Invalid OAuth2 scopes."))
+    // The rejected request consumed no consent.
+    expect(yield* identity.getAuthToken({ interactive: true, scopes: ["email"] })).toEqual({ token: "granted", grantedScopes: ["email"] })
+  }))
+
+  it.effect("rejects a web auth flow whose URL is not http or https without consuming a scripted outcome", () => Effect.gen(function*() {
+    const fixture = makeIdentity()
+    const identity = make(fixture.api)
+    fixture.controls.resolveNextFlow("https://test-extension-id.chromiumapp.org/?code=1")
+    const invalid = new Error("The auth url has an invalid scheme. Only http:// and https:// schemes are allowed.")
+
+    for (const url of ["chrome-extension://abc/auth.html", "javascript:alert(1)", "not a url", "HTTPS://AUTH.EXAMPLE/ok"]) {
+      const exit = yield* Effect.exit(identity.launchWebAuthFlow({ url, interactive: true }))
+
+      if (url.startsWith("HTTPS")) expect(yield* exit).toEqual(Option.some("https://test-extension-id.chromiumapp.org/?code=1"))
+      else expect((yield* Effect.flip(exit)).cause).toEqual(invalid)
+    }
+
+    expect(fixture.controls.flows.map((details) => details.url)).toEqual(["HTTPS://AUTH.EXAMPLE/ok"])
   }))
 
   it.effect("fails each call once per queued cause, in order, then recovers", () => Effect.gen(function*() {

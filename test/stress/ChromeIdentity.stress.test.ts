@@ -620,6 +620,53 @@ describe("makeIdentity stress", () => {
     expect((yield* Effect.flip(identity.launchWebAuthFlow({ url: "https://auth.example/extra" }))).cause).toEqual(new Error("User interaction required."))
   }))
 
+  it.effect("replays 2,048 seeded sign-in changes, many made re-entrantly by listeners, to the final profile", () => Effect.gen(function*() {
+    const random = seeded(2048)
+    const fixture = makeIdentity()
+    const identity = make(fixture.api)
+    const accounts = Array.from({ length: 5 }, (_, index) => ({ email: `user-${index}@example.com`, id: `user-${index}` }))
+    const log: Array<SignInChange> = []
+    let reentrant = 0
+
+    const act = () => {
+      if (random() < 0.3) fixture.controls.signOut()
+      else fixture.controls.signIn(pick(random, accounts), { syncing: random() < 0.5 })
+    }
+
+    const fiber = yield* Effect.forkChild(Stream.runCollect(Stream.take(identity.onSignInChanged, 64)))
+    yield* Effect.promise(() => fixture.controls.onSignInChanged.waitForListener())
+
+    // Three raw listeners react to some deliveries by changing the profile again, while
+    // earlier changes are still being delivered to the listeners after them.
+    for (let listener = 0; listener < 3; listener++) {
+      fixture.api.onSignInChanged?.addListener((account, signedIn) => {
+        if (listener === 0) log.push({ account, signedIn })
+
+        if (log.length < 2048 && random() < 0.3) {
+          reentrant++
+          act()
+        }
+      })
+    }
+
+    while (log.length < 2048) act()
+
+    // Each change leaves from the state the previous one reached: a sign-in only when nobody
+    // is signed in, a sign-out only of the signed-in account.
+    let current: string | undefined
+
+    for (const { account, signedIn } of log) {
+      expect(signedIn ? current : account.id).toBe(signedIn ? undefined : current)
+      current = signedIn ? account.id : undefined
+    }
+
+    expect(yield* identity.getAccounts).toEqual(current === undefined ? [] : [{ id: current }])
+    expect(yield* identity.getProfileUserInfo({ accountStatus: "ANY" })).toMatchObject({ id: current ?? "" })
+    // The observing stream saw the same sequence; its buffer slid to the newest 64.
+    expect(yield* Fiber.join(fiber)).toEqual(log.slice(-64))
+    expect(reentrant).toBeGreaterThan(256)
+  }))
+
   it.effect("resolves 10,000 redirect URLs and fails a queued burst of 1,024 lookups in order", () => Effect.gen(function*() {
     const fixture = makeIdentity()
     const identity = make(fixture.api)

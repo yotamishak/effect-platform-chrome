@@ -42,8 +42,10 @@ export interface ChromeIdentityService {
   /**
    * Runs an OAuth flow in a Chrome-owned window and resolves to the URL the provider
    * redirected to (a `chromiumapp.org` URL), or None when Chrome reports no URL. Chrome
-   * rejects a cancelled, failed or (non-interactive) unfinished flow; that rejection is the
-   * typed error. Interrupting the Effect stops waiting but cannot close Chrome's window.
+   * rejects a cancelled, failed or (non-interactive) unfinished flow, a `url` that is not
+   * http or https, and an interactive flow while another of this extension's is open; that
+   * rejection is the typed error. Interrupting the Effect stops waiting but cannot close
+   * Chrome's window, so a new interactive flow fails until the user closes it.
    */
   readonly launchWebAuthFlow: (
     details: chrome.identity.WebAuthFlowDetails
@@ -52,7 +54,8 @@ export interface ChromeIdentityService {
    * A Google OAuth2 token for the manifest's (or the given) scopes, with the scopes granted,
    * as Chrome's result object unchanged (Chrome types both fields as optional; `grantedScopes`
    * is filled since Chrome 87). Chrome serves it from its token cache when it can. A non-interactive request that would
-   * need the user, a declined consent screen, or a signed-out profile is the typed error.
+   * need the user, a declined consent screen, a signed-out profile, or an explicitly empty
+   * `scopes` list is the typed error.
    * Interrupting an interactive request stops waiting but cannot dismiss Chrome's prompt.
    */
   readonly getAuthToken: (
