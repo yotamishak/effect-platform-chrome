@@ -1,5 +1,6 @@
 import { Cause, Context, Effect, Layer, Queue, Schema, Stream } from "effect"
 import type { Scope } from "effect"
+import * as PortLink from "./internal/port.js"
 
 /** The runtime API is injected; importing this module never accesses Chrome. */
 export type RuntimeApi = Pick<typeof chrome.runtime, "connect" | "lastError">
@@ -53,63 +54,47 @@ const acquire = (
     return yield* Effect.try({
       try: () => {
         const native = getPort()
-        let closed = false
-        let disconnectAttempted = false
         let disconnectError: ChromePortError | undefined
 
-        const detach = () => {
-          // Attempt both removals even if a host API unexpectedly throws.
-          try { native.onMessage.removeListener(onMessage) } finally {
-            native.onDisconnect.removeListener(onDisconnect)
+        const fail = (failure: ChromePortError) => {
+          disconnectError = failure
+          Queue.failCauseUnsafe(queue, Cause.fail(failure))
+        }
+
+        const link: PortLink.Link = PortLink.make(native, ownership, () => api.lastError, {
+          onMessage: (message) => { Queue.offerUnsafe(queue, message) },
+          onDisconnect: (lastError) => {
+            if (lastError !== undefined) {
+              const message = lastError.message ?? "Chrome port disconnected with an error"
+              fail(error("disconnect", { message }, message))
+            } else {
+              Queue.endUnsafe(queue)
+            }
+
+            link.detach()
           }
-        }
-
-        const onMessage = (message: unknown) => {
-          if (!closed) Queue.offerUnsafe(queue, message)
-        }
-
-        const onDisconnect = () => {
-          // Chrome only exposes lastError for the duration of this callback.
-          const lastError = api.lastError
-
-          if (closed) return
-          closed = true
-
-          if (lastError !== undefined) {
-            const message = lastError.message ?? "Chrome port disconnected with an error"
-            disconnectError = error("disconnect", { message }, message)
-            Queue.failCauseUnsafe(queue, Cause.fail(disconnectError))
-          } else {
-            Queue.endUnsafe(queue)
-          }
-
-          detach()
-        }
+        })
 
         const disconnect = Effect.try({
           try: () => {
-            if (closed) return
+            if (!link.isOpen()) return
 
-            if (ownership === "owned" && !disconnectAttempted) {
-              disconnectAttempted = true
+            try {
+              link.disconnect()
+            } catch (cause) {
+              const failure = error("disconnect", cause, "Chrome port disconnect failed")
+              link.close()
+              fail(failure)
 
-              try {
-                native.disconnect()
-              } catch (cause) {
-                closed = true
-                disconnectError = error("disconnect", cause, "Chrome port disconnect failed")
-                Queue.failCauseUnsafe(queue, Cause.fail(disconnectError))
+              try { link.detach() } catch { /* Preserve the native disconnect failure. */ }
 
-                try { detach() } catch { /* Preserve the native disconnect failure. */ }
-
-                throw disconnectError
-              }
+              throw failure
             }
 
-            if (!closed) {
-              closed = true
+            // A native disconnect may report its own lastError synchronously, closing the link.
+            if (link.close()) {
               Queue.endUnsafe(queue)
-              detach()
+              link.detach()
             }
 
             if (disconnectError !== undefined) throw disconnectError
@@ -120,34 +105,22 @@ const acquire = (
         })
 
         const release = Effect.sync(() => {
-          const wasClosed = closed
-          closed = true
+          const wasOpen = link.close()
 
-          try { detach() } catch { /* Finalizers must not mask the scope's exit. */ }
+          try { link.detach() } catch { /* Finalizers must not mask the scope's exit. */ }
 
           Queue.shutdownUnsafe(queue)
 
-          if (!wasClosed && ownership === "owned" && !disconnectAttempted) {
-            disconnectAttempted = true
-
-            try { native.disconnect() } catch { /* Best-effort native release. */ }
+          // A port Chrome or an explicit disconnect already closed is not disconnected again.
+          if (wasOpen) {
+            try { link.disconnect() } catch { /* Best-effort native release. */ }
           }
         })
 
         try {
-          native.onDisconnect.addListener(onDisconnect)
-
-          if (!closed) native.onMessage.addListener(onMessage)
+          link.register()
         } catch (cause) {
-          closed = true
-
-          try { detach() } catch { /* Preserve the acquisition failure. */ }
-
           Queue.shutdownUnsafe(queue)
-
-          if (ownership === "owned") {
-            try { native.disconnect() } catch { /* Preserve the acquisition failure. */ }
-          }
 
           throw cause
         }
@@ -157,7 +130,7 @@ const acquire = (
           messages: Stream.fromQueue(queue),
           send: (message) => Effect.try({
             try: () => {
-              if (closed) throw disconnectError ?? error("send", undefined, "Chrome port is closed")
+              if (!link.isOpen()) throw disconnectError ?? error("send", undefined, "Chrome port is closed")
               native.postMessage(message)
             },
             catch: (cause) => cause instanceof ChromePortError
