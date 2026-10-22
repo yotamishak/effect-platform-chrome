@@ -312,6 +312,59 @@ describe("ChromeCommands stress", () => {
     expect(results.filter(Result.isFailure)).toHaveLength(plan.filter((kind) => kind !== "resolve").length)
   }))
 
+  it.effect("interrupts a seeded half of 2048 pending getAll calls, then settles all of them late", () => Effect.gen(function*() {
+    const random = seeded(0xBADC0DE)
+    const total = 2048
+    const settlers: Array<(call: number) => void> = []
+    let allStarted!: () => void
+    const started = new Promise<void>((resolve) => { allStarted = resolve })
+
+    const api: ChromeCommandsApi = {
+      getAll: () => {
+        const call = settlers.length
+
+        const pending = new Promise<Array<chrome.commands.Command>>((resolve, reject) => {
+          settlers.push(() => call % 3 === 0 ? reject(new Error(`reject-${call}`)) : resolve([{ name: `command-${call}` }]))
+        })
+
+        if (settlers.length === total) allStarted()
+
+        return pending
+      },
+      onCommand: counted().source
+    }
+
+    const getAll = make(api).getAll
+
+    const fibers = yield* Effect.forEach(Array.from({ length: total }, (_, call) => call), (call) =>
+      Effect.map(Effect.forkScoped(Effect.result(getAll)), (fiber) => ({ call, fiber })))
+
+    yield* Effect.promise(() => started)
+    const interrupted = new Set(shuffle(fibers, random).slice(0, total / 2).map(({ call }) => call))
+    yield* Fiber.interruptAll(fibers.filter(({ call }) => interrupted.has(call)).map(({ fiber }) => fiber))
+
+    // Vitest fails the run on an unhandled rejection, so late rejections must stay handled.
+    for (const call of shuffle(Array.from({ length: total }, (_, index) => index), random)) settlers[call]?.(call)
+
+    for (const { call, fiber } of fibers) {
+      const exit = yield* Fiber.await(fiber)
+
+      if (interrupted.has(call)) {
+        expect(Exit.hasInterrupts(exit)).toBe(true)
+        continue
+      }
+
+      expect(Exit.isSuccess(exit)).toBe(true)
+      const result = Exit.isSuccess(exit) ? exit.value : Result.fail(new ChromeCommandsError({ operation: "missing", cause: call }))
+
+      if (call % 3 === 0) {
+        expect(Result.isFailure(result) ? result.failure : undefined).toMatchObject({ operation: "getAll", cause: new Error(`reject-${call}`) })
+      } else {
+        expect(Result.isSuccess(result) ? result.success : undefined).toEqual([{ name: `command-${call}` }])
+      }
+    }
+  }))
+
   it.effect("removes listeners exactly once even when removal re-enters the event", () => Effect.gen(function*() {
     const event = counted()
     let reentered: ReadonlyArray<unknown> = []

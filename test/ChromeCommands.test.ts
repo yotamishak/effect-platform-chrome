@@ -1,6 +1,6 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Cause, Deferred, Effect, Exit, Fiber, Option, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Option, Schedule, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeCommands, ChromeCommandsError, layer, layerLive, make } from "../src/ChromeCommands.js"
 import type { ChromeCommandsApi, CommandEvent } from "../src/ChromeCommands.js"
@@ -95,6 +95,38 @@ describe("ChromeCommands.getAll", () => {
       expect(error.cause).toBe(cause)
       expect(yield* make(api).getAll).toEqual(commands)
     }
+  }))
+
+  it.effect("abandons a pending query when interrupted and ignores its late settlement", () => Effect.gen(function*() {
+    for (const settle of ["reject", "resolve"] as const) {
+      const { api } = mockApi()
+      let release!: () => void
+      let called!: () => void
+      const started = new Promise<void>((resolve) => { called = resolve })
+
+      api.getAll.mockImplementationOnce(() => new Promise((resolve, reject) => {
+        release = () => settle === "reject" ? reject(new Error("late")) : resolve([])
+        called()
+      }))
+
+      const fiber = yield* Effect.forkScoped(make(api).getAll)
+      yield* Effect.promise(() => started)
+      yield* Fiber.interrupt(fiber)
+      expect(Exit.hasInterrupts(yield* Fiber.await(fiber))).toBe(true)
+      // Vitest fails the run on an unhandled rejection, so the late one must stay handled.
+      release()
+      expect(yield* make(api).getAll).toEqual(commands)
+    }
+  }))
+
+  it.effect("types a Chrome without Promise support, whose getAll returns undefined, as getAll", () => Effect.gen(function*() {
+    const { api } = mockApi()
+    // SAFETY: before Chrome 96 a callback-less getAll() returned undefined instead of a Promise.
+    api.getAll.mockImplementationOnce(() => undefined as never)
+    const error = yield* Effect.flip(make(api).getAll)
+    expect(error).toBeInstanceOf(ChromeCommandsError)
+    expect(error.operation).toBe("getAll")
+    expect(error.cause).toBeInstanceOf(TypeError)
   }))
 })
 
@@ -244,6 +276,20 @@ describe("ChromeCommands.onCommand", () => {
     expect(partial.onCommand.emit("after")).toEqual([])
   }))
 
+  it.effect("re-subscribes with exactly one live listener when retried after a registration failure", () => Effect.gen(function*() {
+    const mock = mockApi()
+    mock.onCommand.failNext("addListener", new Error("first registration failed"))
+    const fiber = yield* collect(2, Stream.retry(make(mock.api).onCommand, Schedule.recurs(1)))
+    yield* Effect.promise(() => mock.onCommand.waitForListener())
+    expect(mock.onCommand.listenerCount).toBe(1)
+    mock.onCommand.emit("a")
+    mock.onCommand.emit("b", tab)
+    expect(yield* Fiber.join(fiber)).toEqual([{ command: "a", tab: Option.none() }, { command: "b", tab: Option.some(tab) }])
+    expect(mock.source.addListener).toHaveBeenCalledTimes(2)
+    expect(mock.source.removeListener).toHaveBeenCalledTimes(2)
+    expect(mock.onCommand.listenerCount).toBe(0)
+  }))
+
   it.effect("types a throwing event getter without touching any listener", () => Effect.gen(function*() {
     const mock = mockApi()
     const cause = new Error("'commands.onCommand' is not available in this context")
@@ -382,12 +428,27 @@ describe("testing/Commands", () => {
     yield* Effect.void
   }))
 
+  it.effect("reports a command declared without a shortcut or description with empty strings, as Chrome does", () => Effect.gen(function*() {
+    const fixture = makeCommands([{ name: "_execute_action" }, { name: "bare" }, { name: "described", description: "Described" }])
+    const all = yield* make(fixture.api).getAll
+    expect(all).toEqual([
+      { name: "_execute_action", description: "", shortcut: "" },
+      { name: "bare", description: "", shortcut: "" },
+      { name: "described", description: "Described", shortcut: "" }
+    ])
+    // The documented filter for commands that still need a shortcut finds the bare command.
+    expect(all.filter((command) => command.name !== "_execute_action" && command.shortcut === "").map(({ name }) => name))
+      .toEqual(["bare", "described"])
+    expect(fixture.controls.commands).toEqual(all)
+    expect(fixture.controls.press("bare")).toEqual({ dispatched: false, errors: [] })
+  }))
+
   it.effect("rejects unknown and duplicate command names and applies overrides", () => Effect.gen(function*() {
     const fixture = makeCommands(commands)
     expect(() => fixture.controls.press("missing")).toThrow("No command named missing is declared")
     expect(() => fixture.controls.setShortcut("missing", "Alt+M")).toThrow("No command named missing is declared")
     expect(() => makeCommands([{ name: "twice" }, { name: "twice" }])).toThrow("Duplicate command name: twice")
-    expect(makeCommands([{}, {}]).controls.commands).toEqual([{}, {}])
+    expect(makeCommands([{}, {}]).controls.commands).toEqual([{ description: "", shortcut: "" }, { description: "", shortcut: "" }])
     const cause = new Error("overridden")
     const overridden = makeCommands(commands, { getAll: () => Promise.reject(cause) })
     expect(yield* Effect.flip(make(overridden.api).getAll)).toMatchObject({ operation: "getAll", cause })

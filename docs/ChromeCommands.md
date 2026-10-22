@@ -46,7 +46,8 @@ dropping the oldest.
 ## Testing
 
 `effect-platform-chrome/testing/Commands` exports `makeCommands(commands, overrides)`.
-`getAll` resolves a fresh copy of the declared commands in order.
+`getAll` resolves a fresh copy of the declared commands in order; like Chrome, it reports a
+command declared without a `description` or `shortcut` with `""` for each.
 `controls.setShortcut(name, shortcut)` simulates the user editing a shortcut (an empty
 string unbinds it). `controls.press(name, tab?)` simulates the key press and returns
 `{ dispatched, errors }`: like Chrome, it fires `onCommand` only for a bound command that is
