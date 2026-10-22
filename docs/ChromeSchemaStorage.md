@@ -46,6 +46,9 @@ const program = Effect.gen(function*() {
 `TypedStorage.layer` takes no arguments: it builds on whichever `Storage.ChromeStorage`
 service is in context, so for an injected Chrome API provide `Storage.layer(api)`
 instead of `Storage.layerLive`, or call `TypedStorage.make(Storage.make(api))`.
+`TypedStorage.layerLive` is shorthand for `TypedStorage.layer` over `Storage.layerLive`:
+it reads `chrome.storage` only when built and fails with a `ChromeStorageError` whose
+operation is `"initialize"` where the namespace is missing.
 Reads, writes and observation all go through that one service. Observation registers
 its listener on the service's low-level `changeEvent` (the wrapped API's native
 `storage.onChanged`) synchronously, before the first read, because the `onChanged`
@@ -54,7 +57,8 @@ stream has no listener-ready handshake.
 ## API and stored format
 
 `entry(options)` creates a reusable descriptor, without reading or writing storage.
-Options are `namespace`, `key`, `area` (`local`, `sync`, `session`, or `managed`),
+Options are `namespace`, `key`, `area` (`local`, `sync`, `session`, or `managed`; any
+other value, possible only from untyped callers, fails every operation with `configuration`),
 non-negative safe-integer `version`, `schema`, optional `defaultValue`, and optional
 `migrations`. The physical key is `storageKey(namespace, key)`, the JSON encoding of
 the two-string tuple. This prevents namespace/separator collisions, including empty,
@@ -111,8 +115,9 @@ const migratedProgram = Effect.gen(function*() {
 
 Every intermediate migration output must be JSON-compatible. The final payload
 must decode with the current schema. Only after all these steps succeed does an
-explicit writable-area `get({ writeBack: true })` encode and write the current value.
-Write failure fails the read; it does not report success. Current-version reads do
+explicit writable-area `get({ writeBack: true })` re-read the entry and, if it still
+holds the envelope that was migrated, encode and write the current value. A failing
+re-read or write fails the read; it does not report success. Current-version reads do
 not rewrite. Missing values do not persist defaults even with write-back enabled.
 Missing migration steps, duplicate/out-of-range migration declarations, and future
 stored versions fail. Unwrapped legacy data is not implicitly version zero.
@@ -121,15 +126,19 @@ Managed storage supports migrations **in memory only**. `set`, `remove`, and any
 `get({ writeBack: true })` fail with `readOnly`, even for missing/current values.
 `observe` never persists migrations in any area.
 
-Migration write-back is a non-atomic read/transform/write. Chrome storage provides
-no compare-and-swap here: another context can write during migration and be overwritten.
-Migrations should be deterministic, repeatable, and preferably free of side effects.
-Use an application-level single writer if concurrent migration writes are unacceptable.
-The default `get()` and `observe` migrate only their captured snapshots, so a newer
-concurrent write is preserved, although the returned snapshot may already be stale.
-Opting into write-back can overwrite even a current/future-version envelope written
-while the migration is suspended. No retry or second read can provide atomicity;
-coordinate all writers externally rather than treating write-back as a transaction.
+Migration write-back is a read/transform/check/write, not a transaction. Before writing,
+it re-reads the entry and writes only if the stored envelope still has the migrated
+snapshot's version and JSON payload. A write, replacement, corruption, or removal by
+another context while the migration ran therefore wins: the read still returns the
+migrated snapshot, and nothing is written (a removed entry is not resurrected). Chrome
+storage has no compare-and-swap, so a write landing between that re-read and the
+write-back can still be overwritten; the window is two storage calls, not the whole
+migration. Concurrent write-back readers of the same snapshot each write the same
+current envelope. Migrations should be deterministic, repeatable, and preferably free
+of side effects. Use an application-level single writer if any lost write is
+unacceptable. The default `get()` and `observe` migrate only their captured snapshots
+and never write, so a newer concurrent write is preserved, although the returned
+snapshot may already be stale.
 
 ## JSON contract
 
@@ -152,8 +161,10 @@ Chrome quota calculation; storage quota failures propagate as `ChromeStorageErro
 
 ## Observation and errors
 
-Listeners register synchronously before the initial get. Relevant events received
-during registration/read invalidate that read's result, including typed failures.
+Configuration is checked before anything is registered. Listeners then register
+synchronously before the initial get. A relevant event delivered during registration
+skips the initial read entirely; one received during the read invalidates its result,
+including typed failures.
 An event arriving during async decoding/migration similarly invalidates the obsolete
 result. Processing is sequential; obsolete computations finish before the latest
 event is decoded. Defects are not suppressed. Filters match both area and physical key.
@@ -170,16 +181,25 @@ stream completion; if the API throws before removal, actual removal cannot be
 guaranteed. Cancellation interrupts owned asynchronous migrations/defaults but
 cannot undo their external side effects or a Chrome operation already submitted.
 
-The deterministic stress suite uses 20,000 queued event updates, 256 simultaneous
-subscribers (half cancelled during gated reads), and 64 concurrent migration reads
-in each write-back mode. `test/stress/ChromeSchemaStorage.stress.test.ts` adds a 4,096-change
-burst coalescing to its newest value, 512 observers interrupted during and after their
-initial reads, and 512 concurrent operations with interleaved storage rejections.
-These are bounded mocked races, not browser quota, heap, cross-process scheduling, or
-atomicity benchmarks.
+The unit suite uses 20,000 queued event updates, 256 simultaneous subscribers (half
+cancelled during gated reads), and 64 concurrent migration reads in each write-back
+mode. `test/stress/ChromeSchemaStorage.stress.test.ts` adds: a 4,096-change burst
+coalescing to exactly `[initial, newest]`; a blocked consumer receiving exactly the
+newest change of each seeded chunk, in order; 4,096 superseded failing migrations
+dropped, with only a current failure ending the stream; 512 observers interrupted in
+seeded order before starting, during the initial read, default, or migration, while
+idle, and while migrating a change, ending with every listener removed and no writes;
+2,048 observed entries through a clear-like deletion and a migrating change; 1,024
+concurrent write-back migrations of one envelope with and without a concurrent writer;
+and 1,536 concurrent `get`/`set`/`remove` calls with interleaved rejections and
+synchronous throws, each reported with its area and operation. These are bounded mocked
+races, not browser quota, heap, cross-process scheduling, or atomicity benchmarks.
 
-Errors preserve `ChromeStorageError` and `Schema.SchemaError`. Library failures use
-`ChromeSchemaStorageError` with `key`, `reason`, and `cause`; reasons are
+Errors preserve `ChromeStorageError` (with the Chrome `area` and `operation`, such as
+`"get"`, `"set"`, `"remove"`, or `"onChanged"` for listener registration) and
+`Schema.SchemaError`. Library failures use `ChromeSchemaStorageError` with `operation`
+(the entry member: `"get"`, `"set"`, `"remove"`, or `"observe"`, which covers its
+initial read and each change), `key`, `reason`, and `cause`; reasons are
 `configuration`, `envelope`, `futureVersion`, `migration`, `json`, and `readOnly`.
 Migration/default typed failures propagate unchanged. Schema encode/decode service
 requirements and migration/default requirements remain in the returned Effect/Stream
