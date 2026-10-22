@@ -7,13 +7,15 @@ a permission: `"omnibox": { "keyword": "docs" }`.
 
 - `setDefaultSuggestion({ description })` sets the first dropdown row. Chrome replaces the
   first `%s` in the description with the current input and keeps the suggestion in the
-  extension's preferences, so it outlasts the worker. An empty description or malformed
-  markup fails.
+  extension's preferences, so it outlasts the worker. Only `description` is sent, so a wider
+  object (a `SuggestResult`, say) works. An empty description or malformed markup fails.
 - `onInputStarted` and `onInputCancelled` emit `void`; `onInputEntered` emits
   `{ text, disposition }`; `onDeleteSuggestion` emits the deleted suggestion's `content`.
 - `onInputChanged` emits `{ text, suggest }`. `suggest(results)` is a lazy Effect that calls
   the `suggest` callback Chrome passed with that keystroke, so every reply goes to the
-  input it answers; each run sends a fresh copy, and an empty list clears the rows. Chrome
+  input it answers; each run sends fresh copies of the rows holding only `content`,
+  `description` and `deletable` (Chrome throws for any other property, and TypeScript accepts
+  wider objects such as search hits with a `score`), and an empty list clears the rows. Chrome
   checks the rows' types synchronously (`content` and `description` must be non-empty), and
   a throw fails with `operation: "suggest"`. It parses the markup later and reports malformed
   markup only to the console.
@@ -58,7 +60,9 @@ Each stream subscription buffers at most 64 events, dropping the oldest.
 `effect-platform-chrome/testing/Omnibox` exports `makeOmnibox()`. `controls.change(text)`
 emits `onInputChanged` and returns an array that collects (copies of) each batch listeners
 pass to `suggest`, including late replies; `controls.defaultSuggestion` holds the last
-accepted `setDefaultSuggestion` value. Like Chrome, the fixture's `suggest` throws a
-`TypeError` for an empty `content` or `description`, and `setDefaultSuggestion` rejects an
-empty description or markup that is not well-formed (unbalanced tags, a stray `<` or `&`, an
-unknown entity). Pass overrides to replace any API member.
+accepted `setDefaultSuggestion` value. Like Chrome's schema check, the fixture's `suggest` and
+`setDefaultSuggestion` throw a `TypeError` for a property the type does not declare, and
+`suggest` throws one for an empty `content` or `description`. `setDefaultSuggestion` rejects
+an empty description or markup that is not well-formed: unbalanced tags, a stray `<` or `&`,
+an unknown entity, a reference to a character XML forbids, a control character, `]]>`, or an
+unquoted or repeated attribute. Pass overrides to replace any API member.

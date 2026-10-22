@@ -29,7 +29,9 @@ export interface InputChangedEvent {
   /**
    * Answers this keystroke with suggestions for the dropdown, through the `suggest` callback
    * Chrome passed with it; a later call replaces the rows, and an empty list clears them.
-   * Lazy: nothing reaches Chrome until the Effect runs. Chrome checks the results' types
+   * Lazy: nothing reaches Chrome until the Effect runs, and then only each row's `content`,
+   * `description` and `deletable`, since Chrome rejects undeclared properties of wider objects
+   * TypeScript accepts. Chrome checks the results' types
    * synchronously, and a throw fails with `operation: "suggest"`; it parses the markup
    * afterwards and reports malformed markup only to the console.
    */
@@ -62,7 +64,8 @@ export interface ChromeOmniboxService {
    * Sets the first dropdown row, shown above any suggestions. Chrome stores it in the
    * extension's preferences, so it outlasts the service worker. Its description may use
    * `<url>`, `<match>` and `<dim>` markup, and Chrome replaces its first `%s` with the current
-   * input. An empty description or malformed markup fails.
+   * input. Only `description` is sent, so a wider object such as a `SuggestResult` works. An
+   * empty description or malformed markup fails.
    */
   readonly setDefaultSuggestion: (suggestion: DefaultSuggestResult) => Effect.Effect<void, ChromeOmniboxError>
   /** The user typed the keyword: once per keyword session, before any `onInputChanged`. */
@@ -91,22 +94,29 @@ const attempt = attempter(onError)
 const eventError = (operation: string) => (cause: unknown) => onError(operation, cause)
 
 /**
+ * A row with only the properties Chrome's schema declares. TypeScript accepts any wider object
+ * (a search hit with a `score`), but Chrome throws for a property it does not declare.
+ */
+const suggestResult = ({ content, description, deletable }: SuggestResult): SuggestResult =>
+  deletable === undefined ? { content, description } : { content, description, deletable }
+
+/**
  * The `onInputChanged` event for Chrome's native `(text, suggest)` arguments, as the stream
  * emits it. Use it in a wake listener so it answers through the same Effect-returning
  * `suggest`: `ChromeServiceWorker.listen(chrome.omnibox.onInputChanged, (text, suggest) =>
- * handle(ChromeOmnibox.inputChanged(text, suggest)))`. Each `suggest` call sends a fresh copy
- * of the results.
+ * handle(ChromeOmnibox.inputChanged(text, suggest)))`. Each `suggest` call sends fresh copies
+ * of the rows, keeping only `content`, `description` and `deletable`.
  */
 export const inputChanged = (text: string, suggest: NativeSuggest): InputChangedEvent => ({
   text,
-  suggest: (suggestResults) => attempt("suggest", () => suggest(Array.from(suggestResults)))
+  suggest: (suggestResults) => attempt("suggest", () => suggest(suggestResults.map(suggestResult)))
 })
 
 const inputEntered = (text: string, disposition: Disposition): InputEnteredEvent => ({ text, disposition })
 
 /** Creates the service without reading browser globals or registering listeners. */
 export const make = (api: ChromeOmniboxApi): ChromeOmniboxService => ChromeOmnibox.of({
-  setDefaultSuggestion: (suggestion) => invoke("setDefaultSuggestion", () => api.setDefaultSuggestion(suggestion)),
+  setDefaultSuggestion: ({ description }) => invoke("setDefaultSuggestion", () => api.setDefaultSuggestion({ description })),
   onInputStarted: observe(() => api.onInputStarted, () => undefined, eventError("onInputStarted")),
   onInputChanged: observe(() => api.onInputChanged, inputChanged, eventError("onInputChanged")),
   onInputEntered: observe(() => api.onInputEntered, inputEntered, eventError("onInputEntered")),

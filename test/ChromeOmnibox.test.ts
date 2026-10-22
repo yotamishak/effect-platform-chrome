@@ -94,7 +94,7 @@ const countRegistrations = (event: EventCase, fake: Fake) => {
 const listenerTotal = (fake: Fake) => events.reduce((total, { name }) => total + fake.controls[name].listenerCount, 0)
 
 describe("ChromeOmnibox", () => {
-  it.effect("passes the default suggestion to Chrome unchanged, only when run", () => Effect.gen(function*() {
+  it.effect("passes the default suggestion's description to Chrome, only when run", () => Effect.gen(function*() {
     const fake = makeOmnibox()
     const setDefaultSuggestion = vi.fn((suggestion: DefaultSuggestResult) => fake.api.setDefaultSuggestion(suggestion))
     const omnibox = make({ ...fake.api, setDefaultSuggestion })
@@ -103,7 +103,7 @@ describe("ChromeOmnibox", () => {
     expect(setDefaultSuggestion).not.toHaveBeenCalled()
     yield* set
     expect(setDefaultSuggestion).toHaveBeenCalledExactlyOnceWith(suggestion)
-    expect(setDefaultSuggestion.mock.calls[0]?.[0]).toBe(suggestion)
+    expect(setDefaultSuggestion.mock.calls[0]?.[0]).toStrictEqual(suggestion)
     expect(fake.controls.defaultSuggestion).toEqual(suggestion)
     yield* set
     expect(setDefaultSuggestion).toHaveBeenCalledTimes(2)
@@ -176,6 +176,42 @@ describe("ChromeOmnibox", () => {
     expect(sent[0]).not.toBe(frozen)
     expect(sent[1]).not.toBe(sent[0])
     expect(Object.isFrozen(sent[0])).toBe(false)
+  }))
+
+  it.effect("sends Chrome only the suggestion fields its schema accepts, from wider objects too", () => Effect.gen(function*() {
+    const fake = makeOmnibox()
+    const defaults: Array<DefaultSuggestResult> = []
+
+    const omnibox = make({
+      ...fake.api,
+      setDefaultSuggestion: (suggestion) => {
+        defaults.push(suggestion)
+
+        return fake.api.setDefaultSuggestion(suggestion)
+      }
+    })
+
+    // A search hit is structurally a SuggestResult, so TypeScript accepts it, but Chrome's
+    // schema rejects any property it does not declare.
+    const hit = { content: "docs effect", description: "Effect <match>docs</match>", deletable: true, score: 0.9 }
+    yield* omnibox.setDefaultSuggestion(hit)
+    expect(defaults).toStrictEqual([{ description: hit.description }])
+    expect(fake.controls.defaultSuggestion).toStrictEqual({ description: hit.description })
+    const changes = yield* Effect.forkScoped(Stream.runCollect(Stream.take(omnibox.onInputChanged, 1)))
+    yield* Effect.promise(() => fake.controls.onInputChanged.waitForListener())
+    const batches = fake.controls.change("docs")
+    const [change] = yield* Fiber.join(changes)
+
+    if (change === undefined) return expect.fail("no input change")
+    yield* change.suggest([hit, { content: "docs plain", description: "Plain", deletable: undefined }, { ...hit, deletable: false }])
+    expect(batches).toStrictEqual([[
+      { content: "docs effect", description: "Effect <match>docs</match>", deletable: true },
+      { content: "docs plain", description: "Plain" },
+      { content: "docs effect", description: "Effect <match>docs</match>", deletable: false }
+    ]])
+    const sent: Array<Array<SuggestResult>> = []
+    yield* inputChanged("wake", (suggestResults) => { sent.push(suggestResults) }).suggest([hit])
+    expect(sent).toStrictEqual([[{ content: "docs effect", description: "Effect <match>docs</match>", deletable: true }]])
   }))
 
   it.effect("still forwards suggest calls made after the stream ended", () => Effect.gen(function*() {
@@ -375,7 +411,11 @@ describe("makeOmnibox", () => {
     "<dim>nested <match>match</match></dim> and <url>https://example.com/?a=1&amp;b=2</url>",
     "a &amp; b &lt;&gt;&quot;&apos; &#38; &#x26; c > d",
     "line<br/>break and <url  >spaced</url>",
-    "plain"
+    "plain",
+    "<dim class=\"a\" data-x='b &amp; c > d'>attributes</dim>",
+    "<dim>spaced close</dim > and <url />",
+    "tab\tnewline\ncarriage\r",
+    "&#9;&#xA;&#xD;&#x20;&#xFFFD;&#x10000;&#x10FFFF;"
   ])("accepts well-formed markup: %s", (description) => Effect.gen(function*() {
     const fake = makeOmnibox()
     yield* make(fake.api).setDefaultSuggestion({ description })
@@ -392,7 +432,23 @@ describe("makeOmnibox", () => {
     { description: "&nbsp;", message: "Unescaped \"&\"" },
     { description: "a < b", message: "Malformed tag" },
     { description: "</>", message: "Malformed tag" },
-    { description: "<b/ >", message: "Malformed tag" }
+    { description: "<b/ >", message: "Malformed tag" },
+    { description: "<dim x>bare attribute</dim>", message: "Malformed tag" },
+    { description: "<dim x=y>unquoted</dim>", message: "Malformed tag" },
+    { description: "<dim a=\"1\"b=\"2\">unseparated</dim>", message: "Malformed tag" },
+    { description: "<dim a=\"<\">lt in value</dim>", message: "Malformed tag" },
+    { description: "<dim a=\"1\" a=\"2\">twice</dim>", message: "Duplicate attribute a" },
+    { description: "<dim a=\"&\">amp in value</dim>", message: "Unescaped \"&\"" },
+    { description: "<dim>x</dim y=\"1\">", message: "Malformed tag" },
+    { description: "a ]]> b", message: "\"]]>\"" },
+    { description: "bell\u0007", message: "Invalid character" },
+    { description: "noncharacter\uFFFF", message: "Invalid character" },
+    { description: "&#0;", message: "Invalid character reference" },
+    { description: "&#x1F;", message: "Invalid character reference" },
+    { description: "&#xD800;", message: "Invalid character reference" },
+    { description: "&#xFFFE;", message: "Invalid character reference" },
+    { description: "&#x110000;", message: "Invalid character reference" },
+    { description: "&#99999999999999999999;", message: "Invalid character reference" }
   ])("rejects $description without changing the default suggestion", ({ description, message }) => Effect.gen(function*() {
     const fake = makeOmnibox()
     const omnibox = make(fake.api)
@@ -437,6 +493,22 @@ describe("makeOmnibox", () => {
     expect(String(content?.cause)).toContain("suggestResults[0].content")
     expect(String(description?.cause)).toContain("suggestResults[1].description")
     expect(batches).toEqual([])
+  }))
+
+  it.effect("throws like Chrome's schema check for an undeclared property, recording nothing", () => Effect.sync(() => {
+    const fake = makeOmnibox()
+    const withContent = { description: "Docs", content: "docs" }
+    expect(() => fake.api.setDefaultSuggestion(withContent)).toThrow(TypeError)
+    expect(() => fake.api.setDefaultSuggestion(withContent)).toThrow("Unexpected property: 'content'")
+    expect(fake.controls.defaultSuggestion).toBeUndefined()
+    let answer: ((suggestResults: Array<SuggestResult>) => void) | undefined
+    fake.api.onInputChanged.addListener((_text, suggest) => { answer = suggest })
+    const batches = fake.controls.change("docs")
+    const scored = { content: "docs a", description: "A", score: 1 }
+    expect(() => answer?.([{ content: "docs b", description: "B" }, scored])).toThrow(TypeError)
+    expect(() => answer?.([scored])).toThrow("suggestResults[0]: Unexpected property: 'score'")
+    answer?.([{ content: "docs c", description: "C", deletable: undefined }])
+    expect(batches).toEqual([[{ content: "docs c", description: "C", deletable: undefined }]])
   }))
 
   it.effect("replaces members with overrides and provides its layer", () => Effect.gen(function*() {

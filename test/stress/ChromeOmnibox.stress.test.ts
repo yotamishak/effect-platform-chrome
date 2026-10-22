@@ -391,6 +391,48 @@ describe("ChromeOmnibox stress", () => {
     })
   }))
 
+  it.effect("interrupts 512 pending setDefaultSuggestion calls, then absorbs Chrome settling them late", () => Effect.gen(function*() {
+    const total = 512
+    const random = seeded(0x1a7e)
+    const settle: Array<() => void> = []
+    const pending: Array<Promise<void>> = []
+    let allInvoked!: () => void
+    const everyCall = new Promise<void>((resolve) => { allInvoked = resolve })
+
+    const omnibox = make({
+      ...makeOmnibox().api,
+      setDefaultSuggestion: (suggestion) => {
+        const call = new Promise<void>((resolve, reject) => {
+          settle.push(() => random() < 0.5 ? resolve() : reject(new Error(`late ${suggestion.description}`)))
+        })
+
+        pending.push(call)
+
+        if (pending.length === total) allInvoked()
+
+        return call
+      }
+    })
+
+    const calls = yield* Effect.forkChild(Effect.forEach(
+      range(0, total),
+      (index) => omnibox.setDefaultSuggestion({ description: `d${index}` }),
+      { concurrency: "unbounded" }
+    ))
+
+    yield* Effect.promise(() => everyCall)
+    const exit = yield* Fiber.interrupt(calls).pipe(Effect.andThen(Fiber.await(calls)))
+    expect(Exit.hasInterrupts(exit)).toBe(true)
+    expect(Exit.hasFails(exit)).toBe(false)
+    expect(Exit.hasDies(exit)).toBe(false)
+
+    for (const run of shuffle(settle, random)) run()
+    const settled = yield* Effect.promise(() => Promise.allSettled(pending))
+    expect(settled.filter(({ status }) => status === "rejected").length).toBeGreaterThan(0)
+    expect(settled.filter(({ status }) => status === "fulfilled").length).toBeGreaterThan(0)
+    expect(pending).toHaveLength(total)
+  }))
+
   it.effect("runs 2,048 concurrent suggest calls with interleaved throws, each typed as suggest", () => Effect.gen(function*() {
     const total = 2048
     const random = seeded(0x5106)
