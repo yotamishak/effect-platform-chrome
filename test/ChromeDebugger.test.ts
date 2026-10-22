@@ -254,7 +254,9 @@ describe("ChromeDebugger.session", () => {
       const session = yield* make(mock.api).session(tab, "1.3")
       expect(mock.listenersAtAttach).toEqual([2])
       expect(mock.api.attach).toHaveBeenCalledExactlyOnceWith(tab, "1.3")
-      expect(session.target).toBe(tab)
+      expect(session.target).toEqual(tab)
+      expect(session.target).not.toBe(tab)
+      expect(Object.isFrozen(session.target)).toBe(true)
       expect(yield* session.sendCommand("Network.enable")).toEqual(Option.some({ ok: true }))
       yield* session.sendCommand("Runtime.evaluate", { expression: "1" }, "child")
       yield* session.sendCommand("Runtime.enable", undefined, "child")
@@ -534,6 +536,48 @@ describe("ChromeDebugger.session", () => {
 
     expect(methods).toEqual(["b", "c"])
   }))
+
+  it.effect("lets a later consumer continue where an earlier one stopped, losing no buffered event", () => Effect.gen(function*() {
+    const mock = mockApi()
+
+    const methods = yield* Effect.scoped(Effect.gen(function*() {
+      const session = yield* make(mock.api).session(tab, "1.3")
+
+      for (const method of ["a", "b", "c", "d"]) mock.onEvent.emit(tab, method)
+
+      const first = yield* Stream.runCollect(Stream.take(session.events, 1))
+      const second = yield* Stream.runCollect(Stream.take(session.events, 2))
+      mock.onEvent.emit(tab, "e")
+      mock.onDetach.emit(tab, "target_closed")
+
+      return [first, second, yield* Stream.runCollect(session.events)].map((events) => events.map((event) => event.method))
+    }))
+
+    expect(methods).toEqual([["a"], ["b", "c"], ["d", "e"]])
+  }))
+
+  it.effect("stops sending commands once release starts, without calling Chrome", () => Effect.gen(function*() {
+    const mock = mockApi()
+    const detachCalled = gate()
+    const detachResult = gate()
+    mock.api.detach.mockImplementationOnce(async () => {
+      detachCalled.resolve()
+
+      return detachResult.promise
+    })
+    const scope = yield* Scope.make()
+    const session = yield* make(mock.api).session({ extensionId: "abc" }, "1.3").pipe(Scope.provide(scope))
+    const closing = yield* Effect.forkChild(Scope.close(scope, Exit.void))
+    yield* Effect.promise(() => detachCalled.promise)
+    expect(yield* Effect.flip(session.sendCommand("Runtime.evaluate", { expression: "1" }))).toMatchObject({
+      operation: "sendCommand", cause: new Error("Debugger is not attached to the background page with id: abc.")
+    })
+    detachResult.resolve()
+    yield* Fiber.join(closing)
+    expect(yield* Effect.flip(session.sendCommand("Page.enable", undefined, "child"))).toMatchObject({ operation: "sendCommand" })
+    expect(mock.api.sendCommand).not.toHaveBeenCalled()
+    expect(mock.listeners).toBe(0)
+  }))
 })
 
 describe("ChromeDebugger layers", () => {
@@ -755,6 +799,54 @@ describe("makeDebugger", () => {
     }))
     expect(controls.isAttached(tab)).toBe(false)
     expect(controls.onEvent.listenerCount + controls.onDetach.listenerCount).toBe(0)
+  }))
+
+  it.effect("drives sessions: an ended session's commands never reach a later attachment to its target", () => Effect.gen(function*() {
+    const { api, controls } = fixture()
+    const service = make(api)
+    const scope = yield* Scope.make()
+    const released = yield* service.session(tab, "1.3").pipe(Scope.provide(scope))
+    yield* Scope.close(scope, Exit.void)
+
+    yield* Effect.scoped(Effect.gen(function*() {
+      const canceled = yield* service.session({ targetId: "worker-1" }, "1.3")
+      controls.cancel({ targetId: "worker-1" })
+      // This extension attaches to both targets again, from another session and directly.
+      yield* service.session(tab, "1.3")
+      yield* service.attach({ targetId: "worker-1" }, "1.3")
+      expect(yield* Effect.flip(released.sendCommand("Page.navigate", { url: "https://example.org/" }))).toMatchObject({
+        operation: "sendCommand", cause: new Error("Debugger is not attached to the tab with id: 7.")
+      })
+      expect(yield* Effect.flip(canceled.sendCommand("Runtime.evaluate", { expression: "1" }, "child"))).toMatchObject({
+        operation: "sendCommand", cause: new Error("Debugger is not attached to the target with id: worker-1.")
+      })
+    }))
+
+    expect(controls.commands).toEqual([])
+  }))
+
+  it.effect("drives sessions: changing the caller's debuggee after acquisition redirects nothing", () => Effect.gen(function*() {
+    const { api, controls } = fixture()
+    controls.addTarget({ ...page, id: "target-8", tabId: 8 })
+    const service = make(api)
+    const target: Debuggee = { tabId: 7 }
+
+    const methods = yield* Effect.scoped(Effect.gen(function*() {
+      const session = yield* service.session(target, "1.3")
+      target.tabId = 8
+      yield* service.attach({ tabId: 8 }, "1.3")
+      controls.emit({ tabId: 8 }, "Other.event")
+      controls.emit(tab, "Own.event")
+      yield* session.sendCommand("Page.enable")
+      expect(session.target).toEqual(tab)
+
+      return (yield* Stream.runCollect(Stream.take(session.events, 1))).map((event) => event.method)
+    }))
+
+    expect(methods).toEqual(["Own.event"])
+    expect(controls.commands.map((command) => command.target)).toEqual([tab])
+    expect(controls.isAttached(tab)).toBe(false)
+    expect(controls.isAttached({ tabId: 8 })).toBe(true)
   }))
 
   it.effect("takes overrides and provides a layer", () => Effect.gen(function*() {

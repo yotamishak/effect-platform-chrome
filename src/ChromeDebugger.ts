@@ -72,11 +72,14 @@ export interface ChromeDebuggerApi {
 
 /** One attachment, bound to its target. */
 export interface Session {
+  /** A frozen copy of the debuggee given to `session`; changing that object later cannot redirect the session. */
   readonly target: Debuggee
   /**
    * Sends a CDP command to this target, or to its child session `sessionId` (Chrome 125+).
    * The result is raw protocol JSON; Chrome resolves `{}` for commands without one, so None
-   * means the API resolved nothing. Decode it with a schema.
+   * means the API resolved nothing. Decode it with a schema. Once the session is releasing
+   * or Chrome has detached the target, it fails without calling Chrome, with Chrome's
+   * "Debugger is not attached …" message, so it never reaches a later attachment.
    */
   readonly sendCommand: (
     method: string,
@@ -87,7 +90,8 @@ export interface Session {
    * This target's protocol events, child sessions included, from the moment `attach`
    * resolves: the listener is installed before attaching, so no event caused by a command
    * is lost. Single-consumer; buffers `capacity` events (default 64), dropping the oldest.
-   * Ends when Chrome detaches the target. Closing the session's scope discards the buffer
+   * A consumer takes only the events it reads, so a later consumer continues where an
+   * earlier one stopped. Ends when Chrome detaches the target. Closing the session's scope discards the buffer
    * and interrupts readers, unless Chrome had already ended the stream.
    */
   readonly events: Stream.Stream<SessionEvent>
@@ -168,6 +172,13 @@ const isTarget = (target: Debuggee, source: Debuggee): boolean =>
  * "Debugger is not attached to the tab with id: 7." or "No background page with given id x."
  * messages; that is expected during release.
  */
+/** Chrome's error for a command sent to a target this extension is not attached to. */
+const notAttached = (target: Debuggee): Error => new Error(target.tabId !== undefined
+  ? `Debugger is not attached to the tab with id: ${target.tabId}.`
+  : target.extensionId !== undefined
+  ? `Debugger is not attached to the background page with id: ${target.extensionId}.`
+  : `Debugger is not attached to the target with id: ${target.targetId ?? ""}.`)
+
 const isNotAttached = (error: ChromeDebuggerError): boolean =>
   error.cause instanceof Error && /not attached|no (?:tab|background page|target) with given id/i.test(error.cause.message)
 
@@ -194,7 +205,9 @@ export const make = (api: ChromeDebuggerApi): ChromeDebuggerService => {
 
   const detach = (target: Debuggee) => invoke("detach", () => api.detach(target))
 
-  const session = (target: Debuggee, requiredVersion: string, options?: SessionOptions) => Effect.gen(function*() {
+  const session = (debuggee: Debuggee, requiredVersion: string, options?: SessionOptions) => Effect.gen(function*() {
+    // Bound at acquisition: changing the caller's object must not redirect routing or release.
+    const target: Debuggee = Object.freeze({ ...debuggee })
     const capacity = options?.capacity ?? bufferSize
 
     if (!Number.isSafeInteger(capacity) || capacity < 1) {
@@ -208,8 +221,10 @@ export const make = (api: ChromeDebuggerApi): ChromeDebuggerService => {
     const detached = yield* Deferred.make<DetachReason>()
     // Chrome allows one attachment per target and extension, so until `attach` resolves, any
     // event for the target belongs to an earlier attachment (for example one another context
-    // of this extension is ending) and must not reach, or end, this session.
-    let state: "attaching" | "attached" | "ended" = "attaching"
+    // of this extension is ending) and must not reach, or end, this session. While releasing,
+    // Chrome may still deliver events or end the attachment, but no new command is sent.
+    let state: "attaching" | "attached" | "releasing" | "ended" = "attaching"
+    const live = () => state === "attached" || state === "releasing"
 
     // Registered first, so it runs last: after detaching and removing the listeners.
     yield* Effect.acquireRelease(Effect.void, () => Effect.sync(() => {
@@ -218,13 +233,13 @@ export const make = (api: ChromeDebuggerApi): ChromeDebuggerService => {
     }))
 
     const onEvent: EventListener = (source, method, params) => {
-      if (state === "attached" && isTarget(target, source)) {
+      if (live() && isTarget(target, source)) {
         Queue.offerUnsafe(queue, { method, params: Option.fromNullishOr(params), sessionId: Option.fromNullishOr(source.sessionId) })
       }
     }
 
     const onDetach: DetachListener = (source, reason) => {
-      if (state !== "attached" || !isTarget(target, source)) return
+      if (!live() || !isTarget(target, source)) return
       state = "ended"
       Deferred.doneUnsafe(detached, Effect.succeed(reason))
       Queue.endUnsafe(queue)
@@ -235,16 +250,21 @@ export const make = (api: ChromeDebuggerApi): ChromeDebuggerService => {
     yield* Effect.acquireRelease(
       // Marked in the resolution callback itself, before Chrome can dispatch a later event.
       invoke("attach", () => api.attach(target, requiredVersion).then(() => { state = "attached" })),
-      () => Deferred.isDoneUnsafe(detached)
-        ? Effect.void
-        : detach(target).pipe(Effect.catchIf(isNotAttached, () => Effect.void), Effect.ignore({ log: "Warn" }))
+      () => Effect.suspend(() => {
+        if (state === "ended") return Effect.void
+        state = "releasing"
+
+        return detach(target).pipe(Effect.catchIf(isNotAttached, () => Effect.void), Effect.ignore({ log: "Warn" }))
+      })
     )
 
     return {
       target,
-      sendCommand: (method, params, sessionId) =>
-        sendCommand(sessionId === undefined ? target : { ...target, sessionId }, method, params),
-      events: Stream.fromQueue(queue),
+      sendCommand: (method, params, sessionId) => Effect.suspend(() => state === "attached"
+        ? sendCommand(sessionId === undefined ? target : { ...target, sessionId }, method, params)
+        : Effect.fail(new ChromeDebuggerError({ operation: "sendCommand", cause: notAttached(target) }))),
+      // One event per pull, so a consumer that stops early leaves the rest for the next one.
+      events: Stream.fromEffectRepeat(Queue.take(queue)),
       detached: Deferred.await(detached)
     } satisfies Session
   })

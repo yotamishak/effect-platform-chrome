@@ -692,4 +692,64 @@ describe("ChromeDebugger stress", () => {
     expect(controls.pendingCommands).toBe(0)
     expect(controls.onEvent.listenerCount + controls.onDetach.listenerCount).toBe(0)
   }))
+
+  it.effect("hands 4,096 session events across seeded runs of sequential consumers without losing one", () => Effect.gen(function*() {
+    const random = seeded(4096)
+    const mock = baseApi()
+    const taken: Array<string> = []
+
+    yield* Effect.scoped(Effect.gen(function*() {
+      const session = yield* make(mock.api).session({ tabId: 1 }, "1.3", { capacity: burst })
+      let emitted = 0
+
+      while (emitted < burst) {
+        const batch = Math.min(burst - emitted, Math.floor(random() * 24))
+
+        for (let index = 0; index < batch; index++) mock.onEvent.controls.emit({ tabId: 1 }, `Event.${emitted + index}`)
+
+        emitted += batch
+        const available = emitted - taken.length
+
+        // Each consumer stops after a seeded share of what is buffered; the next one continues.
+        if (available > 0) taken.push(...methods(yield* Stream.runCollect(Stream.take(session.events, 1 + Math.floor(random() * available)))))
+      }
+
+      mock.onDetach.controls.emit({ tabId: 1 }, "target_closed")
+      taken.push(...methods(yield* Stream.runCollect(session.events)))
+    }))
+
+    expect(taken).toEqual(range(burst).map((index) => `Event.${index}`))
+    expect(mock.listeners()).toBe(0)
+  }))
+
+  it.effect("sends 256 commands before a release and refuses 256 after it starts, none reaching Chrome late", () => Effect.gen(function*() {
+    const { api, controls } = makeDebugger()
+    controls.addTarget({ type: "page", id: "target-1", tabId: 1, attached: false, title: "One", url: "https://example.com/" })
+    const invoked = gate()
+    let calls = 0
+
+    controls.respond("Debugger.pause", () => {
+      calls++
+
+      if (calls === 256) invoked.resolve()
+
+      return new Promise<object>(() => {})
+    })
+
+    const scope = yield* Scope.make()
+    const session = yield* make(api).session({ tabId: 1 }, "1.3").pipe(Scope.provide(scope))
+    const command = (index: number) => Effect.flip(session.sendCommand("Debugger.pause", { index }, index % 2 === 0 ? undefined : `child-${index}`))
+    const before = yield* Effect.forkChild(Effect.forEach(range(256), command, { concurrency: "unbounded" }))
+    yield* Effect.promise(() => invoked.promise)
+    yield* Scope.close(scope, Exit.void)
+    const after = yield* Effect.forEach(range(256), (index) => command(256 + index), { concurrency: "unbounded" })
+
+    for (const error of yield* Fiber.join(before)) expect(error).toMatchObject({ operation: "sendCommand", cause: new Error("Detached while handling command.") })
+
+    for (const error of after) expect(error).toMatchObject({ operation: "sendCommand", cause: new Error("Debugger is not attached to the tab with id: 1.") })
+
+    expect(controls.commands.map((sent) => sent.params?.["index"])).toEqual(range(256))
+    expect(controls.isAttached({ tabId: 1 })).toBe(false)
+    expect(controls.onEvent.listenerCount + controls.onDetach.listenerCount).toBe(0)
+  }))
 })

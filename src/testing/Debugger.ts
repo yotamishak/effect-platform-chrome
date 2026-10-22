@@ -119,15 +119,20 @@ export const makeDebugger = (overrides: Partial<ChromeDebugger.ChromeDebuggerApi
   const onEvent = TestEvent.makeEvent<[source: CommandTarget, method: string, params?: object]>()
   const onDetach = TestEvent.makeEvent<[source: Debuggee, reason: ChromeDebugger.DetachReason]>()
 
-  const find = (debuggee: Debuggee): Target | undefined => {
-    if (debuggee.tabId !== undefined) {
-      return Array.from(targets.values()).find(({ info }) => info.type === "page" && info.tabId === debuggee.tabId)
+  /** The first target, in insertion order, that `matches`; iterated without copying the map. */
+  const first = (matches: (info: ChromeDebugger.TargetInfo) => boolean): Target | undefined => {
+    for (const target of targets.values()) {
+      if (matches(target.info)) return target
     }
 
+    return undefined
+  }
+
+  const find = (debuggee: Debuggee): Target | undefined => {
+    if (debuggee.tabId !== undefined) return first((info) => info.type === "page" && info.tabId === debuggee.tabId)
+
     if (debuggee.extensionId !== undefined) {
-      return Array.from(targets.values()).find(({ info }) =>
-        info.type === "background_page" && info.extensionId === debuggee.extensionId
-      )
+      return first((info) => info.type === "background_page" && info.extensionId === debuggee.extensionId)
     }
 
     return debuggee.targetId === undefined ? undefined : targets.get(debuggee.targetId)
