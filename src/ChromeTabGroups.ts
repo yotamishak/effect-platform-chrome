@@ -7,11 +7,23 @@ export class ChromeTabGroupsError extends Schema.TaggedError<ChromeTabGroupsErro
   cause: Schema.Defect()
 }) {}
 
-export type TabGroup = chrome.tabGroups.TabGroup
+/** The `groupId` of a tab that belongs to no group (`chrome.tabGroups.TAB_GROUP_ID_NONE`). */
+export const TAB_GROUP_ID_NONE: -1 = -1
+
+export type Color = `${chrome.tabGroups.Color}`
+
+/**
+ * A tab group as Chrome reports it. `shared` is reported from Chrome 137 and absent before.
+ * Chrome reports an untitled group with an empty `title`.
+ */
+export interface TabGroup extends Omit<chrome.tabGroups.TabGroup, "shared"> {
+  /** Whether the group is shared; absent before Chrome 137. */
+  shared?: boolean
+}
 
 type GroupEvent = EventSource<[group: TabGroup]>
 
-/** The Promise-based MV3 subset this module needs. */
+/** The Promise-based MV3 subset this module needs (Chrome 90+). */
 export interface ChromeTabGroupsApi {
   get(groupId: number): Promise<TabGroup>
   query(queryInfo: chrome.tabGroups.QueryInfo): Promise<Array<TabGroup>>
@@ -25,19 +37,34 @@ export interface ChromeTabGroupsApi {
 
 /**
  * Tab groups are created and filled through ChromeTabs.group and emptied through
- * ChromeTabs.ungroup; a group without tabs is deleted.
+ * ChromeTabs.ungroup; a group without tabs is deleted. Group ids are unique within a browser
+ * session. Chrome validates every argument: a negative `groupId`, an `index` below -1 or a
+ * `windowId` below -2 fails before anything changes.
  */
 export interface ChromeTabGroupsService {
+  /** The group with this id; fails with `No group with id: <id>.` when there is none. */
   readonly get: (groupId: number) => Effect.Effect<TabGroup, ChromeTabGroupsError>
+  /**
+   * Groups in every window the extension can see (incognito ones only when allowed), the most
+   * recently active window first and each window's groups in tab-strip order, keeping those
+   * that match every given field; `{}` matches all. `title` is a pattern where `*` matches any
+   * run of characters, `?` matches zero or one character and `\` makes the next character
+   * literal. `windowId` may be -2 (`WINDOW_ID_CURRENT`); `shared` needs Chrome 137+.
+   */
   readonly query: (queryInfo: chrome.tabGroups.QueryInfo) => Effect.Effect<Array<TabGroup>, ChromeTabGroupsError>
-  /** Changes a group's title, color or collapsed state; None when Chrome reports no group. */
+  /**
+   * Changes a group's title, color or collapsed state; properties left out keep their values.
+   * Chrome declares the resulting group optional, so a missing one is None.
+   */
   readonly update: (
     groupId: number,
     updateProperties: chrome.tabGroups.UpdateProperties
   ) => Effect.Effect<Option.Option<TabGroup>, ChromeTabGroupsError>
   /**
-   * Moves a group and its tabs to `index` (-1 for the end), optionally into another normal
-   * window; None when Chrome reports no group.
+   * Moves a group and its tabs to tab index `index` (-1 or past the end for the end), within
+   * its window or into another normal window (`windowId`, -2 for the current one). Fails when
+   * the index is inside another group or among pinned tabs. Chrome declares the resulting
+   * group optional, so a missing one is None.
    */
   readonly move: (
     groupId: number,
@@ -46,10 +73,12 @@ export interface ChromeTabGroupsService {
   /**
    * Observational subscriptions that cannot wake an MV3 service worker; register wake
    * listeners through ChromeServiceWorker. Each buffers at most 64 events, dropping the oldest.
+   * A group moved into another window is reported as created there.
    */
   readonly onCreated: Stream.Stream<TabGroup, ChromeTabGroupsError>
+  /** Groups whose title, color or collapsed state was set. */
   readonly onUpdated: Stream.Stream<TabGroup, ChromeTabGroupsError>
-  /** Groups closed directly by the user or emptied of tabs. */
+  /** Groups closed directly by the user, emptied of tabs, or moved out to another window. */
   readonly onRemoved: Stream.Stream<TabGroup, ChromeTabGroupsError>
   /** Groups moved within a window; moves between windows are reported as removal and creation. */
   readonly onMoved: Stream.Stream<TabGroup, ChromeTabGroupsError>
