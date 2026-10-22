@@ -321,6 +321,34 @@ describe("testing/I18n", () => {
     expect(yield* fixtureMessage(i18n, "@@bidi_dir")).toBe("rtl")
   }))
 
+  it.effect("folds only ASCII case in names, as base::ToLowerASCII does", () => Effect.gen(function*() {
+    const fixture = makeI18n({ messages: { key: { message: "value" } } })
+    const i18n = make(fixture.api)
+    expect(yield* fixtureMessage(i18n, "KEY")).toBe("value")
+    // JavaScript lowercases the Kelvin sign U+212A to "k"; Chrome leaves it, so no message matches.
+    expect(yield* fixtureMessage(i18n, "Key")).toBe("<none>")
+    expect(fixture.controls.message("Key")).toBeUndefined()
+    expect(fixture.controls.message("KEY")).toBe("value")
+  }))
+
+  it.effect("resolves names differing only in case within one catalog as Chrome's sorted dictionary does", () => Effect.gen(function*() {
+    // Chrome iterates a catalog in byte order and the later spelling overwrites, whatever the file's order.
+    const upperFirst = make(makeI18n({ messages: { Hello: { message: "upper" }, hello: { message: "lower" } } }).api)
+    const lowerFirst = make(makeI18n({ messages: { hello: { message: "lower" }, Hello: { message: "upper" } } }).api)
+    expect(yield* fixtureMessage(upperFirst, "HELLO")).toBe("lower")
+    expect(yield* fixtureMessage(lowerFirst, "HELLO")).toBe("lower")
+
+    // Across catalogs the more specific one still wins, even over a later-sorting spelling.
+    const layered = make(makeI18n({ messages: [{ Hello: { message: "en_GB" } }, { hello: { message: "default" } }] }).api)
+    expect(yield* fixtureMessage(layered, "hello")).toBe("en_GB")
+
+    const placeholders = make(makeI18n({
+      messages: { who: { message: "$who$", placeholders: { who: { content: "lower" }, WHO: { content: "upper" } } } }
+    }).api)
+
+    expect(yield* fixtureMessage(placeholders, "who")).toBe("lower")
+  }))
+
   it("rejects catalogs Chrome would refuse to load", () => {
     expect(() => makeI18n({ messages: { "bad-name": { message: "x" } } })).toThrow("Name of a key \"bad-name\" is invalid")
     expect(() => makeI18n({ messages: { "": { message: "x" } } })).toThrow("is invalid")

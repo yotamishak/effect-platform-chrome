@@ -19,8 +19,11 @@ Every call is lazy and asks Chrome again on each run. A throw or rejection becom
 These rules come from Chromium's `MessageBundle`, `I18nHooksDelegate` and
 `base::ReplaceStringPlaceholders`, and the `testing/I18n` fixture reproduces them.
 
-- Names are case-insensitive. The UI locale's catalog is searched first, then its parent
-  locale's and the `default_locale` one.
+- Names are case-insensitive for ASCII letters only (`base::ToLowerASCII`), so a lookalike
+  such as the Kelvin sign in `\u212Aey` matches no `key`. The UI locale's catalog is searched
+  first, then its parent locale's and the `default_locale` one. Within one catalog, names
+  that differ only in case resolve to the spelling that sorts last by bytes (`hello` over
+  `Hello`), whatever their order in the file; placeholder names likewise.
 - `@@extension_id` always resolves. A localized extension (one with `default_locale`) also
   gets `@@ui_locale` (`en_US`), `@@bidi_dir`, `@@bidi_reversed_dir`, `@@bidi_start_edge`
   and `@@bidi_end_edge`.

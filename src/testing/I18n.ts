@@ -58,6 +58,19 @@ const isRightToLeft = (locale: string): boolean => {
 const isValidName = (name: string) => /^[A-Za-z0-9_@]+$/.test(name)
 
 /**
+ * `base::ToLowerASCII`: only A-Z fold, so a name such as `\u212Aey` (a Kelvin sign, which
+ * `toLowerCase` turns into `k`) matches no message, as in Chrome.
+ */
+const toLowerAscii = (name: string) => name.replace(/[A-Z]+/g, (letters) => letters.toLowerCase())
+
+/**
+ * A parsed JSON object's entries in `base::Value::Dict` order, which is sorted by key bytes
+ * whatever the file's order. Keys that fold to the same name resolve to the last spelling.
+ */
+const chromeEntries = <A>(record: Readonly<Record<string, A>>): Array<[string, A]> =>
+  Object.entries(record).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+
+/**
  * Chrome's load-time `$name$` resolution (`MessageBundle::ReplaceVariables`): a delimited
  * valid name must be a defined placeholder, contents are inserted verbatim and not rescanned,
  * and a `$` pair around anything else is left alone.
@@ -65,10 +78,10 @@ const isValidName = (name: string) => /^[A-Za-z0-9_@]+$/.test(name)
 const resolvePlaceholders = (key: string, entry: MessageEntry): string => {
   const placeholders = new Map<string, string>()
 
-  for (const [name, placeholder] of Object.entries(entry.placeholders ?? {})) {
+  for (const [name, placeholder] of chromeEntries(entry.placeholders ?? {})) {
     if (!isValidName(name)) throw new Error(`Name of a key "${name}" is invalid. Only ASCII [a-z], [A-Z], [0-9] and "_" are allowed.`)
 
-    placeholders.set(name.toLowerCase(), placeholder.content)
+    placeholders.set(toLowerAscii(name), placeholder.content)
   }
 
   let message = entry.message
@@ -88,7 +101,7 @@ const resolvePlaceholders = (key: string, entry: MessageEntry): string => {
 
     if (!isValidName(name)) continue
 
-    const content = placeholders.get(name.toLowerCase())
+    const content = placeholders.get(toLowerAscii(name))
 
     if (content === undefined) throw new Error(`Variable $${name}$ used but not defined (message "${key}").`)
 
@@ -146,20 +159,22 @@ export const replacePlaceholders = (message: string, substitutions: ReadonlyArra
   return fromUtf8.decode(Uint8Array.from(formatted))
 }
 
+/**
+ * `MessageBundle::Init`: catalogs from `default_locale` up to the most specific one, each
+ * in sorted key order, every entry overwriting the name it folds to.
+ */
 const loadCatalogs = (catalogs: ReadonlyArray<MessageCatalog>): Map<string, string> => {
   const dictionary = new Map<string, string>()
 
-  for (const catalog of catalogs) {
-    for (const [key, entry] of Object.entries(catalog)) {
-      if (!isValidName(key)) throw new Error(`Name of a key "${key.toLowerCase()}" is invalid. Only ASCII [a-z], [A-Z], [0-9] and "_" are allowed.`)
+  for (const catalog of Array.from(catalogs).reverse()) {
+    for (const [key, entry] of chromeEntries(catalog)) {
+      if (!isValidName(key)) throw new Error(`Name of a key "${key}" is invalid. Only ASCII [a-z], [A-Z], [0-9] and "_" are allowed.`)
 
-      const name = key.toLowerCase()
+      const name = toLowerAscii(key)
 
       if (reservedLocaleNames.includes(name)) throw new Error(`Reserved key "${name}" found.`)
 
-      const message = resolvePlaceholders(key, entry)
-
-      if (!dictionary.has(name)) dictionary.set(name, message)
+      dictionary.set(name, resolvePlaceholders(key, entry))
     }
   }
 
@@ -170,7 +185,8 @@ const loadCatalogs = (catalogs: ReadonlyArray<MessageCatalog>): Map<string, stri
  * An in-memory `chrome.i18n` with Chrome's message semantics, taken from its source:
  * catalogs are validated as Chrome validates them when loading an extension (the factory
  * throws for an invalid name, an undefined `$placeholder$` or a reserved `@@` name);
- * names are case-insensitive; an unknown name answers `""`; `@@extension_id` always
+ * names fold ASCII case only, and spellings colliding within a catalog resolve in Chrome's
+ * sorted key order; an unknown name answers `""`; `@@extension_id` always
  * resolves and a localized extension also gets `@@ui_locale` and the `@@bidi_*` names from
  * the UI language. `getMessage` answers `undefined` for more than 9 substitutions, applies
  * `escapeLt` to the message before substitution, and substitutes like Chrome
@@ -214,7 +230,7 @@ export const makeI18n = (options: I18nOptions = {}) => {
   const api: ChromeI18n.ChromeI18nApi = {
     getMessage: (messageName, substitutions, getMessageOptions) => {
       check("getMessage")
-      const name = messageName.toLowerCase()
+      const name = toLowerAscii(messageName)
       const message = reserved(name) ?? dictionary.get(name) ?? ""
       let values: Array<string> = []
 
@@ -266,7 +282,7 @@ export const makeI18n = (options: I18nOptions = {}) => {
       setUILanguage: (language: string) => { uiLanguage = language },
       setAcceptLanguages: (languages: ReadonlyArray<string>) => { acceptLanguages = Array.from(languages) },
       /** The resolved message for a name, as Chrome stores it after loading the catalogs. */
-      message: (name: string): string | undefined => dictionary.get(name.toLowerCase()),
+      message: (name: string): string | undefined => dictionary.get(toLowerAscii(name)),
       /** Fails the next call of `operation` with `cause`: a throw, or a rejection for the Promise calls. */
       failNext: (operation: I18nOperation, cause: unknown) => {
         const queue = failures.get(operation) ?? []

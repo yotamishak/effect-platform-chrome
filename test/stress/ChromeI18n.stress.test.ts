@@ -354,6 +354,77 @@ describe("ChromeI18n stress", () => {
     })
   }))
 
+  it.effect("resolves 1,536 case-colliding names across three catalogs and 4,096 lookups like Chrome's MessageBundle", () => Effect.gen(function*() {
+    const random = seeded(0xCA5E)
+    const alphabet = ["k", "K", "a", "A", "_", "1"]
+
+    // An independent ASCII fold over character codes, rather than the fixture's regular expression.
+    const fold = (name: string) => String.fromCharCode(...Array.from(name, (character) => {
+      const code = character.charCodeAt(0)
+
+      return code >= 65 && code <= 90 ? code + 32 : code
+    }))
+
+    const spelling = () => Array.from({ length: 1 + random(5) }, () => alphabet[random(alphabet.length)] ?? "").join("")
+
+    const catalogs: Array<MessageCatalog> = [0, 1, 2].map((layer) =>
+      Object.fromEntries(Array.from({ length: 512 }, () => {
+        const key = spelling()
+
+        return [key, { message: `${layer}:${key}` }]
+      })))
+
+    // Chrome: the most specific catalog holding the folded name wins, and within it the
+    // spelling greatest in byte order.
+    const greatest = catalogs.map((catalog) => {
+      const spellings = new Map<string, string>()
+
+      for (const key of Object.keys(catalog)) {
+        const current = spellings.get(fold(key))
+
+        if (current === undefined || key > current) spellings.set(fold(key), key)
+      }
+
+      return spellings
+    })
+
+    const expected = (name: string): string | undefined => {
+      for (const [layer, catalog] of catalogs.entries()) {
+        const key = greatest[layer]?.get(fold(name))
+
+        if (key !== undefined) return catalog[key]?.message
+      }
+
+      return undefined
+    }
+
+    const i18n = make(makeI18n({ messages: catalogs }).api)
+
+    const lookups = Array.from({ length: 4096 }, () => {
+      const name = spelling()
+
+      // A quarter of the lookups swap "k" for the Kelvin sign, which only Unicode folding matches.
+      return random(4) === 0 ? name.replaceAll("k", "\u212A") : name
+    })
+
+    const results = yield* Effect.forEach(lookups, (name) => i18n.getMessage(name), { concurrency: "unbounded" })
+    let kelvin = 0
+
+    results.forEach((result, index) => {
+      const name = lookups[index] ?? ""
+
+      if (name.includes("\u212A")) {
+        kelvin++
+        expect(result).toEqual(Option.none())
+      } else {
+        expect(Option.getOrUndefined(result)).toBe(expected(name))
+      }
+    })
+
+    expect(kelvin).toBeGreaterThan(0)
+    expect(results.filter(Option.isSome).length).toBeGreaterThan(2048)
+  }))
+
   it.effect("builds 512 live layers concurrently from the global, and fails all of them without it", () => Effect.gen(function*() {
     const fixture = makeI18n({ uiLanguage: "he-IL" })
     const getUILanguage = vi.spyOn(fixture.api, "getUILanguage")

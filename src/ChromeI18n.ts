@@ -34,7 +34,7 @@ export interface ChromeI18nApi {
 export interface ChromeI18nService {
   /**
    * The localized string for a `_locales/<locale>/messages.json` key, looked up
-   * case-insensitively in the UI locale's catalog and then the `default_locale` one. The
+   * ASCII-case-insensitively in the UI locale's catalog and then the `default_locale` one. The
    * reserved names `@@extension_id`, `@@ui_locale` and `@@bidi_*` resolve as well.
    *
    * Chrome answers an unknown key with `""`, which becomes `Option.none()`, so a message
