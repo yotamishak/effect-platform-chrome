@@ -30,9 +30,13 @@ namespace is missing, which is what Chrome does without the permission.
 
 ## State changes
 
-Chrome samples the state about once a second while a listener exists and fires
-`onStateChanged` only when the state differs from the last one it saw: there is no initial
-event, so read the current state with `queryState`. A locked screen wins over idleness, so
+Chrome samples the state at the detection interval about once a second while the
+extension has any idle listener, and fires `onStateChanged` only when a sample differs
+from the last one it took. That last sample starts as `"active"` and is not updated while
+the extension has no listener, so the first event after subscribing can report the state
+the machine was already in (subscribing on a locked screen yields `"locked"` about a
+second later) or a change made while nobody listened. There is no guaranteed initial
+event: read the current state with `queryState`. A locked screen wins over idleness, so
 `"locked"` can follow `"active"` directly.
 
 Each consumption of `onStateChanged` installs its own listener and removes it when the
@@ -70,10 +74,14 @@ input) and a lock. Options set the starting `idleTime`, `locked`, `detectionInte
 - `controls.elapse(seconds)`, `input()`, `lock()` and `unlock()` (which counts as input)
   change the machine; input alone does not unlock. Time never passes on its own and
   nothing locks automatically.
-- After every change, including `setDetectionInterval`, the state at the detection
-  interval is evaluated at once and `onStateChanged` fires if it differs from the last one;
-  `controls.state` reads it. Changes made from inside a listener are queued behind the
-  current emission, so every listener sees the states in order.
+- Sampling follows Chrome: the last sampled state starts as `"active"` and is sampled at
+  the detection interval only while `onStateChanged` has a listener. Each change made
+  while one exists, including `setDetectionInterval`, samples at once, and
+  `controls.poll()` runs Chrome's next one-second tick. Adding a listener never samples by
+  itself, so a subscription made on a locked screen sees `"locked"` at the next `poll()`
+  or change. `onStateChanged` fires when a sample differs from the last one;
+  `controls.state` reads the last sample. Changes made from inside a listener are queued
+  behind the current emission, so every listener sees the states in order.
 - Controls return the exceptions listeners threw. `controls.failNext(operation, cause)`
   fails the next call once: `setDetectionInterval` throws, the others reject.
 
@@ -91,6 +99,15 @@ it.effect("reports the user going idle", () => Effect.gen(function*() {
   fixture.controls.elapse(60)
   expect(yield* Fiber.join(next)).toMatchObject({ value: "idle" })
 }))
+
+it.effect("opens with the state the machine is already in", () => Effect.gen(function*() {
+  const fixture = makeIdle({ locked: true })
+  const idle = ChromeIdle.make(fixture.api)
+  const next = yield* Effect.forkChild(Stream.runHead(idle.onStateChanged))
+  yield* Effect.promise(() => fixture.controls.onStateChanged.waitForListener())
+  fixture.controls.poll()
+  expect(yield* Fiber.join(next)).toMatchObject({ value: "locked" })
+}))
 ```
 
 ## Stress coverage
@@ -104,5 +121,7 @@ registration), ending with zero listeners; 16 rounds of 32 subscriptions with 4,
 each; 1,536 concurrent calls settled in a seeded random order with interleaved rejections
 and throws, each typed with its operation and cause; 1,024 pending calls interrupted and
 settled later; 1,024 racing `setDetectionInterval` calls; a 20,000-step seeded walk of the
-fixture against a reference model; 512 isolated fixtures; and 512 concurrent live-layer
+fixture against a reference model; a 20,000-step seeded walk with listener gaps, checking
+that sampling stops without listeners and resumes against the stale sample; 512 isolated
+fixtures; and 512 concurrent live-layer
 builds and refusals. All schedules are seeded and gated, with no sleeps.

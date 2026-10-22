@@ -54,14 +54,21 @@ const validSeconds =(name: string, seconds: number): number => {
  * input) and whether the screen is locked; `queryState(n)` reports `"locked"` when locked,
  * else `"idle"` once the idle time reaches `n`, else `"active"`, as Chrome does. Both
  * intervals are validated like Chrome's bindings (a synchronous `TypeError` for anything
- * but an integer of at least 15) and capped at four hours. `onStateChanged` fires, at the
- * extension's detection interval, only when the state differs from the last one
- * evaluated; Chrome's one-second polling collapses into an immediate evaluation after
- * every change, including `setDetectionInterval`. Emissions triggered from inside a
- * listener are queued behind the current one, so every listener sees states in order.
- * Controls return the exceptions listeners threw. Time never passes on its own:
- * `controls.elapse` moves it, and nothing locks automatically. Each operation can be
- * failed once with `controls.failNext` (`setDetectionInterval` throws, the others reject).
+ * but an integer of at least 15) and capped at four hours.
+ *
+ * `onStateChanged` follows Chrome's sampling: Chrome keeps the extension's last sampled
+ * state, starting at `"active"`, samples it at the detection interval about once a second
+ * only while the extension has a listener, and fires when a sample differs from it. A
+ * subscription made while the machine is already idle or locked therefore opens with that
+ * state, and changes made while no listener exists surface at the next sample. Here a
+ * sample runs after every change made while a listener exists, including
+ * `setDetectionInterval`, and on `controls.poll()`, Chrome's next tick; adding a listener
+ * never samples by itself, as Chrome never calls a listener while it is being added.
+ * Emissions triggered from inside a listener are queued behind the current one, so every
+ * listener sees states in order. Controls return the exceptions listeners threw. Time
+ * never passes on its own: `controls.elapse` moves it, and nothing locks automatically.
+ * Each operation can be failed once with `controls.failNext` (`setDetectionInterval`
+ * throws, the others reject).
  */
 export const makeIdle = (options: IdleOptions = {}) => {
   const stateChanged = TestEvent.makeEvent<[ChromeIdle.IdleState]>()
@@ -82,10 +89,16 @@ export const makeIdle = (options: IdleOptions = {}) => {
   const stateAt = (threshold: number): ChromeIdle.IdleState =>
     locked ? "locked" : idleTime >= threshold ? "idle" : "active"
 
-  let reported = stateAt(detectionInterval)
+  // Chrome's per-extension record of the last sampled state starts "active".
+  let reported: ChromeIdle.IdleState = "active"
 
-  /** Re-evaluates at the detection interval and dispatches a change, in order, without nesting. */
+  /**
+   * Samples at the detection interval while a listener exists, as Chrome's polling does,
+   * and dispatches a change, in order, without nesting.
+   */
   const evaluate = (): ReadonlyArray<unknown> => {
+    if (stateChanged.controls.listenerCount === 0) return []
+
     const next = stateAt(detectionInterval)
 
     if (next === reported) return []
@@ -146,7 +159,10 @@ export const makeIdle = (options: IdleOptions = {}) => {
     api,
     layer: ChromeIdle.layer(api),
     controls: {
-      /** The state last evaluated at the detection interval, which `onStateChanged` last reported. */
+      /**
+       * The state Chrome last sampled at the detection interval, which `onStateChanged` last
+       * reported: `"active"` until the first sample, and stale while no listener exists.
+       */
       get state(): ChromeIdle.IdleState { return reported },
       /** The extension's current detection interval, after Chrome's cap. */
       get detectionInterval(): number { return detectionInterval },
@@ -160,6 +176,8 @@ export const makeIdle = (options: IdleOptions = {}) => {
 
         return evaluate()
       },
+      /** Chrome's next once-a-second sample, firing a change if a listener exists; nothing else changes. */
+      poll: (): ReadonlyArray<unknown> => evaluate(),
       /** The user generates input, resetting the idle time; input alone does not unlock the screen. */
       input: (): ReadonlyArray<unknown> => {
         idleTime = 0

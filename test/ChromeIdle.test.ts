@@ -540,6 +540,8 @@ describe("testing/Idle fixture", () => {
     expect(yield* idle.queryState(2 ** 31 - 1)).toBe("active")
     fixture.controls.elapse(1)
     expect(yield* idle.queryState(2 ** 31 - 1)).toBe("idle")
+    // A listener makes Chrome sample at the detection interval.
+    fixture.api.onStateChanged.addListener(() => {})
     yield* idle.setDetectionInterval(1e6)
     expect(fixture.controls.detectionInterval).toBe(maximumInterval)
     expect(fixture.controls.state).toBe("idle")
@@ -603,13 +605,23 @@ describe("testing/Idle fixture", () => {
   }))
 
   it.effect("takes its starting state from options and rejects invalid ones", () => Effect.gen(function*() {
+    const sampled = (fixture: ReturnType<typeof makeIdle>): IdleState => {
+      fixture.api.onStateChanged.addListener(() => {})
+      fixture.controls.poll()
+
+      return fixture.controls.state
+    }
+
     const fixture = makeIdle({ idleTime: 30, locked: true, detectionInterval: 20, autoLockDelay: 300 })
-    expect(fixture.controls.state).toBe("locked")
+    expect(fixture.controls.locked).toBe(true)
+    expect(fixture.controls.idleTime).toBe(30)
+    expect(sampled(fixture)).toBe("locked")
     expect(yield* make(fixture.api).getAutoLockDelay).toBe(300)
     fixture.controls.unlock()
     expect(fixture.controls.state).toBe("active")
     expect(fixture.controls.idleTime).toBe(0)
-    expect(makeIdle({ idleTime: 20, detectionInterval: 20 }).controls.state).toBe("idle")
+    expect(sampled(makeIdle({ idleTime: 20, detectionInterval: 20 }))).toBe("idle")
+    expect(sampled(makeIdle({ idleTime: 19, detectionInterval: 20 }))).toBe("active")
     expect(makeIdle({ detectionInterval: 99999 }).controls.detectionInterval).toBe(maximumInterval)
     expect(() => makeIdle({ detectionInterval: 10 })).toThrow(TypeError)
     expect(() => makeIdle({ idleTime: -1 })).toThrow(RangeError)
@@ -633,6 +645,8 @@ describe("testing/Idle fixture", () => {
   it.effect("fails each operation once through failNext, before any change", () => Effect.gen(function*() {
     const fixture = makeIdle({ idleTime: 100 })
     const idle = make(fixture.api)
+    fixture.api.onStateChanged.addListener(() => {})
+    fixture.controls.poll()
     const queryCause = new Error("query")
     const setCause = new Error("set")
     const delayCause = new Error("delay")
@@ -685,6 +699,44 @@ describe("testing/Idle fixture", () => {
     expect(second).toEqual(["idle", "active"])
     expect(fixture.controls.state).toBe("active")
     expect(yield* make(fixture.api).queryState(60)).toBe("active")
+  }))
+
+  it.effect("samples from Chrome's initial \"active\", so a subscription can open with the state the machine is already in", () => Effect.gen(function*() {
+    const fixture = makeIdle({ locked: true })
+    const idle = make(fixture.api)
+    // Chrome's per-extension record starts "active" and is sampled only while a listener exists.
+    expect(fixture.controls.state).toBe("active")
+    expect(yield* idle.queryState(60)).toBe("locked")
+    const first = yield* Effect.forkChild(Stream.runHead(idle.onStateChanged))
+    yield* Effect.promise(() => fixture.controls.onStateChanged.waitForListener())
+    // Chrome never calls a listener while it is being added: the first sample comes a tick later.
+    expect(fixture.controls.state).toBe("active")
+    expect(fixture.controls.poll()).toEqual([])
+    expect(yield* Fiber.join(first)).toEqual(Option.some("locked"))
+    expect(fixture.controls.state).toBe("locked")
+    expect(fixture.controls.poll()).toEqual([])
+  }))
+
+  it.effect("stops sampling without listeners, so a later subscription sees the change it missed", () => Effect.gen(function*() {
+    const fixture = makeIdle()
+    const idle = make(fixture.api)
+    const locked = yield* Effect.forkChild(Stream.runHead(idle.onStateChanged))
+    yield* Effect.promise(() => fixture.controls.onStateChanged.waitForListener())
+    fixture.controls.lock()
+    expect(yield* Fiber.join(locked)).toEqual(Option.some("locked"))
+    expect(fixture.controls.onStateChanged.listenerCount).toBe(0)
+    // Nothing samples now: neither changes, the detection interval, nor a tick.
+    fixture.controls.unlock()
+    yield* idle.setDetectionInterval(15)
+    expect(fixture.controls.poll()).toEqual([])
+    expect(fixture.controls.state).toBe("locked")
+    expect(yield* idle.queryState(15)).toBe("active")
+    const resumed = yield* Effect.forkChild(Stream.runCollect(Stream.take(idle.onStateChanged, 2)))
+    yield* Effect.promise(() => fixture.controls.onStateChanged.waitForListener())
+    // The first change after re-subscribing is sampled against the stale "locked".
+    fixture.controls.elapse(15)
+    fixture.controls.input()
+    expect(yield* Fiber.join(resumed)).toEqual(["idle", "active"])
   }))
 
   it.effect("replaces members with overrides", () => Effect.gen(function*() {

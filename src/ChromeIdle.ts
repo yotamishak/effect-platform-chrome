@@ -46,9 +46,13 @@ export interface ChromeIdleService {
    */
   readonly getAutoLockDelay: Effect.Effect<number, ChromeIdleError>
   /**
-   * The state each time it changes, sampled by Chrome about once a second while any
-   * listener exists; there is no initial event, so read the current state with
-   * `queryState`. `"locked"` can follow `"active"` directly. This is an observational
+   * The state each time it changes. Chrome samples it at the detection interval about once
+   * a second while the extension has any idle listener, and fires when a sample differs
+   * from the last one it took, which starts as `"active"` and is not updated while no
+   * listener exists. The first event after subscribing can therefore report the state the
+   * machine was already in, or a change made while nobody listened; there is no
+   * guaranteed initial event, so read the current state with `queryState`. `"locked"` can
+   * follow `"active"` directly. This is an observational
    * subscription that cannot wake an MV3 service worker; register wake listeners
    * synchronously through `ChromeServiceWorker.listen` instead. Buffers at most 64
    * events, dropping the oldest.

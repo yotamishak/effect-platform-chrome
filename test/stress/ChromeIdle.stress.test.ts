@@ -585,14 +585,107 @@ describe("ChromeIdle stress: fixture and layers", () => {
     expect(fixture.controls.onStateChanged.listenerCount).toBe(1)
   }))
 
+  it.effect("samples only while a listener exists over a 20,000-step seeded walk of subscribe/unsubscribe gaps", () => Effect.gen(function*() {
+    const random = seeded(4242)
+    const fixture = makeIdle({ idleTime: 30, locked: true })
+    const idle = make(fixture.api)
+    const recorded: Array<IdleState> = []
+    const listener = (state: IdleState) => { recorded.push(state) }
+
+    const model: IdleModel = { idleTime: 30, locked: true, interval: 60, reported: "active" }
+    const expected: Array<IdleState> = []
+    let listening = false
+    let staleOpenings = 0
+    let fresh = false
+    const stateAt = (threshold: number): IdleState => model.locked ? "locked" : model.idleTime >= threshold ? "idle" : "active"
+
+    /** Chrome's sample: only while listening, against the last sampled state. */
+    const sample = () => {
+      if (!listening) return
+      const next = stateAt(model.interval)
+
+      if (next !== model.reported) {
+        if (fresh) staleOpenings++
+        model.reported = next
+        expected.push(next)
+      }
+
+      fresh = false
+    }
+
+    for (let step = 0; step < 20000; step++) {
+      switch (random.int(8)) {
+        case 0: {
+          const seconds = random.int(4) * 30
+          fixture.controls.elapse(seconds)
+          model.idleTime += seconds
+          sample()
+          break
+        }
+
+        case 1:
+          fixture.controls.input()
+          model.idleTime = 0
+          sample()
+          break
+        case 2:
+          fixture.controls.lock()
+          model.locked = true
+          sample()
+          break
+        case 3:
+          fixture.controls.unlock()
+          model.locked = false
+          model.idleTime = 0
+          sample()
+          break
+        case 4: {
+          const seconds = minimumInterval + random.int(120)
+          yield* idle.setDetectionInterval(seconds)
+          model.interval = seconds
+          sample()
+          break
+        }
+
+        case 5: {
+          const threshold = minimumInterval + random.int(300)
+          expect(yield* idle.queryState(threshold)).toBe(stateAt(threshold))
+          break
+        }
+
+        case 6:
+          fixture.controls.poll()
+          sample()
+          break
+        default:
+          // Adding a listener never samples by itself; removing one freezes the last sample.
+          if (listening) {
+            fixture.api.onStateChanged.removeListener(listener)
+          } else {
+            fixture.api.onStateChanged.addListener(listener)
+            fresh = true
+          }
+
+          listening = !listening
+      }
+
+      expect(fixture.controls.state).toBe(model.reported)
+    }
+
+    expect(recorded).toEqual(expected)
+    expect(expected.length).toBeGreaterThan(1000)
+    // Many subscriptions opened with a change that happened while nobody listened.
+    expect(staleOpenings).toBeGreaterThan(100)
+  }))
+
   it.effect("keeps 512 concurrent fixtures and their subscriptions isolated", () => Effect.gen(function*() {
     const fixtures = Array.from({ length: 512 }, (_, index) => makeIdle({ idleTime: index }))
 
-    // Even fixtures lock then unlock; odd ones go idle then get input. Those starting at
-    // 60 seconds or more are already idle, so only their return to active is a change.
+    // Even fixtures lock then unlock; odd ones go idle then get input. Chrome had sampled
+    // none of them, so even those starting idle report it against the initial "active".
     const expectedFor = (index: number): ReadonlyArray<IdleState> => index % 2 === 0
       ? ["locked", "active"]
-      : index >= 60 ? ["active"] : ["idle", "active"]
+      : ["idle", "active"]
 
     const results = yield* Effect.forEach(fixtures, (fixture, index) => Effect.gen(function*() {
       const idle = make(fixture.api)
