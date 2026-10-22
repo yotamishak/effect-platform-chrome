@@ -1,40 +1,63 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Effect, Fiber, Schema, Stream } from "effect"
+import { Effect, Exit, Fiber, Schema, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeMessageError, fail, succeed } from "../src/ChromeMessage.js"
-import { ChromeRuntime, ChromeRuntimeError, layer, layerLive, make, type ChromeRuntimeApi } from "../src/ChromeRuntime.js"
+import { ChromeRuntime, ChromeRuntimeError, layer, layerLive, make } from "../src/ChromeRuntime.js"
+import type { ChromeRuntimeApi, ChromeRuntimeService, MessageListenerArguments } from "../src/ChromeRuntime.js"
 import { makePortPair } from "../src/testing/Port.js"
+import { gatedEvent } from "./stress/support.js"
 
+/** A gated Chrome-like event whose next registrations can be made to throw, before or after adding. */
 const event = <A extends ReadonlyArray<unknown>>() => {
-  const listeners = new Set<(...args: A) => void>()
-  let registered!: () => void
-  const ready = new Promise<void>((resolve) => { registered = resolve })
+  const base = gatedEvent<A>()
+  const failures: Array<{ readonly cause: Error; readonly afterAdding: boolean }> = []
 
   return {
-    listeners,
-    ready,
-    addListener: vi.fn((listener: (...args: A) => void) => {
-      listeners.add(listener)
-      registered()
-    }),
-    removeListener: vi.fn((listener: (...args: A) => void) => { listeners.delete(listener) }),
-    emit: (...args: A) => { for (const listener of listeners) listener(...args) }
+    ...base,
+    addListener: (listener: (...args: A) => void) => {
+      const failure = failures.shift()
+
+      if (failure !== undefined && !failure.afterAdding) throw failure.cause
+      base.addListener(listener)
+
+      if (failure !== undefined) throw failure.cause
+    },
+    failNext: (cause: Error, afterAdding: boolean) => { failures.push({ cause, afterAdding }) }
   }
+}
+
+/** What the shared stream tests observe of any fake event. */
+interface Probe {
+  readonly listeners: ReadonlySet<unknown>
+  readonly added: ReadonlyArray<unknown>
+  readonly removed: ReadonlyArray<unknown>
+  readonly registered: (size: number) => Effect.Effect<void>
+  readonly failNext: (cause: Error, afterAdding: boolean) => void
 }
 
 const context: chrome.runtime.ExtensionContext = {
   contextId: "worker", contextType: "BACKGROUND", frameId: -1, incognito: false, tabId: -1, windowId: -1
 }
 
+const manifest: chrome.runtime.Manifest = { manifest_version: 3, name: "Test", version: "1.0.0" }
+
+// SAFETY: a DirectoryEntry is an opaque legacy FileSystem handle the module only passes through.
+const directory = { name: "", isDirectory: true } as DirectoryEntry
+
 const fake = () => ({
   id: "extension-id",
-  getManifest: vi.fn<ChromeRuntimeApi["getManifest"]>(() => ({ manifest_version: 3, name: "Test", version: "1.0.0" })),
+  getManifest: vi.fn(() => manifest),
   getURL: vi.fn((path: string) => `chrome-extension://extension-id/${path}`),
+  getVersion: vi.fn(() => "1.0.0"),
   sendMessage: vi.fn<ChromeRuntimeApi["sendMessage"]>(async () => ({ ok: true })),
+  sendNativeMessage: vi.fn<ChromeRuntimeApi["sendNativeMessage"]>(async () => ({ native: true })),
   getContexts: vi.fn<ChromeRuntimeApi["getContexts"]>(async () => [context]),
+  getPackageDirectoryEntry: vi.fn(async () => directory),
   openOptionsPage: vi.fn<ChromeRuntimeApi["openOptionsPage"]>(async () => undefined),
   reload: vi.fn<ChromeRuntimeApi["reload"]>(() => undefined),
+  restart: vi.fn<ChromeRuntimeApi["restart"]>(() => undefined),
+  restartAfterDelay: vi.fn<ChromeRuntimeApi["restartAfterDelay"]>(async () => undefined),
   setUninstallURL: vi.fn<ChromeRuntimeApi["setUninstallURL"]>(async () => undefined),
   getPlatformInfo: vi.fn<ChromeRuntimeApi["getPlatformInfo"]>(async () => ({ os: "mac", arch: "arm64" })),
   requestUpdateCheck: vi.fn<ChromeRuntimeApi["requestUpdateCheck"]>(async () => ({ status: "update_available", version: "2.0.0" })),
@@ -42,443 +65,480 @@ const fake = () => ({
   onStartup: event<[]>(),
   onUpdateAvailable: event<[chrome.runtime.UpdateAvailableDetails]>(),
   onSuspend: event<[]>(),
-  onMessageExternal: event<[unknown, chrome.runtime.MessageSender, () => void]>(),
-  onConnectExternal: event<[chrome.runtime.Port]>()
+  onSuspendCanceled: event<[]>(),
+  onRestartRequired: event<[`${chrome.runtime.OnRestartRequiredReason}`]>(),
+  onEnabled: event<[]>(),
+  onMessage: event<MessageListenerArguments>(),
+  onMessageExternal: event<MessageListenerArguments>(),
+  onUserScriptMessage: event<MessageListenerArguments>(),
+  onConnect: event<[chrome.runtime.Port]>(),
+  onConnectExternal: event<[chrome.runtime.Port]>(),
+  onConnectNative: event<[chrome.runtime.Port]>(),
+  onUserScriptConnect: event<[chrome.runtime.Port]>()
 })
 
+type Fake = ReturnType<typeof fake>
+
+interface Fired {
+  readonly expected: unknown
+}
+
+interface StreamCase {
+  readonly operation: string
+  readonly source: Probe
+  readonly stream: Stream.Stream<unknown, ChromeRuntimeError>
+  /** Fires the event once, returning what the stream must emit for it. */
+  readonly fire: () => Fired
+}
+
+const sender: chrome.runtime.MessageSender = { id: "peer-extension", origin: "chrome-extension://peer-extension" }
+
+const streamCases = (api: Fake, service: ChromeRuntimeService): ReadonlyArray<StreamCase> => {
+  const port = makePortPair("runtime").left.port
+  const respond = vi.fn()
+
+  const message = (source: Fake["onMessage"]) => () => {
+    source.emit({ ping: 1 }, sender, respond)
+
+    return { expected: { message: { ping: 1 }, sender } }
+  }
+
+  const connection = (source: Fake["onConnect"]) => () => {
+    source.emit(port)
+
+    return { expected: port }
+  }
+
+  const signal = (source: Fake["onStartup"]) => () => {
+    source.emit()
+
+    return { expected: undefined }
+  }
+
+  return [
+    { operation: "onInstalled", source: api.onInstalled, stream: service.onInstalled, fire: () => {
+      api.onInstalled.emit({ reason: "update", previousVersion: "0.9.0" })
+
+      return { expected: { reason: "update", previousVersion: "0.9.0" } }
+    } },
+    { operation: "onStartup", source: api.onStartup, stream: service.onStartup, fire: signal(api.onStartup) },
+    { operation: "onUpdateAvailable", source: api.onUpdateAvailable, stream: service.onUpdateAvailable, fire: () => {
+      api.onUpdateAvailable.emit({ version: "2.0.0" })
+
+      return { expected: { version: "2.0.0" } }
+    } },
+    { operation: "onSuspend", source: api.onSuspend, stream: service.onSuspend, fire: signal(api.onSuspend) },
+    { operation: "onSuspendCanceled", source: api.onSuspendCanceled, stream: service.onSuspendCanceled, fire: signal(api.onSuspendCanceled) },
+    { operation: "onRestartRequired", source: api.onRestartRequired, stream: service.onRestartRequired, fire: () => {
+      api.onRestartRequired.emit("os_update")
+
+      return { expected: "os_update" }
+    } },
+    { operation: "onEnabled", source: api.onEnabled, stream: service.onEnabled, fire: signal(api.onEnabled) },
+    { operation: "onMessage", source: api.onMessage, stream: service.onMessage, fire: message(api.onMessage) },
+    { operation: "onMessageExternal", source: api.onMessageExternal, stream: service.onMessageExternal, fire: message(api.onMessageExternal) },
+    { operation: "onUserScriptMessage", source: api.onUserScriptMessage, stream: service.onUserScriptMessage, fire: message(api.onUserScriptMessage) },
+    { operation: "onConnect", source: api.onConnect, stream: service.onConnect, fire: connection(api.onConnect) },
+    { operation: "onConnectExternal", source: api.onConnectExternal, stream: service.onConnectExternal, fire: connection(api.onConnectExternal) },
+    { operation: "onConnectNative", source: api.onConnectNative, stream: service.onConnectNative, fire: connection(api.onConnectNative) },
+    { operation: "onUserScriptConnect", source: api.onUserScriptConnect, stream: service.onUserScriptConnect, fire: connection(api.onUserScriptConnect) }
+  ]
+}
+
+/** The mock surface used to make one Chrome call fail. */
+interface Failable {
+  readonly mock: { readonly calls: ReadonlyArray<unknown>; readonly contexts: ReadonlyArray<unknown> }
+  mockRejectedValueOnce(value: Error): void
+  mockImplementationOnce(implementation: () => never): void
+}
+
+interface CallCase {
+  readonly operation: string
+  readonly mock: Failable
+  readonly effect: Effect.Effect<void, ChromeRuntimeError>
+}
+
+const promiseCalls = (api: Fake, service: ChromeRuntimeService): ReadonlyArray<CallCase> => [
+  { operation: "sendMessage", mock: api.sendMessage, effect: Effect.asVoid(service.sendMessage("message")) },
+  { operation: "sendNativeMessage", mock: api.sendNativeMessage, effect: Effect.asVoid(service.sendNativeMessage("com.example.host", { ping: 1 })) },
+  { operation: "getContexts", mock: api.getContexts, effect: Effect.asVoid(service.getContexts({})) },
+  { operation: "getPackageDirectoryEntry", mock: api.getPackageDirectoryEntry, effect: Effect.asVoid(service.getPackageDirectoryEntry) },
+  { operation: "openOptionsPage", mock: api.openOptionsPage, effect: Effect.asVoid(service.openOptionsPage) },
+  { operation: "restartAfterDelay", mock: api.restartAfterDelay, effect: Effect.asVoid(service.restartAfterDelay(30)) },
+  { operation: "setUninstallURL", mock: api.setUninstallURL, effect: Effect.asVoid(service.setUninstallURL("https://example.com/bye")) },
+  { operation: "getPlatformInfo", mock: api.getPlatformInfo, effect: Effect.asVoid(service.getPlatformInfo) },
+  { operation: "requestUpdateCheck", mock: api.requestUpdateCheck, effect: Effect.asVoid(service.requestUpdateCheck) }
+]
+
+const syncCalls = (api: Fake, service: ChromeRuntimeService): ReadonlyArray<CallCase> => [
+  { operation: "getManifest", mock: api.getManifest, effect: Effect.asVoid(service.getManifest) },
+  { operation: "getURL", mock: api.getURL, effect: Effect.asVoid(service.getURL("page.html")) },
+  { operation: "getVersion", mock: api.getVersion, effect: Effect.asVoid(service.getVersion) },
+  { operation: "reload", mock: api.reload, effect: Effect.asVoid(service.reload) },
+  { operation: "restart", mock: api.restart, effect: Effect.asVoid(service.restart) }
+]
+
+const expectFailure = (error: ChromeRuntimeError, operation: string, cause: unknown) => {
+  expect(error).toBeInstanceOf(ChromeRuntimeError)
+  expect(error.operation).toBe(operation)
+  expect(error.cause).toBe(cause)
+}
+
+const resolve = Effect.service(ChromeRuntime)
+
 describe("ChromeRuntime", () => {
-  it.effect("request encodes the message and unwraps the reply envelope", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    const request = Schema.Struct({ ping: Schema.FiniteFromString })
-    const value = Schema.Struct({ pong: Schema.FiniteFromString })
+  describe("calls", () => {
+    it.effect("run lazily, pass arguments through and keep the API receiver", () => Effect.gen(function*() {
+      const api = fake()
+      const service = make(api)
+      const calls = [...promiseCalls(api, service), ...syncCalls(api, service)]
 
-    runtime.sendMessage.mockResolvedValueOnce(succeed({ pong: "2" }))
-    expect(yield* service.request(request, value, { ping: 1 })).toEqual({ pong: 2 })
-    expect(runtime.sendMessage).toHaveBeenLastCalledWith(undefined, { ping: "1" }, undefined)
+      for (const { mock } of calls) expect(mock.mock.calls).toHaveLength(0)
 
-    runtime.sendMessage.mockResolvedValueOnce(fail({ code: "Overflow", message: "Startup queue is full" }))
-    const failure = yield* Effect.flip(service.request(request, value, { ping: 1 }))
-    expect(failure).toBeInstanceOf(ChromeMessageError)
-    expect(failure).toMatchObject({ code: "Overflow", message: "Startup queue is full" })
+      expect(yield* service.id).toBe("extension-id")
+      expect(yield* service.getManifest).toBe(manifest)
+      expect(yield* service.getURL("page.html")).toBe("chrome-extension://extension-id/page.html")
+      expect(yield* service.getVersion).toBe("1.0.0")
+      expect(yield* service.sendNativeMessage("com.example.host", { ping: 1, nested: [true, null] })).toEqual({ native: true })
+      expect(api.sendNativeMessage).toHaveBeenCalledExactlyOnceWith("com.example.host", { ping: 1, nested: [true, null] })
+      const filter: chrome.runtime.ContextFilter = { contextTypes: ["BACKGROUND"], tabIds: [-1] }
+      expect(yield* service.getContexts(filter)).toEqual([context])
+      expect(api.getContexts).toHaveBeenCalledExactlyOnceWith(filter)
+      expect(yield* service.getPackageDirectoryEntry).toBe(directory)
+      yield* service.openOptionsPage
+      yield* service.reload
+      yield* service.restart
+      yield* service.restartAfterDelay(-1)
+      expect(api.restartAfterDelay).toHaveBeenCalledExactlyOnceWith(-1)
+      yield* service.setUninstallURL("")
+      expect(api.setUninstallURL).toHaveBeenCalledExactlyOnceWith("")
+      expect(yield* service.getPlatformInfo).toEqual({ os: "mac", arch: "arm64" })
+      expect(yield* service.requestUpdateCheck).toEqual({ status: "update_available", version: "2.0.0" })
+      expect(yield* service.sendMessage("hello")).toEqual({ ok: true })
 
-    for (const reply of [{ pong: "2" }, succeed({ pong: "x" }), undefined]) {
-      runtime.sendMessage.mockResolvedValueOnce(reply)
-      const invalid = yield* Effect.flip(service.request(request, value, { ping: 1 }))
-      expect(invalid).toBeInstanceOf(ChromeRuntimeError)
-      expect(invalid).toMatchObject({ operation: "sendMessage.decodeResponse" })
-    }
-  }))
-
-  it.effect("encodes transformed requests and decodes transformed responses across 256 exchanges", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    const request = Schema.Struct({ ping: Schema.FiniteFromString })
-    const response = Schema.Struct({ pong: Schema.FiniteFromString })
-
-    for (let index = 0; index < 256; index++) {
-      runtime.sendMessage.mockResolvedValueOnce({ pong: String(index + 1) })
-      expect(yield* service.sendMessageSchema(request, response, { ping: index }, { extensionId: "peer" })).toEqual({ pong: index + 1 })
-      expect(runtime.sendMessage).toHaveBeenLastCalledWith("peer", { ping: String(index) }, undefined)
-    }
-
-    runtime.sendMessage.mockResolvedValueOnce({ pong: "not numeric" })
-    const failure = yield* service.sendMessageSchema(request, response, { ping: 0 }).pipe(Effect.flip)
-    expect(failure.operation).toBe("sendMessage.decodeResponse")
-    expect(failure.cause).toBeInstanceOf(Schema.SchemaError)
-    expect(runtime.sendMessage).toHaveBeenCalledTimes(257)
-  }))
-
-  it.effect.each([1, 63, 64, 65, 1024, 4096])("retains exactly the newest lifecycle events in a synchronous burst of %i", (count) => Effect.gen(function*() {
-    const runtime = fake()
-    runtime.onInstalled.addListener.mockImplementationOnce((listener) => {
-      runtime.onInstalled.listeners.add(listener)
-
-      for (let index = 0; index < count; index++) listener({ reason: "update", previousVersion: String(index) })
-    })
-    const values = yield* make(runtime).onInstalled.pipe(Stream.take(Math.min(count, 64)), Stream.runCollect)
-    expect(values).toEqual(Array.from({ length: Math.min(count, 64) }, (_, index) => ({
-      reason: "update", previousVersion: String(Math.max(0, count - 64) + index)
-    })))
-    expect(runtime.onInstalled.listeners.size).toBe(0)
-    expect(runtime.onInstalled.addListener).toHaveBeenCalledOnce()
-    expect(runtime.onInstalled.removeListener).toHaveBeenCalledOnce()
-  }))
-
-  it.effect("repeats 256 lifecycle subscriptions with exact startup and installed counts and no listeners left behind", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    runtime.onInstalled.addListener.mockImplementation((listener) => {
-      runtime.onInstalled.listeners.add(listener)
-
-      for (let index = 0; index < 128; index++) listener({ reason: "update", previousVersion: String(index) })
-    })
-    runtime.onStartup.addListener.mockImplementation((listener) => {
-      runtime.onStartup.listeners.add(listener)
-
-      for (let index = 0; index < 128; index++) listener()
-    })
-
-    for (let cycle = 0; cycle < 256; cycle++) {
-      const values = yield* service.onInstalled.pipe(Stream.take(64), Stream.runCollect)
-      expect(values.map((value) => value.previousVersion)).toEqual(Array.from({ length: 64 }, (_, index) => String(index + 64)))
-      expect(yield* service.onStartup.pipe(Stream.take(64), Stream.runCollect)).toEqual(Array.from({ length: 64 }, () => undefined))
-      expect(runtime.onInstalled.listeners.size + runtime.onStartup.listeners.size).toBe(0)
-    }
-
-    expect(runtime.onInstalled.addListener).toHaveBeenCalledTimes(256)
-    expect(runtime.onInstalled.removeListener).toHaveBeenCalledTimes(256)
-    expect(runtime.onStartup.addListener).toHaveBeenCalledTimes(256)
-    expect(runtime.onStartup.removeListener).toHaveBeenCalledTimes(256)
-  }))
-
-  it.effect("gives concurrent lifecycle subscribers independent buffers and removes each listener", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    let registered!: () => void
-    const ready = new Promise<void>((resolve) => { registered = resolve })
-    runtime.onInstalled.addListener.mockImplementation((listener) => {
-      runtime.onInstalled.listeners.add(listener)
-
-      if (runtime.onInstalled.listeners.size === 16) registered()
-    })
-
-    const results = yield* Effect.forEach(Array.from({ length: 16 }), () =>
-      Effect.forkScoped(service.onInstalled.pipe(Stream.take(64), Stream.runCollect)))
-
-    yield* Effect.promise(() => ready)
-
-    for (let index = 0; index < 2048; index++) runtime.onInstalled.emit({ reason: "update", previousVersion: String(index) })
-
-    for (const values of yield* Effect.forEach(results, Fiber.join)) {
-      expect(values).toEqual(Array.from({ length: 64 }, (_, index) => ({ reason: "update", previousVersion: String(1984 + index) })))
-    }
-
-    expect(runtime.onInstalled.listeners.size).toBe(0)
-    expect(runtime.onInstalled.removeListener).toHaveBeenCalledTimes(16)
-  }))
-
-  it.effect("repeated interrupted startup subscribers always release their listener", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-
-    for (let cycle = 0; cycle < 128; cycle++) {
-      let registered!: () => void
-      const ready = new Promise<void>((resolve) => { registered = resolve })
-      runtime.onStartup.addListener.mockImplementationOnce((listener) => {
-        runtime.onStartup.listeners.add(listener)
-        registered()
-      })
-      const fiber = yield* Effect.forkScoped(Stream.runDrain(service.onStartup))
-      yield* Effect.promise(() => ready)
-
-      for (let index = 0; index < 128; index++) runtime.onStartup.emit()
-      yield* Fiber.interrupt(fiber)
-      expect(runtime.onStartup.listeners.size).toBe(0)
-    }
-
-    expect(runtime.onStartup.removeListener).toHaveBeenCalledTimes(128)
-  }))
-
-  it.effect("isolates 512 mixed messaging failures and successes without leaking lifecycle listeners", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    const request = Schema.Struct({ ping: Schema.Finite })
-    const response = Schema.Struct({ ok: Schema.Boolean })
-
-    for (let index = 0; index < 512; index++) {
-      const cause = new Error(`failure ${index}`)
-
-      switch (index % 4) {
-        case 0: {
-          runtime.sendMessage.mockRejectedValueOnce(cause)
-          const failure = yield* service.sendMessageSchema(request, response, { ping: index }).pipe(Effect.flip)
-          expect(failure).toMatchObject({ operation: "sendMessage", cause })
-          break
-        }
-
-        case 1: {
-          runtime.sendMessage.mockImplementationOnce(() => { throw cause })
-          const failure = yield* service.sendMessageSchema(request, response, { ping: index }).pipe(Effect.flip)
-          expect(failure).toMatchObject({ operation: "sendMessage", cause })
-          break
-        }
-
-        case 2: {
-          runtime.sendMessage.mockResolvedValueOnce({ ok: "invalid" })
-          const failure = yield* service.sendMessageSchema(request, response, { ping: index }).pipe(Effect.flip)
-          expect(failure.operation).toBe("sendMessage.decodeResponse")
-          expect(failure.cause).toBeInstanceOf(Schema.SchemaError)
-          break
-        }
-
-        default: {
-          expect(yield* service.sendMessageSchema(request, response, { ping: index })).toEqual({ ok: true })
-        }
+      for (const { operation, mock } of calls) {
+        expect(mock.mock.calls, operation).toHaveLength(1)
+        expect(mock.mock.contexts[0], operation).toBe(api)
       }
 
-      const failure = yield* service.sendMessageSchema(request, response, { ping: Number.NaN }).pipe(Effect.flip)
-      expect(failure.operation).toBe("sendMessage.encodeRequest")
-      expect(failure.cause).toBeInstanceOf(Schema.SchemaError)
-    }
+      // Effect values re-run the native call each time they run.
+      yield* service.openOptionsPage
+      expect(api.openOptionsPage).toHaveBeenCalledTimes(2)
+    }))
 
-    expect(runtime.sendMessage).toHaveBeenCalledTimes(512)
-    expect(runtime.onInstalled.listeners.size + runtime.onStartup.listeners.size).toBe(0)
-  }))
+    it.effect("map every Promise call's rejection and synchronous throw to its operation", () => Effect.gen(function*() {
+      const api = fake()
 
-  it.effect("imports safely without chrome and resolves the live API lazily", () => Effect.gen(function*() {
-    vi.stubGlobal("chrome", undefined)
-    const imported = yield* Effect.promise(() => import("../src/ChromeRuntime.js"))
-    expect(imported.layerLive).toBe(layerLive)
+      for (const { operation, mock, effect } of promiseCalls(api, make(api))) {
+        const rejected = new Error(`${operation} rejected`)
+        mock.mockRejectedValueOnce(rejected)
+        expectFailure(yield* Effect.flip(effect), operation, rejected)
 
-    const error = yield* ChromeRuntime.pipe(Effect.provide(layerLive), Effect.flip)
-
-    expect(error).toBeInstanceOf(ChromeRuntimeError)
-    expect(error.operation).toBe("initialize")
-    const runtime = fake()
-    vi.stubGlobal("chrome", { runtime })
-    expect(yield* Effect.gen(function*() {
-      return yield* (yield* ChromeRuntime).id
-    }).pipe(Effect.provide(layerLive))).toBe("extension-id")
-  }))
-
-  it.effect("provides an injected API through layer without a global", () => Effect.gen(function*() {
-    vi.stubGlobal("chrome", undefined)
-    const runtime = fake()
-    expect(yield* Effect.gen(function*() {
-      return yield* (yield* ChromeRuntime).getPlatformInfo
-    }).pipe(Effect.provide(layer(runtime)))).toEqual({ os: "mac", arch: "arm64" })
-  }))
-
-  it.effect("reads metadata lazily and preserves the API receiver", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    expect(runtime.getManifest).not.toHaveBeenCalled()
-    expect(yield* service.id).toBe("extension-id")
-    expect(yield* service.getManifest).toEqual(runtime.getManifest())
-    expect(yield* service.getURL("page.html")).toBe("chrome-extension://extension-id/page.html")
-    expect(runtime.getURL.mock.contexts[0]).toBe(runtime)
-    expect(runtime.onInstalled.listeners.size).toBe(0)
-    expect(runtime.onStartup.listeners.size).toBe(0)
-  }))
-
-  it.effect("uses the explicit Chrome Promise overload and returns unknown responses", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    expect(yield* service.sendMessage("hello")).toEqual({ ok: true })
-    expect(runtime.sendMessage).toHaveBeenLastCalledWith(undefined, "hello", undefined)
-    yield* service.sendMessage({ ping: 1 }, {
-      extensionId: "other-extension", options: { includeTlsChannelId: true }
-    })
-    expect(runtime.sendMessage).toHaveBeenLastCalledWith("other-extension", { ping: 1 }, { includeTlsChannelId: true })
-    expect(runtime.sendMessage.mock.contexts[0]).toBe(runtime)
-  }))
-
-  it.effect("tags messaging rejections and synchronous throws with the original cause", () => Effect.gen(function*() {
-    const runtime = fake()
-    const cause = new Error("disconnected")
-    runtime.sendMessage.mockRejectedValueOnce(cause)
-    const service = make(runtime)
-    const rejected = yield* service.sendMessage({}).pipe(Effect.asVoid, Effect.flip)
-    expect(rejected).toBeInstanceOf(ChromeRuntimeError)
-    expect(rejected).toMatchObject({ operation: "sendMessage", cause })
-    runtime.sendMessage.mockImplementationOnce(() => { throw cause })
-    expect(yield* service.sendMessage({}).pipe(Effect.asVoid, Effect.flip)).toMatchObject({ operation: "sendMessage", cause })
-  }))
-
-  it.effect("validates requests before sending and validates unknown responses", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    const request = Schema.Struct({ ping: Schema.Finite })
-    const response = Schema.Struct({ ok: Schema.Boolean })
-    expect(yield* service.sendMessageSchema(request, response, { ping: 1 })).toEqual({ ok: true })
-    runtime.sendMessage.mockClear()
-    const invalid = { ping: "invalid" }
-    // Deliberately violate the typed input contract to verify runtime encoding validation.
-    // @ts-expect-error negative test: ping must be a number
-    const requestError = yield* service.sendMessageSchema(request, response, invalid).pipe(Effect.flip)
-    expect(requestError.operation).toBe("sendMessage.encodeRequest")
-    expect(requestError.cause).toBeInstanceOf(Schema.SchemaError)
-    expect(runtime.sendMessage).not.toHaveBeenCalled()
-    runtime.sendMessage.mockResolvedValueOnce({ ok: "not-a-boolean" })
-    const responseError = yield* service.sendMessageSchema(request, response, { ping: 1 }).pipe(Effect.flip)
-    expect(responseError.operation).toBe("sendMessage.decodeResponse")
-    expect(responseError.cause).toBeInstanceOf(Schema.SchemaError)
-  }))
-
-  it.effect("tags synchronous metadata errors", () => Effect.gen(function*() {
-    const runtime = fake()
-    const cause = new Error("unavailable")
-    runtime.getManifest.mockImplementation(() => { throw cause })
-    runtime.getURL.mockImplementation(() => { throw cause })
-    Object.defineProperty(runtime, "id", { get: () => { throw cause } })
-    const service = make(runtime)
-    expect(yield* service.id.pipe(Effect.flip)).toMatchObject({ operation: "id", cause })
-    expect(yield* service.getManifest.pipe(Effect.flip)).toMatchObject({ operation: "getManifest", cause })
-    expect(yield* service.getURL("").pipe(Effect.flip)).toMatchObject({ operation: "getURL", cause })
-  }))
-
-  it.effect("removes installed listeners when consumption completes", () => Effect.gen(function*() {
-    const runtime = fake()
-    const result = yield* Effect.forkScoped(make(runtime).onInstalled.pipe(Stream.take(1), Stream.runCollect))
-    yield* Effect.promise(() => runtime.onInstalled.ready)
-    runtime.onInstalled.emit({ reason: "install" })
-    expect(yield* Fiber.join(result)).toEqual([{ reason: "install" }])
-    expect(runtime.onInstalled.listeners.size).toBe(0)
-    expect(runtime.onInstalled.removeListener).toHaveBeenCalledWith(runtime.onInstalled.addListener.mock.calls[0]?.[0])
-  }))
-
-  it.effect("removes startup listeners on interruption", () => Effect.gen(function*() {
-    const runtime = fake()
-    const fiber = yield* Effect.forkScoped(Stream.runDrain(make(runtime).onStartup))
-    yield* Effect.promise(() => runtime.onStartup.ready)
-    runtime.onStartup.emit()
-    yield* Fiber.interrupt(fiber)
-    expect(runtime.onStartup.listeners.size).toBe(0)
-    expect(runtime.onStartup.removeListener).toHaveBeenCalledOnce()
-  }))
-
-  it.effect("bounds lifecycle buffering and drops the oldest events on overflow", () => Effect.gen(function*() {
-    const runtime = fake()
-    runtime.onInstalled.addListener.mockImplementationOnce((listener) => {
-      runtime.onInstalled.listeners.add(listener)
-
-      for (let index = 0; index < 100; index++) {
-        listener({ reason: "update", previousVersion: String(index) })
+        const thrown = new Error(`${operation} threw`)
+        mock.mockImplementationOnce(() => { throw thrown })
+        expectFailure(yield* Effect.flip(effect), operation, thrown)
       }
-    })
-    const values = yield* make(runtime).onInstalled.pipe(Stream.take(64), Stream.runCollect)
-    expect(values).toHaveLength(64)
-    expect(values[0]).toEqual({ reason: "update", previousVersion: "36" })
-    expect(values[63]).toEqual({ reason: "update", previousVersion: "99" })
-    expect(runtime.onInstalled.listeners.size).toBe(0)
-  }))
+    }))
 
-  it.effect("cleans up and tags listener registration throws", () => Effect.gen(function*() {
-    const runtime = fake()
-    const cause = new Error("registration failed")
-    runtime.onInstalled.addListener.mockImplementationOnce((listener) => {
-      runtime.onInstalled.listeners.add(listener)
-      throw cause
-    })
-    const error = yield* Stream.runDrain(make(runtime).onInstalled).pipe(Effect.flip)
-    expect(error).toMatchObject({ operation: "onInstalled", cause })
-    expect(runtime.onInstalled.listeners.size).toBe(0)
-    runtime.onStartup.addListener.mockImplementationOnce(() => { throw cause })
-    expect(yield* Stream.runDrain(make(runtime).onStartup).pipe(Effect.flip)).toMatchObject({
-      operation: "onStartup", cause
-    })
-    expect(runtime.onStartup.removeListener).toHaveBeenCalledOnce()
-  }))
+    it.effect("map every synchronous call's throw to its operation", () => Effect.gen(function*() {
+      const api = fake()
 
-  it.effect("calls the extension-management APIs lazily with the API receiver", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    const filter: chrome.runtime.ContextFilter = { contextTypes: ["BACKGROUND"] }
-    const reload = service.reload
-    expect(runtime.reload).not.toHaveBeenCalled()
-    yield* reload
-    expect(runtime.reload).toHaveBeenCalledOnce()
-    expect(runtime.reload.mock.contexts[0]).toBe(runtime)
-    expect(yield* service.getContexts(filter)).toEqual([context])
-    expect(runtime.getContexts).toHaveBeenCalledExactlyOnceWith(filter)
-    yield* service.openOptionsPage
-    yield* service.openOptionsPage
-    expect(runtime.openOptionsPage).toHaveBeenCalledTimes(2)
-    yield* service.setUninstallURL("https://example.com/goodbye")
-    expect(runtime.setUninstallURL).toHaveBeenCalledExactlyOnceWith("https://example.com/goodbye")
-    expect(yield* service.getPlatformInfo).toEqual({ os: "mac", arch: "arm64" })
-    expect(yield* service.requestUpdateCheck).toEqual({ status: "update_available", version: "2.0.0" })
-    expect(runtime.getContexts.mock.contexts[0]).toBe(runtime)
-  }))
+      for (const { operation, mock, effect } of syncCalls(api, make(api))) {
+        const thrown = new Error(`${operation} threw`)
+        mock.mockImplementationOnce(() => { throw thrown })
+        expectFailure(yield* Effect.flip(effect), operation, thrown)
+      }
 
-  it.effect("tags extension-management rejections and throws with their operation", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    const cause = new Error("Could not create an options page.")
-    runtime.getContexts.mockRejectedValueOnce(cause)
-    runtime.openOptionsPage.mockRejectedValueOnce(cause)
-    runtime.reload.mockImplementationOnce(() => { throw cause })
-    runtime.setUninstallURL.mockRejectedValueOnce(cause)
-    runtime.getPlatformInfo.mockImplementationOnce(() => { throw cause })
-    runtime.requestUpdateCheck.mockRejectedValueOnce(cause)
+      const thrown = new Error("Extension context invalidated.")
+      Object.defineProperty(api, "id", { get: () => { throw thrown } })
+      expectFailure(yield* Effect.flip(make(api).id), "id", thrown)
+    }))
 
-    const failures = [
-      ["getContexts", service.getContexts({})],
-      ["openOptionsPage", service.openOptionsPage],
-      ["reload", service.reload],
-      ["setUninstallURL", service.setUninstallURL("")],
-      ["getPlatformInfo", service.getPlatformInfo],
-      ["requestUpdateCheck", service.requestUpdateCheck]
-    ] as const
-
-    for (const [operation, effect] of failures) {
-      const error = yield* Effect.flip(Effect.asVoid(effect))
+    it.effect("fails id with the typed error once Chrome invalidates the context", () => Effect.gen(function*() {
+      const { id: _id, ...rest } = fake()
+      const error = yield* Effect.flip(make({ ...rest, id: undefined }).id)
       expect(error).toBeInstanceOf(ChromeRuntimeError)
-      expect(error).toMatchObject({ operation, cause })
-    }
-  }))
+      expect(error.operation).toBe("id")
+      expect(String(error.cause)).toContain("chrome.runtime.id is unavailable")
+    }))
 
-  it.effect("streams update, suspend, external message and external connection events while consumed", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    const sender: chrome.runtime.MessageSender = { id: "peer-extension", origin: "chrome-extension://peer-extension" }
-    const sendResponse = vi.fn()
-    const port = makePortPair("external").left.port
+    it.effect("fails version- and context-gated calls with the typed error when Chrome lacks them", () => Effect.gen(function*() {
+      const { getVersion: _version, getPackageDirectoryEntry: _entry, ...rest } = fake()
+      const service = make(rest)
 
-    const updates = yield* Effect.forkScoped(Stream.runCollect(Stream.take(service.onUpdateAvailable, 1)))
-    const suspends = yield* Effect.forkScoped(Stream.runCollect(Stream.take(service.onSuspend, 2)))
-    const messages = yield* Effect.forkScoped(Stream.runCollect(Stream.take(service.onMessageExternal, 1)))
-    const connections = yield* Effect.forkScoped(Stream.runCollect(Stream.take(service.onConnectExternal, 1)))
-    yield* Effect.promise(() => Promise.all([
-      runtime.onUpdateAvailable.ready, runtime.onSuspend.ready, runtime.onMessageExternal.ready, runtime.onConnectExternal.ready
-    ]))
+      for (const [operation, effect] of [
+        ["getVersion", Effect.asVoid(service.getVersion)],
+        ["getPackageDirectoryEntry", Effect.asVoid(service.getPackageDirectoryEntry)]
+      ] as const) {
+        const error = yield* Effect.flip(effect)
+        expect(error).toBeInstanceOf(ChromeRuntimeError)
+        expect(error.operation).toBe(operation)
+        expect(String(error.cause)).toContain(`chrome.runtime.${operation} is unavailable`)
+      }
+    }))
+  })
 
-    runtime.onUpdateAvailable.emit({ version: "2.0.0" })
-    runtime.onSuspend.emit()
-    runtime.onSuspend.emit()
-    runtime.onMessageExternal.emit({ ping: 1 }, sender, sendResponse)
-    runtime.onConnectExternal.emit(port)
+  describe("sendMessage", () => {
+    it.effect("passes the extension id and options only when given, never in an ambiguous two-argument form", () => Effect.gen(function*() {
+      const api = fake()
+      const service = make(api)
+      const options: chrome.runtime.MessageOptions = { includeTlsChannelId: true }
 
-    expect(yield* Fiber.join(updates)).toEqual([{ version: "2.0.0" }])
-    expect(yield* Fiber.join(suspends)).toEqual([undefined, undefined])
-    expect(yield* Fiber.join(messages)).toEqual([{ message: { ping: 1 }, sender }])
-    expect((yield* Fiber.join(connections))[0]).toBe(port)
-    expect(sendResponse).not.toHaveBeenCalled()
+      yield* service.sendMessage("hello")
+      expect(api.sendMessage).toHaveBeenLastCalledWith("hello")
+      expect(api.sendMessage.mock.lastCall).toHaveLength(1)
 
-    for (const source of [runtime.onUpdateAvailable, runtime.onSuspend, runtime.onMessageExternal, runtime.onConnectExternal]) {
-      expect(source.listeners.size).toBe(0)
-      expect(source.removeListener).toHaveBeenCalledOnce()
-    }
-  }))
+      yield* service.sendMessage({ ping: 1 }, { extensionId: "other-extension" })
+      expect(api.sendMessage.mock.lastCall).toEqual(["other-extension", { ping: 1 }])
 
-  it.effect("the external message listener never claims the response channel", () => Effect.gen(function*() {
-    const runtime = fake()
-    const fiber = yield* Effect.forkScoped(Stream.runDrain(make(runtime).onMessageExternal))
-    yield* Effect.promise(() => runtime.onMessageExternal.ready)
-    const [listener] = runtime.onMessageExternal.listeners
-    expect(listener?.("message", {}, () => undefined)).toBeUndefined()
-    yield* Fiber.interrupt(fiber)
-    expect(runtime.onMessageExternal.listeners.size).toBe(0)
-  }))
+      // Two arguments would bind a string message to the extension id, so the id is explicit.
+      yield* service.sendMessage("hello", { options })
+      expect(api.sendMessage.mock.lastCall).toEqual([undefined, "hello", options])
 
-  it.effect("tags and cleans up failed registrations of the new event streams", () => Effect.gen(function*() {
-    const runtime = fake()
-    const service = make(runtime)
-    const cause = new Error("registration failed")
+      yield* service.sendMessage({ ping: 2 }, { extensionId: "other-extension", options })
+      expect(api.sendMessage.mock.lastCall).toEqual(["other-extension", { ping: 2 }, options])
 
-    const streams = [
-      ["onUpdateAvailable", runtime.onUpdateAvailable, Stream.runDrain(service.onUpdateAvailable)],
-      ["onSuspend", runtime.onSuspend, Stream.runDrain(service.onSuspend)],
-      ["onMessageExternal", runtime.onMessageExternal, Stream.runDrain(service.onMessageExternal)],
-      ["onConnectExternal", runtime.onConnectExternal, Stream.runDrain(service.onConnectExternal)]
-    ] as const
+      yield* service.sendMessage(null, {})
+      expect(api.sendMessage.mock.lastCall).toEqual([null])
+      expect(api.sendMessage.mock.contexts.every((receiver) => receiver === api)).toBe(true)
+    }))
 
-    for (const [operation, source, drain] of streams) {
-      source.addListener.mockImplementationOnce(() => { throw cause })
-      expect(yield* Effect.flip(drain)).toMatchObject({ operation, cause })
-      expect(source.removeListener).toHaveBeenCalledOnce()
-      expect(source.listeners.size).toBe(0)
-    }
-  }))
+    it.effect("returns the unvalidated reply, including no reply", () => Effect.gen(function*() {
+      const api = fake()
+      api.sendMessage.mockResolvedValueOnce(undefined)
+      expect(yield* make(api).sendMessage("hello")).toBeUndefined()
+    }))
+
+    it.effect("sendMessageSchema encodes before sending and decodes the reply", () => Effect.gen(function*() {
+      const api = fake()
+      const service = make(api)
+      const request = Schema.Struct({ ping: Schema.FiniteFromString })
+      const response = Schema.Struct({ pong: Schema.FiniteFromString })
+
+      for (let index = 0; index < 64; index++) {
+        api.sendMessage.mockResolvedValueOnce({ pong: String(index + 1) })
+        expect(yield* service.sendMessageSchema(request, response, { ping: index }, { extensionId: "peer" })).toEqual({ pong: index + 1 })
+        expect(api.sendMessage.mock.lastCall).toEqual(["peer", { ping: String(index) }])
+      }
+
+      api.sendMessage.mockResolvedValueOnce({ pong: "not numeric" })
+      const decodeFailure = yield* Effect.flip(service.sendMessageSchema(request, response, { ping: 0 }))
+      expect(decodeFailure.operation).toBe("sendMessage.decodeResponse")
+      expect(decodeFailure.cause).toBeInstanceOf(Schema.SchemaError)
+
+      api.sendMessage.mockClear()
+      const finite = Schema.Struct({ ping: Schema.Finite })
+      const encodeFailure = yield* Effect.flip(service.sendMessageSchema(finite, response, { ping: Number.NaN }))
+      expect(encodeFailure.operation).toBe("sendMessage.encodeRequest")
+      expect(encodeFailure.cause).toBeInstanceOf(Schema.SchemaError)
+      expect(api.sendMessage).not.toHaveBeenCalled()
+
+      const cause = new Error("Could not establish connection. Receiving end does not exist.")
+      api.sendMessage.mockRejectedValueOnce(cause)
+      expectFailure(yield* Effect.flip(service.sendMessageSchema(request, response, { ping: 1 })), "sendMessage", cause)
+      api.sendMessage.mockImplementationOnce(() => { throw cause })
+      expectFailure(yield* Effect.flip(service.sendMessageSchema(request, response, { ping: 1 })), "sendMessage", cause)
+    }))
+
+    it.effect("request encodes the message and unwraps the reply envelope", () => Effect.gen(function*() {
+      const api = fake()
+      const service = make(api)
+      const request = Schema.Struct({ ping: Schema.FiniteFromString })
+      const value = Schema.Struct({ pong: Schema.FiniteFromString })
+
+      api.sendMessage.mockResolvedValueOnce(succeed({ pong: "2" }))
+      expect(yield* service.request(request, value, { ping: 1 })).toEqual({ pong: 2 })
+      expect(api.sendMessage.mock.lastCall).toEqual([{ ping: "1" }])
+
+      api.sendMessage.mockResolvedValueOnce(fail({ code: "Overflow", message: "Startup queue is full" }))
+      const failure = yield* Effect.flip(service.request(request, value, { ping: 1 }))
+      expect(failure).toBeInstanceOf(ChromeMessageError)
+      expect(failure).toMatchObject({ code: "Overflow", message: "Startup queue is full" })
+
+      for (const reply of [{ pong: "2" }, succeed({ pong: "x" }), undefined]) {
+        api.sendMessage.mockResolvedValueOnce(reply)
+        const invalid = yield* Effect.flip(service.request(request, value, { ping: 1 }))
+        expect(invalid).toBeInstanceOf(ChromeRuntimeError)
+        expect(invalid).toMatchObject({ operation: "sendMessage.decodeResponse" })
+      }
+
+      const cause = new Error("disconnected")
+      api.sendMessage.mockRejectedValueOnce(cause)
+      expect(yield* Effect.flip(service.request(request, value, { ping: 1 }))).toMatchObject({ operation: "sendMessage", cause })
+    }))
+  })
+
+  describe("events", () => {
+    it.effect("register nothing until consumed", () => Effect.sync(() => {
+      const api = fake()
+      const service = make(api)
+
+      for (const { source } of streamCases(api, service)) expect(source.added).toHaveLength(0)
+    }))
+
+    it.effect("deliver each event and remove the listener when consumption ends", () => Effect.gen(function*() {
+      const api = fake()
+
+      for (const { operation, source, stream, fire } of streamCases(api, make(api))) {
+        const consumer = yield* Effect.forkScoped(Stream.runCollect(Stream.take(stream, 2)))
+        yield* source.registered(1)
+        const first = fire().expected
+        const second = fire().expected
+        expect(yield* Fiber.join(consumer), operation).toEqual([first, second])
+        expect(source.listeners.size, operation).toBe(0)
+        expect(source.removed, operation).toEqual(source.added)
+        expect(source.added, operation).toHaveLength(1)
+      }
+    }))
+
+    it.effect("remove the listener when the consumer is interrupted", () => Effect.gen(function*() {
+      const api = fake()
+
+      for (const { operation, source, stream, fire } of streamCases(api, make(api))) {
+        const consumer = yield* Effect.forkScoped(Stream.runDrain(stream))
+        yield* source.registered(1)
+        fire()
+        yield* Fiber.interrupt(consumer)
+        expect(Exit.hasInterrupts(yield* Fiber.await(consumer)), operation).toBe(true)
+        expect(source.listeners.size, operation).toBe(0)
+        expect(source.removed, operation).toEqual(source.added)
+      }
+    }))
+
+    it.effect("type registration failures and roll back partial registrations", () => Effect.gen(function*() {
+      const api = fake()
+
+      for (const { operation, source, stream } of streamCases(api, make(api))) {
+        for (const afterAdding of [false, true]) {
+          const cause = new Error(`${operation} registration failed`)
+          source.failNext(cause, afterAdding)
+          expectFailure(yield* Effect.flip(Stream.runDrain(stream)), operation, cause)
+          expect(source.listeners.size, operation).toBe(0)
+        }
+
+        expect(source.added, operation).toHaveLength(1)
+        expect(source.removed, operation).toHaveLength(2)
+      }
+    }))
+
+    it.effect("fail with the typed error, not a defect, when the context lacks an event", () => Effect.gen(function*() {
+      const {
+        onEnabled: _enabled, onUserScriptMessage: _message, onConnectNative: _native, onUserScriptConnect: _connect, ...rest
+      } = fake()
+
+      const service = make(rest)
+
+      for (const [operation, drain] of [
+        ["onEnabled", Stream.runDrain(service.onEnabled)],
+        ["onUserScriptMessage", Stream.runDrain(service.onUserScriptMessage)],
+        ["onConnectNative", Stream.runDrain(service.onConnectNative)],
+        ["onUserScriptConnect", Stream.runDrain(service.onUserScriptConnect)]
+      ] as const) {
+        const exit = yield* Effect.exit(drain)
+        expect(Exit.isFailure(exit) && !Exit.hasDies(exit), operation).toBe(true)
+        const error = yield* Effect.flip(drain)
+        expect(error.operation).toBe(operation)
+        expect(String(error.cause)).toContain(`chrome.runtime.${operation} is unavailable`)
+      }
+    }))
+
+    it.effect("message listeners never claim the response channel", () => Effect.gen(function*() {
+      const api = fake()
+      const service = make(api)
+      const respond = vi.fn()
+
+      for (const [source, stream] of [
+        [api.onMessage, service.onMessage],
+        [api.onMessageExternal, service.onMessageExternal],
+        [api.onUserScriptMessage, service.onUserScriptMessage]
+      ] as const) {
+        const consumer = yield* Effect.forkScoped(Stream.runCollect(Stream.take(stream, 1)))
+        yield* source.registered(1)
+        const [listener] = source.listeners
+        expect(listener?.("message", sender, respond)).toBeUndefined()
+        expect(yield* Fiber.join(consumer)).toEqual([{ message: "message", sender }])
+      }
+
+      expect(respond).not.toHaveBeenCalled()
+    }))
+
+    it.effect("gives concurrent subscribers independent 64-event buffers", () => Effect.gen(function*() {
+      const api = fake()
+      const service = make(api)
+
+      const consumers = yield* Effect.forEach(Array.from({ length: 16 }), () =>
+        Effect.forkScoped(Stream.runCollect(Stream.take(service.onInstalled, 64))))
+
+      yield* api.onInstalled.registered(16)
+
+      for (let index = 0; index < 100; index++) api.onInstalled.emit({ reason: "update", previousVersion: String(index) })
+
+      for (const values of yield* Effect.forEach(consumers, Fiber.join)) {
+        expect(values.map((details) => details.previousVersion)).toEqual(Array.from({ length: 64 }, (_, index) => String(36 + index)))
+      }
+
+      expect(api.onInstalled.listeners.size).toBe(0)
+      expect(api.onInstalled.removed).toHaveLength(16)
+    }))
+  })
+
+  describe("layers", () => {
+    it.effect("imports safely without chrome and fails layerLive with initialize", () => Effect.gen(function*() {
+      vi.stubGlobal("chrome", undefined)
+      const imported = yield* Effect.promise(() => import("../src/ChromeRuntime.js"))
+      expect(imported.layerLive).toBe(layerLive)
+
+      const missing = yield* Effect.flip(Effect.provide(resolve, layerLive))
+      expect(missing).toBeInstanceOf(ChromeRuntimeError)
+      expect(missing.operation).toBe("initialize")
+
+      vi.stubGlobal("chrome", {})
+      expect((yield* Effect.flip(Effect.provide(resolve, layerLive))).operation).toBe("initialize")
+    }))
+
+    it.effect("builds layerLive from a fake global, reading it only when built", () => Effect.gen(function*() {
+      const api = fake()
+      vi.stubGlobal("chrome", { runtime: api })
+
+      const program = Effect.gen(function*() {
+        const service = yield* ChromeRuntime
+
+        return [yield* service.id, yield* service.getVersion] as const
+      })
+
+      expect(yield* Effect.provide(program, layerLive)).toEqual(["extension-id", "1.0.0"])
+    }))
+
+    it.effect("fails with typed errors in a content-script runtime that lacks most members", () => Effect.gen(function*() {
+      const api = fake()
+      vi.stubGlobal("chrome", {
+        runtime: {
+          id: api.id, getManifest: api.getManifest, getURL: api.getURL, sendMessage: api.sendMessage,
+          onMessage: api.onMessage, onConnect: api.onConnect
+        }
+      })
+      const service = yield* Effect.provide(resolve, layerLive)
+      expect(yield* service.sendMessage("hello")).toEqual({ ok: true })
+
+      for (const [operation, effect] of [
+        ["getContexts", Effect.asVoid(service.getContexts({}))],
+        ["openOptionsPage", service.openOptionsPage],
+        ["restart", service.restart],
+        ["onInstalled", Stream.runDrain(service.onInstalled)],
+        ["onStartup", Stream.runDrain(service.onStartup)],
+        ["onMessageExternal", Stream.runDrain(service.onMessageExternal)]
+      ] as const) {
+        const exit = yield* Effect.exit(effect)
+        expect(Exit.hasDies(exit), operation).toBe(false)
+        expect((yield* Effect.flip(effect)).operation).toBe(operation)
+      }
+    }))
+
+    it.effect("provides an injected API through layer without a global", () => Effect.gen(function*() {
+      vi.stubGlobal("chrome", undefined)
+      const api = fake()
+      const service = yield* Effect.provide(resolve, layer(api))
+      expect(yield* service.getPlatformInfo).toEqual({ os: "mac", arch: "arm64" })
+    }))
+  })
 })
