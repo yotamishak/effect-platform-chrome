@@ -2,7 +2,7 @@
 /* oxlint-disable effecttsgo/unstable-api-usage */
 import { Deferred, Effect, Exit, Fiber, Option, Stream } from "effect"
 import { describe, expect, it } from "@effect/vitest"
-import { ChromeStorageError, make } from "../../src/ChromeStorage.js"
+import { ChromeStorageError, limits, make } from "../../src/ChromeStorage.js"
 import type { AreaName, Change, Changes, ChromeStorageApi, GetKeys, StorageAreaApi } from "../../src/ChromeStorage.js"
 import { makeStorage } from "../../src/testing/Storage.js"
 import { burst, expectOperations, gatedEvent, labelled, newest, pendingCalls, pendingCount } from "./support.js"
@@ -406,8 +406,95 @@ describe("ChromeStorage stress", () => {
     for (const name of writable) {
       const stored = yield* storage[name].get()
       expect(stored).toEqual(Object.fromEntries(replayed[name]))
-      expect(yield* storage[name].getKeys).toEqual(Array.from(replayed[name].keys()))
+      // Chrome lists keys in sorted order; these keys are ASCII, where `sort` agrees with it.
+      expect(yield* storage[name].getKeys).toEqual(Array.from(replayed[name].keys()).sort())
     }
+  }))
+
+  it.effect("keeps every listener's replica consistent while listeners write re-entrantly 2,048 times", () => Effect.gen(function*() {
+    const random = seeded(7)
+    const fixture = makeStorage()
+    const storage = make(fixture.api)
+    const replicas = Array.from({ length: 3 }, () => new Map<string, unknown>())
+    const mismatches: Array<string> = []
+    let budget = 2048
+
+    const replay = (replica: Map<string, unknown>, label: string) => (changes: Changes, name: AreaName) => {
+      if (name !== "local") return
+
+      for (const [key, change] of Object.entries(changes)) {
+        if (JSON.stringify(change.oldValue) !== JSON.stringify(replica.get(key))) mismatches.push(`${label}:${key}`)
+
+        if (Object.hasOwn(change, "newValue")) replica.set(key, change.newValue)
+        else replica.delete(key)
+      }
+    }
+
+    // The middle listener writes from inside the dispatch, as a listener running an Effect synchronously does.
+    fixture.api.onChanged.addListener(replay(replicas[0]!, "before"))
+    fixture.api.onChanged.addListener((changes, name) => {
+      replay(replicas[1]!, "writer")(changes, name)
+
+      if (name === "local" && budget > 0) {
+        budget--
+        const key = `k${Math.floor(random() * 16)}`
+        void (random() < 0.7 ? fixture.api.local.set({ [key]: Math.floor(random() * 8) }) : fixture.api.local.remove(key))
+      }
+    })
+    fixture.api.onChanged.addListener(replay(replicas[2]!, "after"))
+
+    for (let round = 0; budget > 0 && round < 4096; round++) {
+      yield* storage.local.set({ [`k${Math.floor(random() * 16)}`]: round })
+    }
+
+    expect(budget).toBe(0)
+    expect(mismatches).toEqual([])
+    const stored = yield* storage.local.get()
+
+    for (const replica of replicas) expect(Object.fromEntries(replica)).toEqual(stored)
+  }))
+
+  it.effect("never lets 512 seeded sync writes exceed Chrome's quotas, and rejected writes change nothing", () => Effect.gen(function*() {
+    const random = seeded(0x9007a)
+    const fixture = makeStorage()
+    const storage = make(fixture.api)
+    let events = 0
+    fixture.api.onChanged.addListener(() => { events++ })
+    const outcomes = new Map<string, number>()
+
+    for (let index = 0; index < 512; index++) {
+      // Phases of 128 writes from an empty area: tiny items over 700 keys reach MAX_ITEMS,
+      // then large ones straddle QUOTA_BYTES_PER_ITEM and QUOTA_BYTES.
+      const large = Math.floor(index / 128) % 2 === 1
+
+      if (index % 128 === 0) yield* storage.sync.clear
+      const before = { keys: yield* storage.sync.getKeys, bytes: yield* storage.sync.getBytesInUse(), events }
+
+      const items = Object.fromEntries(Array.from({ length: 1 + Math.floor(random() * (large ? 3 : 16)) }, () => [
+        `k${Math.floor(random() * 700)}`,
+        "x".repeat(Math.floor(random() * (large ? limits.sync.QUOTA_BYTES_PER_ITEM * 1.05 : 8)))
+      ]))
+
+      const exit = yield* Effect.exit(storage.sync.set(items))
+      const outcome = Exit.isSuccess(exit) ? "stored" : String(Option.getOrUndefined(Exit.findErrorOption(exit))?.cause)
+      outcomes.set(outcome, (outcomes.get(outcome) ?? 0) + 1)
+
+      if (Exit.isFailure(exit)) {
+        expect(yield* storage.sync.getKeys).toEqual(before.keys)
+        expect(yield* storage.sync.getBytesInUse()).toBe(before.bytes)
+        expect(events).toBe(before.events)
+      }
+
+      expect(yield* storage.sync.getBytesInUse()).toBeLessThanOrEqual(limits.sync.QUOTA_BYTES)
+      expect((yield* storage.sync.getKeys).length).toBeLessThanOrEqual(limits.sync.MAX_ITEMS)
+    }
+
+    expect(new Set(outcomes.keys())).toEqual(new Set([
+      "stored",
+      "Error: Resource::kQuotaBytesPerItem quota exceeded",
+      "Error: Resource::kQuotaBytes quota exceeded",
+      "Error: Resource::kMaxItems quota exceeded"
+    ]))
   }))
 
   it.effect("reads, measures, lists and clears a 20,000-key area in one change event", () => Effect.gen(function*() {
@@ -419,7 +506,8 @@ describe("ChromeStorage stress", () => {
     fixture.controls.seed("managed", items)
 
     const keys = Object.keys(items)
-    expect(yield* storage.local.getKeys).toEqual(keys)
+    // Chrome's sorted order ("key-10" before "key-2"); ASCII keys sort the same with `sort`.
+    expect(yield* storage.local.getKeys).toEqual([...keys].sort())
     expect(yield* storage.managed.getKeys).toHaveLength(count)
     expect(yield* storage.local.get(keys)).toEqual(items)
     expect(yield* storage.local.get([...keys, ...keys])).toEqual(items)

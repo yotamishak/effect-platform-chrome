@@ -39,8 +39,11 @@ export interface StorageAreaApi {
   readonly getKeys?: () => Promise<Array<string>>
 }
 
-/** The read-only members of `storage.managed`, which enterprise policy fills. */
-export type ManagedAreaApi = Pick<StorageAreaApi, "get" | "getBytesInUse" | "getKeys">
+/**
+ * The members of `storage.managed`, which enterprise policy fills: its items are read-only,
+ * but Chrome sets its access level like any other area's.
+ */
+export type ManagedAreaApi = Pick<StorageAreaApi, "get" | "getBytesInUse" | "getKeys" | "setAccessLevel">
 
 /** The Promise-based MV3 subset this module needs. */
 export interface ChromeStorageApi {
@@ -118,6 +121,13 @@ export interface ReadOnlyArea {
    * wake an MV3 service worker. Each subscription buffers at most 64 events, dropping the oldest.
    */
   readonly onChanged: Stream.Stream<Change, ChromeStorageError>
+  /**
+   * Restricts or opens the area to content scripts (Chrome 102+), `managed` included: its
+   * items are read-only, its access level is not. Chrome defaults `session` to trusted
+   * contexts only and the other areas to all contexts; tokens kept in `local` call this
+   * with `"TRUSTED_CONTEXTS"` before writing. Only trusted contexts may call it.
+   */
+  readonly setAccessLevel: (accessLevel: AccessLevel) => Effect.Effect<void, ChromeStorageError>
 }
 
 export interface WritableArea extends ReadOnlyArea {
@@ -125,20 +135,13 @@ export interface WritableArea extends ReadOnlyArea {
   readonly set: (items: Items) => Effect.Effect<void, ChromeStorageError>
   readonly remove: (keys: string | Array<string>) => Effect.Effect<void, ChromeStorageError>
   readonly clear: Effect.Effect<void, ChromeStorageError>
-  /**
-   * Restricts or opens the area to content scripts (Chrome 102+). Chrome defaults
-   * `session` to trusted contexts only and `local` and `sync` to all contexts; tokens kept
-   * in `local` call this with `"TRUSTED_CONTEXTS"` before writing. Only trusted contexts
-   * may call it.
-   */
-  readonly setAccessLevel: (accessLevel: AccessLevel) => Effect.Effect<void, ChromeStorageError>
 }
 
 export interface ChromeStorageService {
   readonly local: WritableArea
   readonly sync: WritableArea
   readonly session: WritableArea
-  /** Policy set by an administrator; read-only. */
+  /** Policy set by an administrator: read-only items, with a settable access level. */
   readonly managed: ReadOnlyArea
   /**
    * Changes in every area, as observational subscriptions that cannot wake an MV3 service
@@ -197,14 +200,7 @@ export const make = (api: ChromeStorageApi): ChromeStorageService => {
       // Called on the area, never detached, so native members keep their receiver.
       return target.getKeys === undefined ? unavailable(area, "getKeys") : target.getKeys()
     }),
-    onChanged: changes(area)
-  })
-
-  const writable = (area: "local" | "sync" | "session"): WritableArea => ({
-    ...readOnly(area),
-    set: (items) => call(area, "set", () => api[area].set(items)),
-    remove: (keys) => call(area, "remove", () => api[area].remove(keys)),
-    clear: call(area, "clear", () => api[area].clear()),
+    onChanged: changes(area),
     setAccessLevel: (accessLevel) => call(area, "setAccessLevel", () => {
       const target = api[area]
 
@@ -212,6 +208,13 @@ export const make = (api: ChromeStorageApi): ChromeStorageService => {
         ? unavailable(area, "setAccessLevel")
         : target.setAccessLevel({ accessLevel })
     })
+  })
+
+  const writable = (area: "local" | "sync" | "session"): WritableArea => ({
+    ...readOnly(area),
+    set: (items) => call(area, "set", () => api[area].set(items)),
+    remove: (keys) => call(area, "remove", () => api[area].remove(keys)),
+    clear: call(area, "clear", () => api[area].clear())
   })
 
   return ChromeStorage.of({

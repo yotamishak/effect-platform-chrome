@@ -68,7 +68,8 @@ const callsOn = (storage: ReturnType<typeof make>, name: AreaName): ReadonlyArra
   const reads = [
     ["get", Effect.asVoid(storage[name].get())],
     ["getBytesInUse", Effect.asVoid(storage[name].getBytesInUse())],
-    ["getKeys", Effect.asVoid(storage[name].getKeys)]
+    ["getKeys", Effect.asVoid(storage[name].getKeys)],
+    ["setAccessLevel", storage[name].setAccessLevel("TRUSTED_CONTEXTS")]
   ] as const
 
   if (name === "managed") return reads
@@ -78,8 +79,7 @@ const callsOn = (storage: ReturnType<typeof make>, name: AreaName): ReadonlyArra
     ...reads,
     ["set", area.set({ key: 1 })],
     ["remove", area.remove("key")],
-    ["clear", area.clear],
-    ["setAccessLevel", area.setAccessLevel("TRUSTED_CONTEXTS")]
+    ["clear", area.clear]
   ]
 }
 
@@ -187,10 +187,10 @@ describe("ChromeStorage calls", () => {
     expect(raw.getBytesInUse.mock.calls).toEqual([[], [null], [[]]])
   }))
 
-  it.effect("exposes only reads and changes for managed storage", () => Effect.gen(function*() {
+  it.effect("exposes only reads, changes and the access level for managed storage", () => Effect.gen(function*() {
     const f = fixture()
     const managed = make(f.api).managed
-    expect(Object.keys(managed).sort()).toEqual(["area", "get", "getBytesInUse", "getKeys", "onChanged"])
+    expect(Object.keys(managed).sort()).toEqual(["area", "get", "getBytesInUse", "getKeys", "onChanged", "setAccessLevel"])
     expect(yield* managed.get()).toEqual({ key: "value" })
     expect(yield* managed.getBytesInUse()).toBe(17)
     expect(yield* managed.getKeys).toEqual(["key"])
@@ -222,7 +222,7 @@ describe("ChromeStorage calls", () => {
       raw.setAccessLevel.mockImplementation(failing("setAccessLevel"))
       const storage = make(f.api)
       const calls = callsOn(storage, name)
-      expect(calls).toHaveLength(name === "managed" ? 3 : 7)
+      expect(calls).toHaveLength(name === "managed" ? 4 : 7)
 
       for (const [operation, effect] of calls) {
         const error = yield* Effect.flip(effect)
@@ -461,7 +461,8 @@ describe("ChromeStorage fixture", () => {
     expect(yield* storage.local.get({})).toEqual({})
     expect(yield* storage.local.getBytesInUse()).toBe(4)
     expect(yield* storage.local.getBytesInUse([])).toBe(0)
-    expect(yield* storage.local.getKeys).toEqual(["b", "a"])
+    // Chrome lists keys in its own sorted order, not insertion order.
+    expect(yield* storage.local.getKeys).toEqual(["a", "b"])
     expect(yield* storage.managed.getKeys).toEqual(["policy"])
     expect(yield* storage.managed.get()).toEqual({ policy: true })
     expect(yield* storage.session.getKeys).toEqual([])
@@ -546,5 +547,176 @@ describe("ChromeStorage fixture", () => {
     fixture.controls.onChanged.failNext("addListener", cause)
     expect(yield* Effect.flip(Stream.runDrain(storage.onChanged))).toMatchObject({ area: "all", operation: "onChanged", cause })
     expect(fixture.controls.onChanged.listenerCount).toBe(0)
+  }))
+})
+
+describe("ChromeStorage edge cases", () => {
+  it.effect("restricts managed policy to trusted contexts through setAccessLevel, which Chrome allows on every area", () => Effect.gen(function*() {
+    const f = fixture()
+    const managed = make(f.api).managed
+    const restrict = managed.setAccessLevel("TRUSTED_CONTEXTS")
+    expect(f.raw.managed.setAccessLevel).not.toHaveBeenCalled()
+    yield* restrict
+    expect(f.raw.managed.setAccessLevel).toHaveBeenCalledExactlyOnceWith({ accessLevel: "TRUSTED_CONTEXTS" })
+    expect(f.raw.managed.setAccessLevel.mock.contexts[0]).toBe(f.raw.managed)
+    const cause = new Error("Context cannot set the storage access level")
+    f.raw.managed.setAccessLevel.mockRejectedValueOnce(cause)
+    expect(yield* Effect.flip(managed.setAccessLevel("TRUSTED_CONTEXTS"))).toMatchObject({ area: "managed", operation: "setAccessLevel", cause })
+    const { setAccessLevel: _setAccessLevel, ...older } = f.raw.managed
+    const missing = yield* Effect.flip(make({ ...f.raw, managed: older }).managed.setAccessLevel("TRUSTED_CONTEXTS"))
+    expect(missing).toMatchObject({ area: "managed", operation: "setAccessLevel" })
+    expect(String(missing.cause)).toContain("storage.managed.setAccessLevel is unavailable")
+    expect(f.raw.managed.set).not.toHaveBeenCalled()
+  }))
+
+  it.effect("re-subscribes the same stream value after its registration failed", () => Effect.gen(function*() {
+    const f = fixture()
+    const cause = new Error("registration")
+    f.raw.onChanged.addListener.mockImplementationOnce(() => { throw cause })
+    const stream = make(f.api).sync.onChanged
+    expect(yield* Effect.flip(Stream.runDrain(stream))).toMatchObject({ area: "sync", operation: "onChanged", cause })
+    const fiber = yield* Effect.forkScoped(Stream.runCollect(Stream.take(stream, 1)))
+    yield* f.registered(1)
+    f.emit({ key: { newValue: 1 } }, "sync")
+    expect(yield* Fiber.join(fiber)).toEqual([{ area: "sync", changes: { key: { newValue: 1 } } }])
+    expect(f.listeners.size).toBe(0)
+  }))
+
+  it.effect("fixture: managed starts open to content scripts and records its access level", () => Effect.gen(function*() {
+    const fixture = makeStorage()
+    expect(fixture.controls.accessLevel("managed")).toBe("TRUSTED_AND_UNTRUSTED_CONTEXTS")
+    const storage = make(fixture.api)
+    yield* storage.managed.setAccessLevel("TRUSTED_CONTEXTS")
+    expect(fixture.controls.accessLevel("managed")).toBe("TRUSTED_CONTEXTS")
+    const cause = new Error("denied")
+    fixture.controls.failNext("managed", "setAccessLevel", cause)
+    expect(yield* Effect.flip(storage.managed.setAccessLevel("TRUSTED_AND_UNTRUSTED_CONTEXTS"))).toMatchObject({ cause })
+    expect(fixture.controls.accessLevel("managed")).toBe("TRUSTED_CONTEXTS")
+    expect(makeStorage({ managed: { setAccessLevel: undefined } }).api.managed).not.toHaveProperty("setAccessLevel")
+  }))
+
+  it.effect("fixture: lists keys, reads and reports changes in Chrome's key order, not insertion order", () => Effect.gen(function*() {
+    const fixture = makeStorage()
+    const storage = make(fixture.api)
+    const reported: Array<Array<string>> = []
+    fixture.api.onChanged.addListener((changes) => { reported.push(Object.keys(changes)) })
+    // Chrome keeps keys in std::map / base::Value::Dict order: UTF-8 bytes, so U+FFFD sorts before an emoji.
+    const inserted = ["b", "\u{1F600}", "a", "�", "Z", "é", "key-10", "key-9"]
+    const sorted = ["Z", "a", "b", "key-10", "key-9", "é", "�", "\u{1F600}"]
+
+    for (const name of writableAreas) {
+      yield* storage[name].set(Object.fromEntries(inserted.map((key) => [key, key])))
+      expect(yield* storage[name].getKeys).toEqual(sorted)
+      expect(Object.keys(yield* storage[name].get())).toEqual(sorted)
+      expect(Object.keys(yield* storage[name].get([...inserted].reverse()))).toEqual(sorted)
+      yield* storage[name].clear
+    }
+
+    expect(reported).toEqual(writableAreas.flatMap(() => [sorted, sorted]))
+  }))
+
+  it.effect("fixture: delivers a write made inside a change listener after the current change reached every listener", () => Effect.gen(function*() {
+    const fixture = makeStorage()
+    const storage = make(fixture.api)
+    const order: Array<string> = []
+
+    fixture.api.onChanged.addListener((changes, area) => {
+      order.push(`first:${area}:${String(changes["n"]?.newValue)}`)
+
+      // A re-entrant write, as a listener running an Effect synchronously makes.
+      if (changes["n"]?.newValue === 1) void fixture.api.local.set({ n: 2 })
+    })
+    fixture.api.onChanged.addListener((changes, area) => { order.push(`second:${area}:${String(changes["n"]?.newValue)}`) })
+    fixture.api.local.onChanged.addListener((changes) => { order.push(`local:${String(changes["n"]?.newValue)}`) })
+    yield* storage.local.set({ n: 1 })
+    // Chrome dispatches the area event before the global one, one change at a time.
+    expect(order).toEqual([
+      "local:1", "first:local:1", "second:local:1",
+      "local:2", "first:local:2", "second:local:2"
+    ])
+    expect(yield* storage.local.get("n")).toEqual({ n: 2 })
+  }))
+
+  it.effect("fixture: injected one-shot failures also apply to overridden members", () => Effect.gen(function*() {
+    const get = vi.fn(async (): Promise<Items> => ({ overridden: true }))
+    const set = vi.fn(async (_items: Items) => {})
+    const fixture = makeStorage({ local: { get, set } })
+    const storage = make(fixture.api)
+    const cause = new Error("injected")
+    fixture.controls.failNext("local", "get", cause)
+    fixture.controls.failNext("local", "set", cause)
+    expect(yield* Effect.flip(storage.local.get("x"))).toMatchObject({ area: "local", operation: "get", cause })
+    expect(yield* Effect.flip(storage.local.set({ x: 1 }))).toMatchObject({ area: "local", operation: "set", cause })
+    expect(get).not.toHaveBeenCalled()
+    expect(set).not.toHaveBeenCalled()
+    expect(yield* storage.local.get("x")).toEqual({ overridden: true })
+    yield* storage.local.set({ x: 1 })
+    expect(get).toHaveBeenCalledExactlyOnceWith("x")
+    expect(set).toHaveBeenCalledExactlyOnceWith({ x: 1 })
+    // A synchronous throw from an override still reaches the caller as a throw.
+    const thrown = new Error("argument")
+    const throwing = makeStorage({ sync: { remove: () => { throw thrown } } })
+    expect(() => throwing.api.sync.remove("x")).toThrow(thrown)
+  }))
+
+  it.effect("fixture: rejects sync writes beyond Chrome's per-item, total and item-count quotas atomically", () => Effect.gen(function*() {
+    const fixture = makeStorage()
+    const storage = make(fixture.api)
+    let events = 0
+    fixture.api.onChanged.addListener(() => { events++ })
+    // An item's size is its key plus its JSON: "k" + "\"…\"" is exactly QUOTA_BYTES_PER_ITEM here.
+    const fits = "x".repeat(limits.sync.QUOTA_BYTES_PER_ITEM - 3)
+    yield* storage.sync.set({ k: fits })
+    expect(yield* storage.sync.getBytesInUse("k")).toBe(limits.sync.QUOTA_BYTES_PER_ITEM)
+    const perItem = yield* Effect.flip(storage.sync.set({ a: 1, k: `${fits}x` }))
+    expect(perItem).toMatchObject({ area: "sync", operation: "set" })
+    expect(String(perItem.cause)).toContain("kQuotaBytesPerItem quota exceeded")
+    expect(yield* storage.sync.get()).toEqual({ k: fits })
+
+    // Twelve full items fit in QUOTA_BYTES; a thirteenth does not.
+    const full = Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`k${index}`, "x".repeat(limits.sync.QUOTA_BYTES_PER_ITEM - 5)]))
+    yield* storage.sync.clear
+    yield* storage.sync.set(full)
+    const total = yield* Effect.flip(storage.sync.set({ k12: "x".repeat(limits.sync.QUOTA_BYTES_PER_ITEM - 5) }))
+    expect(String(total.cause)).toContain("kQuotaBytes quota exceeded")
+    // Replacing an item counts only the difference.
+    yield* storage.sync.set({ k0: "small" })
+
+    yield* storage.sync.clear
+    const items = Object.fromEntries(Array.from({ length: limits.sync.MAX_ITEMS }, (_, index) => [`i${index}`, 0]))
+    yield* storage.sync.set(items)
+    const count = yield* Effect.flip(storage.sync.set({ extra: 0 }))
+    expect(String(count.cause)).toContain("kMaxItems quota exceeded")
+    yield* storage.sync.set({ i0: 1 })
+    expect(yield* storage.sync.getKeys).toHaveLength(limits.sync.MAX_ITEMS)
+    const before = events
+    expect(yield* Effect.flip(storage.sync.set({ extra: 0, i1: 2 }))).toMatchObject({ operation: "set" })
+    expect(events).toBe(before)
+    expect(yield* storage.sync.get("i1")).toEqual({ i1: 0 })
+    // Seeding is a test control, not a write: it ignores quotas.
+    fixture.controls.seed("sync", { ...items, extra: 0 })
+    expect(yield* storage.sync.getKeys).toHaveLength(limits.sync.MAX_ITEMS + 1)
+  }))
+
+  it.effect("fixture: rejects local and session writes beyond QUOTA_BYTES unless local has unlimitedStorage", () => Effect.gen(function*() {
+    const fixture = makeStorage()
+    const storage = make(fixture.api)
+    // "big" + "\"…\"" is exactly QUOTA_BYTES.
+    const fits = "x".repeat(limits.local.QUOTA_BYTES - 5)
+    yield* storage.local.set({ big: fits })
+    const local = yield* Effect.flip(storage.local.set({ more: 1 }))
+    expect(local).toMatchObject({ area: "local", operation: "set" })
+    expect(String(local.cause)).toContain("kQuotaBytes quota exceeded")
+    // Chrome's session quota is exclusive: reaching it exactly already fails.
+    const session = yield* Effect.flip(storage.session.set({ big: fits }))
+    expect(session).toMatchObject({ area: "session", operation: "set" })
+    expect(String(session.cause)).toContain("Session storage quota bytes exceeded")
+    expect(yield* storage.session.getKeys).toEqual([])
+    yield* storage.session.set({ big: fits.slice(1) })
+
+    const unlimited = make(makeStorage({ unlimitedStorage: true }).api)
+    yield* unlimited.local.set({ big: fits, more: fits })
+    expect(yield* unlimited.local.getKeys).toEqual(["big", "more"])
+    expect(yield* Effect.flip(unlimited.session.set({ big: fits }))).toMatchObject({ area: "session" })
   }))
 })
