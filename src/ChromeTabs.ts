@@ -13,6 +13,8 @@ export interface ChromeTabsApi {
   update(tabId: number | undefined, properties: chrome.tabs.UpdateProperties): Promise<chrome.tabs.Tab | undefined>
   remove(tabIds: number | Array<number>): Promise<void>
   sendMessage(tabId: number, message: unknown, options?: chrome.tabs.MessageSendOptions): Promise<unknown>
+  connect(tabId: number, connectInfo?: chrome.tabs.ConnectInfo): chrome.runtime.Port
+  captureVisibleTab(windowId: number, options: chrome.extensionTypes.ImageDetails): Promise<string>
   readonly onCreated: Pick<typeof chrome.tabs.onCreated, "addListener" | "removeListener">
   readonly onUpdated: Pick<typeof chrome.tabs.onUpdated, "addListener" | "removeListener">
   readonly onRemoved: Pick<typeof chrome.tabs.onRemoved, "addListener" | "removeListener">
@@ -38,6 +40,14 @@ export interface ChromeTabsService {
   readonly update: (tabId: number | undefined, properties: chrome.tabs.UpdateProperties) => Effect.Effect<chrome.tabs.Tab | undefined, ChromeTabsError>
   readonly remove: (tabIds: number | Array<number>) => Effect.Effect<void, ChromeTabsError>
   readonly sendMessage: (tabId: number, message: unknown, options?: chrome.tabs.MessageSendOptions) => Effect.Effect<unknown, ChromeTabsError>
+  /**
+   * Opens a port to the content scripts of a tab (one frame with `frameId`). The native port
+   * is returned unwrapped, for ChromeRpc.makeClientProtocol or ChromePort.adopt; the caller
+   * owns it. A tab with no listener disconnects the port at once, with `lastError` set.
+   */
+  readonly connect: (tabId: number, connectInfo?: chrome.tabs.ConnectInfo) => Effect.Effect<chrome.runtime.Port, ChromeTabsError>
+  /** A data URL of the visible area of the window's active tab (needs `<all_urls>` or activeTab). */
+  readonly captureVisibleTab: (windowId: number, options?: chrome.extensionTypes.ImageDetails) => Effect.Effect<string, ChromeTabsError>
   readonly onCreated: Stream.Stream<chrome.tabs.Tab, ChromeTabsError>
   readonly onUpdated: Stream.Stream<UpdatedEvent, ChromeTabsError>
   readonly onRemoved: Stream.Stream<RemovedEvent, ChromeTabsError>
@@ -92,6 +102,11 @@ export const make = (api: ChromeTabsApi): ChromeTabsService => ChromeTabs.of({
   sendMessage: (tabId, message, options) => invoke("sendMessage", () => options === undefined
     ? api.sendMessage(tabId, message)
     : api.sendMessage(tabId, message, options)),
+  connect: (tabId, connectInfo) => Effect.try({
+    try: () => connectInfo === undefined ? api.connect(tabId) : api.connect(tabId, connectInfo),
+    catch: (cause) => new ChromeTabsError({ operation: "connect", cause })
+  }),
+  captureVisibleTab: (windowId, options = {}) => invoke("captureVisibleTab", () => api.captureVisibleTab(windowId, options)),
   onCreated: observe("onCreated", api.onCreated, (tab) => tab),
   onUpdated: observe("onUpdated", api.onUpdated, (tabId, changeInfo, tab) => ({ tabId, changeInfo, tab })),
   onRemoved: observe("onRemoved", api.onRemoved, (tabId, removeInfo) => ({ tabId, removeInfo })),

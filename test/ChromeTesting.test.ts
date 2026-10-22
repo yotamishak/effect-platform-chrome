@@ -1,8 +1,9 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Effect, Fiber, Schema, Stream } from "effect"
+import { Effect, Exit, Fiber, Schema, Stream } from "effect"
 import { describe, expect, it } from "@effect/vitest"
-import { makeEvent, makePortPair, makeStorage } from "../src/ChromeTesting.js"
+import { makeEvent, makePortPair, makeStorage, makeTabs } from "../src/ChromeTesting.js"
+import * as ChromeTabs from "../src/ChromeTabs.js"
 import * as ChromeStorage from "../src/ChromeStorage.js"
 import * as ChromePort from "../src/ChromePort.js"
 
@@ -381,5 +382,57 @@ describe("ChromeTesting port pair", () => {
     expect(fixture.controls.right.disconnect.listenerCount).toBe(0)
     expect(fixture.controls.connected).toBe(false)
     fixture.controls.flush()
+  }))
+
+  it.effect("records storage access levels from Chrome's defaults", () => Effect.gen(function*() {
+    const fixture = makeStorage()
+    expect(fixture.controls.accessLevel("local")).toBe("TRUSTED_AND_UNTRUSTED_CONTEXTS")
+    expect(fixture.controls.accessLevel("session")).toBe("TRUSTED_CONTEXTS")
+    const storage = yield* ChromeStorage.ChromeStorage.pipe(Effect.provide(fixture.layer))
+    yield* storage.local.setAccessLevel("TRUSTED_CONTEXTS")
+    expect(fixture.controls.accessLevel("local")).toBe("TRUSTED_CONTEXTS")
+    fixture.controls.failNext("session", "setAccessLevel", new Error("denied"))
+    expect(yield* Effect.flip(storage.session.setAccessLevel("TRUSTED_CONTEXTS"))).toMatchObject({ operation: "setAccessLevel" })
+  }))
+})
+
+describe("ChromeTesting tabs", () => {
+  it.effect("keeps tabs in memory and emits their events", () => Effect.gen(function*() {
+    const fixture = makeTabs()
+    const tabs = yield* ChromeTabs.ChromeTabs.pipe(Effect.provide(fixture.layer))
+    const removed = yield* Effect.forkScoped(Stream.runCollect(Stream.take(tabs.onRemoved, 1)))
+    yield* Effect.promise(() => fixture.controls.onRemoved.waitForListener())
+    const created = yield* tabs.create({ url: "https://app.example/", active: false })
+    const seeded = fixture.controls.seed({ url: "https://other.example/", windowId: 2 })
+    expect(created.id).not.toBe(seeded.id)
+    expect((yield* tabs.query({ windowId: 2 })).map((tab) => tab.id)).toEqual([seeded.id])
+    expect((yield* tabs.query({ url: "https://app.example/" })).map((tab) => tab.id)).toEqual([created.id])
+    yield* tabs.update(created.id, { url: "https://app.example/next", active: true })
+    expect(yield* tabs.get(created.id ?? -1)).toMatchObject({ url: "https://app.example/next", active: true })
+    yield* tabs.remove(created.id ?? -1)
+    expect((yield* Fiber.join(removed))[0]?.tabId).toBe(created.id)
+    expect(yield* Effect.flip(tabs.get(created.id ?? -1))).toMatchObject({ operation: "get" })
+    expect(Exit.isFailure(yield* Effect.exit(tabs.sendMessage(seeded.id ?? -1, "hello")))).toBe(true)
+  }))
+
+  it.effect("hands out port pairs and accepts member overrides", () => Effect.gen(function*() {
+    let gets = 0
+
+    const fixture = makeTabs({
+      get: async (tabId) => {
+        gets++
+
+        return { ...fixture.controls.tab(tabId), id: tabId, index: 0, windowId: 1, highlighted: false, active: true, pinned: false, incognito: false, discarded: false, autoDiscardable: true, groupId: -1, frozen: false, selected: true, lastAccessed: 0, url: "about:blank" }
+      }
+    })
+
+    const tabs = yield* ChromeTabs.ChromeTabs.pipe(Effect.provide(fixture.layer))
+    expect((yield* tabs.get(4)).url).toBe("about:blank")
+    expect(gets).toBe(1)
+    const port = yield* tabs.connect(4, { name: "example-frame", frameId: 1 })
+    expect(port.name).toBe("example-frame")
+    expect(fixture.controls.connections).toHaveLength(1)
+    expect(fixture.controls.connections[0]).toMatchObject({ tabId: 4, connectInfo: { name: "example-frame", frameId: 1 } })
+    expect(yield* tabs.captureVisibleTab(1)).toBe("data:image/jpeg;base64,")
   }))
 })

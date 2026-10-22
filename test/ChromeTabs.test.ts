@@ -4,6 +4,7 @@ import { Effect, Fiber, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeTabs, ChromeTabsError, layer, layerLive, make } from "../src/ChromeTabs.js"
 import type { ChromeTabsApi } from "../src/ChromeTabs.js"
+import { makePortPair } from "../src/ChromeTesting.js"
 
 const tab: chrome.tabs.Tab = {
   id: 7, index: 0, windowId: 3, highlighted: false, active: true,
@@ -35,6 +36,8 @@ const mockApi = () => ({
   update: vi.fn(async (_tabId: number | undefined, _properties: chrome.tabs.UpdateProperties): Promise<chrome.tabs.Tab | undefined> => tab),
   remove: vi.fn(async (_tabIds: number | Array<number>) => {}),
   sendMessage: vi.fn(async (_tabId: number, _message: unknown, _options?: chrome.tabs.MessageSendOptions): Promise<unknown> => ({ ok: true })),
+  connect: vi.fn((_tabId: number, connectInfo?: chrome.tabs.ConnectInfo): chrome.runtime.Port => makePortPair(connectInfo?.name).left.port),
+  captureVisibleTab: vi.fn(async (_windowId: number, _options: chrome.extensionTypes.ImageDetails) => "data:image/jpeg;base64,AA=="),
   onCreated: event<[chrome.tabs.Tab]>(),
   onUpdated: event<[number, chrome.tabs.OnUpdatedInfo, chrome.tabs.Tab]>(),
   onRemoved: event<[number, chrome.tabs.OnRemovedInfo]>(),
@@ -357,5 +360,24 @@ describe("ChromeTabs", () => {
     expect(error.operation).toBe("onUpdated")
     expect(error.cause).toBe(cause)
     expect(api.onUpdated.removeListener).toHaveBeenCalledExactlyOnceWith(api.onUpdated.addListener.mock.calls[0]?.[0])
+  }))
+
+  it.effect("opens a frame port and returns the native port unwrapped", () => Effect.gen(function*() {
+    const api = mockApi()
+    const port = yield* make(api).connect(7, { name: "example-frame", frameId: 2 })
+    expect(port.name).toBe("example-frame")
+    expect(api.connect).toHaveBeenCalledExactlyOnceWith(7, { name: "example-frame", frameId: 2 })
+    yield* make(api).connect(8)
+    expect(api.connect.mock.calls[1]).toEqual([8])
+    const cause = new Error("No tab with id: 9.")
+    api.connect.mockImplementationOnce(() => { throw cause })
+    expect(yield* Effect.flip(make(api).connect(9))).toMatchObject({ operation: "connect", cause })
+  }))
+
+  it.effect("captures the visible tab with default image options", () => Effect.gen(function*() {
+    const api = mockApi()
+    expect(yield* make(api).captureVisibleTab(3)).toBe("data:image/jpeg;base64,AA==")
+    yield* make(api).captureVisibleTab(3, { format: "jpeg", quality: 60 })
+    expect(api.captureVisibleTab.mock.calls).toEqual([[3, {}], [3, { format: "jpeg", quality: 60 }]])
   }))
 })

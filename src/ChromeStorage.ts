@@ -8,6 +8,9 @@ export type GetKeys = string | Array<string> | Items | null
 
 export type Keys = string | Array<string> | null
 
+/** Who may use an area: extension pages and the worker only, or content scripts as well. */
+export type AccessLevel = `${chrome.storage.AccessLevel}`
+
 /** Promise-based storage boundary; unrelated Chrome members are not required by injected APIs. */
 export interface StorageAreaApi {
   readonly get: (keys: GetKeys) => Promise<Items>
@@ -15,6 +18,8 @@ export interface StorageAreaApi {
   readonly set: (items: Items) => Promise<void>
   readonly remove: (keys: string | Array<string>) => Promise<void>
   readonly clear: () => Promise<void>
+  /** Optional so injected APIs without it still fit; calling it then fails with a typed error. */
+  readonly setAccessLevel?: (options: { readonly accessLevel: AccessLevel }) => Promise<void>
 }
 
 export interface StorageApi {
@@ -53,6 +58,12 @@ export interface WritableArea extends ReadOnlyArea {
   readonly set: (items: Items) => Effect.Effect<void, ChromeStorageError>
   readonly remove: (keys: string | Array<string>) => Effect.Effect<void, ChromeStorageError>
   readonly clear: Effect.Effect<void, ChromeStorageError>
+  /**
+   * Restricts or opens the area to content scripts. Chrome defaults `session` to trusted
+   * contexts only and `local` to all contexts; tokens kept in `local` call this with
+   * `"TRUSTED_CONTEXTS"` before writing.
+   */
+  readonly setAccessLevel: (accessLevel: AccessLevel) => Effect.Effect<void, ChromeStorageError>
 }
 
 export interface Service {
@@ -110,7 +121,14 @@ export const make = (api: StorageApi): Service => {
     ...readOnly(area),
     set: (items) => call(area, "set", () => api[area].set(items)),
     remove: (keys) => call(area, "remove", () => api[area].remove(keys)),
-    clear: call(area, "clear", () => api[area].clear())
+    clear: call(area, "clear", () => api[area].clear()),
+    setAccessLevel: (accessLevel) => call(area, "setAccessLevel", () => {
+      const target = api[area]
+
+      return target.setAccessLevel === undefined
+        ? Promise.reject(new Error(`storage.${area}.setAccessLevel is unavailable`))
+        : target.setAccessLevel({ accessLevel })
+    })
   })
 
   return ChromeStorage.of({
@@ -123,7 +141,7 @@ export const make = (api: StorageApi): Service => {
 }
 
 /** Resolves the global only when the layer is built, never during import. */
-export const layer = Layer.effect(ChromeStorage, Effect.try({
+export const layerLive = Layer.effect(ChromeStorage, Effect.try({
   try: () => {
     if (typeof chrome === "undefined" || chrome.storage === undefined) {
       throw new Error("Chrome storage API is unavailable")
@@ -133,3 +151,6 @@ export const layer = Layer.effect(ChromeStorage, Effect.try({
   },
   catch: (cause) => new ChromeStorageError({ area: "all", operation: "initialize", cause })
 }))
+
+/** The same live layer as `layerLive`, under this module's original name. */
+export const layer = layerLive

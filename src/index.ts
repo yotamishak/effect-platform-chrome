@@ -24,4 +24,14 @@ export * as ChromePermissions from "./ChromePermissions.js"
 
 export * as ChromeScripting from "./ChromeScripting.js"
 
+export * as ChromeIdentity from "./ChromeIdentity.js"
+
+export * as ChromeWebNavigation from "./ChromeWebNavigation.js"
+
+export * as ChromeCookies from "./ChromeCookies.js"
+
+export * as ChromeNotifications from "./ChromeNotifications.js"
+
+export * as ChromeWindows from "./ChromeWindows.js"
+
 export * as ChromeTesting from "./ChromeTesting.js"
