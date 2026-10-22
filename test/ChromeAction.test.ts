@@ -744,6 +744,96 @@ describe("makeAction", () => {
     expect(yield* action.getUserSettings).toEqual({ isOnToolbar: true })
   }))
 
+  it.effect("hands out state snapshots whose mutation reaches neither this fixture nor a fresh one", () => Effect.gen(function*() {
+    const fixture = makeAction()
+    const action = make(fixture.api)
+    yield* action.setBadgeBackgroundColor({ color: red, tabId: 1 })
+    const defaults = fixture.controls.state()
+    defaults.badgeBackgroundColor[0] = 99
+    defaults.badgeTextColor[3] = 99
+    fixture.controls.state(1).badgeBackgroundColor[1] = 99
+    expect(fixture.controls.state().badgeBackgroundColor).toEqual([0, 0, 0, 0])
+    expect(fixture.controls.state().badgeTextColor).toEqual([0, 0, 0, 0])
+    expect(yield* action.getBadgeBackgroundColor({ tabId: 1 })).toEqual(red)
+    const fresh = make(makeAction().api)
+    expect(yield* fresh.getBadgeBackgroundColor()).toEqual([0, 0, 0, 0])
+    expect(yield* fresh.getBadgeTextColor()).toEqual([0, 0, 0, 0])
+  }))
+
+  it.effect("keeps the icon Chrome received when the caller later mutates its details", () => Effect.gen(function*() {
+    const fixture = makeAction()
+    const action = make(fixture.api)
+    const path = { "16": "a-16.png" }
+    const details = { path, tabId: 2 }
+    yield* action.setIcon(details)
+    path["16"] = "b-16.png"
+    details.tabId = 3
+    expect(fixture.controls.state(2).icon).toEqual({ path: { "16": "a-16.png" }, tabId: 2 })
+    expect(fixture.controls.state(3).icon).toBeUndefined()
+    const snapshot = fixture.controls.state(2).icon
+
+    if (snapshot !== undefined) snapshot.tabId = 9
+
+    expect(fixture.controls.state(2).icon).toEqual({ path: { "16": "a-16.png" }, tabId: 2 })
+  }))
+
+  it.effect("rejects setIcon details without an image, as Chrome's bindings do before the tab lookup", () => Effect.gen(function*() {
+    const fixture = makeAction()
+    const action = make(fixture.api)
+    fixture.controls.closeTab(4)
+    const imageDataError = "The imageData property must contain an ImageData object or dictionary of ImageData objects."
+
+    // Untyped JavaScript can pass Chrome details the declared union forbids.
+    const invalid: ReadonlyArray<readonly [string, string]> = [
+      ["{}", "Either the path or imageData property must be specified."],
+      ["{\"tabId\": 4}", "Either the path or imageData property must be specified."],
+      ["{\"path\": {}}", "The path property must not be empty."],
+      ["{\"imageData\": {}}", imageDataError],
+      ["{\"imageData\": {\"16\": {\"width\": 16}}}", imageDataError],
+      ["{\"imageData\": {\"width\": 16, \"height\": 16}}", imageDataError]
+    ]
+
+    for (const [json, message] of invalid) {
+      const details: chrome.action.TabIconDetails = JSON.parse(json)
+      const error = yield* Effect.flip(action.setIcon(details))
+      expect(error).toMatchObject({ operation: "setIcon" })
+      expect(error.cause).toMatchObject({ message })
+    }
+
+    expect(fixture.controls.state().icon).toBeUndefined()
+    const imageData: ImageData = JSON.parse("{\"width\": 1, \"height\": 1, \"data\": [0, 0, 0, 255]}")
+    yield* action.setIcon({ imageData, tabId: 1 })
+    yield* action.setIcon({ imageData: { "32": imageData }, path: { "16": "a.png" }, tabId: 2 })
+    expect(fixture.controls.state(1).icon).toEqual({ imageData, tabId: 1 })
+    expect((yield* Effect.flip(action.setIcon({ imageData, tabId: 4 }))).cause).toMatchObject({ message: "No tab with id: 4." })
+  }))
+
+  it.effect("refuses openPopup while the action is disabled on the active tab, as Chrome does", () => Effect.gen(function*() {
+    const fixture = makeAction({ popup: "popup.html" })
+    const action = make(fixture.api)
+    const noPopup = { message: "Extension does not have a popup on the active tab." }
+    yield* action.disable()
+    expect((yield* Effect.flip(action.openPopup())).cause).toMatchObject(noPopup)
+    fixture.controls.activateTab(3)
+    yield* action.enable(3)
+    yield* action.openPopup({ windowId: 1 })
+    yield* action.disable(3)
+    expect((yield* Effect.flip(action.openPopup())).cause).toMatchObject(noPopup)
+    fixture.controls.activateTab(4)
+    expect((yield* Effect.flip(action.openPopup())).cause).toMatchObject(noPopup)
+    yield* action.enable()
+    yield* action.openPopup({ windowId: 2 })
+    expect(fixture.controls.openedPopups).toEqual([{ windowId: 1 }, { windowId: 2 }])
+  }))
+
+  it.effect("records openPopup options as Chrome received them", () => Effect.gen(function*() {
+    const fixture = makeAction({ popup: "popup.html" })
+    const options = { windowId: 1 }
+    yield* make(fixture.api).openPopup(options)
+    options.windowId = 2
+    expect(fixture.controls.openedPopups).toEqual([{ windowId: 1 }])
+  }))
+
   it.effect("provides its layer and lets overrides replace members", () => Effect.gen(function*() {
     const cause = new Error("Could not find an active browser window.")
     const fixture = makeAction({ popup: "popup.html" }, { openPopup: () => Promise.reject(cause), getTitle: async () => "Override" })

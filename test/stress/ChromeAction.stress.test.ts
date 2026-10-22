@@ -640,6 +640,65 @@ describe("makeAction stress", () => {
     expect(opened.length).toBeLessThan(2048)
   }))
 
+  it.effect("decides 2,048 openPopup calls racing 2,048 enable and disable calls by the state each one meets", () => Effect.gen(function*() {
+    const random = seeded(4242)
+    const base = makeAction({ popup: "popup.html" })
+    base.controls.activateTab(3)
+    const received: Array<{ readonly kind: "toggle", readonly enabled: boolean } | { readonly kind: "open", readonly windowId: number }> = []
+
+    const fixture = makeAction({}, {
+      enable: (tabId) => {
+        received.push({ kind: "toggle", enabled: true })
+
+        return base.api.enable(tabId)
+      },
+      disable: (tabId) => {
+        received.push({ kind: "toggle", enabled: false })
+
+        return base.api.disable(tabId)
+      },
+      openPopup: (options) => {
+        received.push({ kind: "open", windowId: options?.windowId ?? -1 })
+
+        if (base.api.openPopup === undefined) throw new Error("the fixture always has openPopup")
+
+        return base.api.openPopup(options)
+      }
+    })
+
+    const action = make(fixture.api)
+
+    const operations = Array.from({ length: 4096 }, (_, index) => {
+      if (index % 2 === 0) return action.openPopup({ windowId: index })
+
+      return random() < 0.5 ? action.enable(3) : action.disable(3)
+    })
+
+    const exits = yield* Effect.forEach(operations, Effect.exit, { concurrency: "unbounded" })
+    const expectOpen = new Map<number, boolean>()
+    let enabled = true
+
+    for (const entry of received) {
+      if (entry.kind === "toggle") enabled = entry.enabled
+      else expectOpen.set(entry.windowId, enabled)
+    }
+
+    expect(received).toHaveLength(4096)
+    expect(expectOpen.size).toBe(2048)
+
+    for (const [index, exit] of exits.entries()) {
+      if (index % 2 === 1) expect(exit).toEqual(Exit.void)
+      else if (expectOpen.get(index) === true) expect(exit).toEqual(Exit.void)
+      else expect((yield* Effect.flip(exit)).cause).toMatchObject({ message: "Extension does not have a popup on the active tab." })
+    }
+
+    const opened = base.controls.openedPopups.map((options) => options?.windowId)
+    expect(opened).toEqual([...expectOpen.entries()].flatMap(([windowId, open]) => open ? [windowId] : []))
+    expect(opened.length).toBeGreaterThan(0)
+    expect(opened.length).toBeLessThan(2048)
+    expect(yield* action.isEnabled(3)).toBe(enabled)
+  }))
+
   it.effect("delivers 4,096 simulated clicks to 64 subscribers, each keeping the newest 64", () => Effect.gen(function*() {
     const fixture = makeAction()
     const registered = gate()

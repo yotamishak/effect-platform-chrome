@@ -39,6 +39,44 @@ const transparent: ChromeAction.ColorArray = [0, 0, 0, 0]
 
 const invalidColor = "The color specification could not be parsed."
 
+const imageDataError = "The imageData property must contain an ImageData object or dictionary of ImageData objects."
+
+/**
+ * Chrome's own ImageData sniff: an object with `width`, `height` and `data`. Untyped callers
+ * may pass anything, so a primitive is refused before `in` could throw on it.
+ */
+const looksLikeImageData = (value: chrome.action.TabIconDetails["imageData"]): boolean =>
+  value instanceof Object && "width" in value && "height" in value && "data" in value
+
+/**
+ * Chrome's setIcon bindings run before the request reaches the browser: `imageData` wins over
+ * `path`, a dictionary needs at least one entry, and every `imageData` entry must look like
+ * ImageData. Loading a `path` is not modelled.
+ */
+const checkIcon = (details: chrome.action.TabIconDetails) => {
+  if ("imageData" in details) {
+    const { imageData } = details
+
+    if (looksLikeImageData(imageData)) return
+
+    const entries: ReadonlyArray<ImageData> = imageData instanceof Object ? Object.values(imageData) : []
+
+    if (entries.length === 0 || !entries.every(looksLikeImageData)) throw new Error(imageDataError)
+
+    return
+  }
+
+  if ("path" in details) {
+    if (details.path instanceof Object && Object.keys(details.path).length === 0) {
+      throw new Error("The path property must not be empty.")
+    }
+
+    return
+  }
+
+  throw new Error("Either the path or imageData property must be specified.")
+}
+
 const isChannel = (value: number) => Number.isInteger(value) && value >= 0 && value <= 255
 
 const hexColor = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i
@@ -109,11 +147,12 @@ const parseColor = (color: string | ChromeAction.ColorArray): ChromeAction.Color
  * colors start transparent; title and popup start from the manifest, and popups are reported
  * as absolute `chrome-extension://<extensionId>/…` URLs. Chrome's checks are modelled: a
  * negative or fractional tab id, a tab closed with `controls.closeTab`, an unparseable or (for
- * the text color) fully transparent color, badge text over 100 bytes and a popup outside the
- * extension all reject. `controls.click` models a toolbar click: it opens the popup when one is
- * set, otherwise fires `onClicked`. `openPopup` fails unless the active tab
- * (`controls.activateTab`, the defaults until one is set) has a popup; windows are not modelled.
- * Pass `overrides` to replace any member.
+ * the text color) fully transparent color, badge text over 100 bytes, a popup outside the
+ * extension and setIcon details without an image all reject. Icons are copied when set, and
+ * `controls.state` returns fresh copies. `controls.click` models a toolbar click: it opens the
+ * popup when one is set, otherwise fires `onClicked`. `openPopup` fails unless the action is
+ * enabled and has a popup on the active tab (`controls.activateTab`, the defaults until one is
+ * set); windows are not modelled. Pass `overrides` to replace any member.
  */
 export const makeAction = (options: ActionOptions = {}, overrides: Partial<ChromeAction.ChromeActionApi> = {}) => {
   const origin = `chrome-extension://${options.extensionId ?? "test-extension"}/`
@@ -138,13 +177,18 @@ export const makeAction = (options: ActionOptions = {}, overrides: Partial<Chrom
 
   const defaults: Overrides = { title: options.title ?? "", popup: resolvePopup(options.popup ?? "") }
 
-  /** Chrome's schema requires a non-negative integer tab id, and the tab must be open. */
-  const checkTab = (tabId: number | null | undefined) => {
+  /** Chrome's schema requires a non-negative integer tab id. */
+  const checkTabSchema = (tabId: number | null | undefined) => {
     if (tabId === undefined || tabId === null) return
 
     if (!Number.isInteger(tabId) || tabId < 0) throw new TypeError(`Error at property 'tabId': ${tabId} is not an integer of at least 0.`)
+  }
 
-    if (closed.has(tabId)) throw new Error(`No tab with id: ${tabId}.`)
+  /** The schema check, then the browser's lookup: the tab must be open. */
+  const checkTab = (tabId: number | null | undefined) => {
+    checkTabSchema(tabId)
+
+    if (tabId !== undefined && tabId !== null && closed.has(tabId)) throw new Error(`No tab with id: ${tabId}.`)
   }
 
   const scope = (tabId: number | null | undefined): Overrides => {
@@ -164,15 +208,17 @@ export const makeAction = (options: ActionOptions = {}, overrides: Partial<Chrom
 
   const state = (tabId?: number): ActionState => {
     const tab = tabId === undefined ? {} : tabs.get(tabId) ?? {}
+    const icon = tab.icon ?? defaults.icon
 
+    // Fresh copies, so a caller mutating a snapshot changes neither this fixture nor another.
     return {
       badgeText: tab.badgeText ?? defaults.badgeText ?? "",
-      badgeBackgroundColor: tab.badgeBackgroundColor ?? defaults.badgeBackgroundColor ?? transparent,
-      badgeTextColor: tab.badgeTextColor ?? defaults.badgeTextColor ?? transparent,
+      badgeBackgroundColor: [...tab.badgeBackgroundColor ?? defaults.badgeBackgroundColor ?? transparent],
+      badgeTextColor: [...tab.badgeTextColor ?? defaults.badgeTextColor ?? transparent],
       title: tab.title ?? defaults.title ?? "",
       popup: tab.popup ?? defaults.popup ?? "",
       enabled: tab.enabled ?? defaults.enabled ?? true,
-      icon: tab.icon ?? defaults.icon
+      icon: icon === undefined ? undefined : structuredClone(icon)
     }
   }
 
@@ -226,7 +272,12 @@ export const makeAction = (options: ActionOptions = {}, overrides: Partial<Chrom
       target.badgeTextColor = parsed
     },
     getBadgeTextColor: async ({ tabId }) => [...read(tabId).badgeTextColor],
-    setIcon: async (details) => { scope(details.tabId).icon = details },
+    setIcon: async (details) => {
+      checkTabSchema(details.tabId)
+      checkIcon(details)
+      // Chrome converts the icon when called, so later changes to the caller's details are not seen.
+      scope(details.tabId).icon = structuredClone(details)
+    },
     setTitle: async ({ tabId, title }) => { scope(tabId).title = title },
     getTitle: async ({ tabId }) => read(tabId).title,
     setPopup: async ({ tabId, popup }) => {
@@ -238,9 +289,12 @@ export const makeAction = (options: ActionOptions = {}, overrides: Partial<Chrom
     disable: async (tabId) => { scope(tabId).enabled = false },
     isEnabled: async (tabId) => read(tabId).enabled,
     openPopup: async (popupOptions) => {
-      if (state(activeTabId).popup === "") throw new Error("Extension does not have a popup on the active tab.")
+      const active = state(activeTabId)
 
-      openedPopups.push(popupOptions)
+      // Chrome also refuses when the action is disabled on the active tab.
+      if (active.popup === "" || !active.enabled) throw new Error("Extension does not have a popup on the active tab.")
+
+      openedPopups.push(popupOptions === undefined ? undefined : { ...popupOptions })
     },
     getUserSettings: async () => ({ ...userSettings }),
     onClicked: clicked.api,

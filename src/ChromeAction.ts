@@ -76,7 +76,7 @@ export interface ChromeActionService {
   /**
    * Takes an extension-relative image `path` or `imageData` (an `ImageData`, which a service
    * worker can draw with `OffscreenCanvas`), or either keyed by pixel size. Chrome cannot
-   * report the icon back.
+   * report the icon back. Chrome rejects an empty dictionary, and fails a `path` it cannot load.
    */
   readonly setIcon: (details: chrome.action.TabIconDetails) => Effect.Effect<void, ChromeActionError>
   /** The tooltip shown when the user hovers over the action. */
@@ -101,7 +101,8 @@ export interface ChromeActionService {
   /**
    * Opens the popup in the given window, or in the active one; needs no user gesture
    * (Chrome 127+; Chrome 118 to 126 allow it only to policy-installed extensions). Fails
-   * when the active tab of that window has no popup, when the window is not the focused one
+   * when the active tab of that window has no popup or the action is disabled there (both
+   * report `Extension does not have a popup on the active tab.`), when the window is not the focused one
    * (focus it with `ChromeWindows.focus` first), when Chrome finds no browser window, or when
    * a popup is already showing.
    */
