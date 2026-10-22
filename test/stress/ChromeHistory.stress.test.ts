@@ -1,5 +1,6 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
+import { isDeepStrictEqual } from "node:util"
 import { Cause, Deferred, Effect, Exit, Fiber, Option, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeHistoryError, make } from "../../src/ChromeHistory.js"
@@ -207,7 +208,38 @@ describe("ChromeHistory stress", () => {
     expect([gate.added, gate.removed]).toEqual([32, 32])
   }))
 
-  it.effect.each(events)("$operation churns 512 subscriptions interrupted at every stage down to zero listeners", ({ operation, setup, expected }) => Effect.gen(function*() {
+  it.effect.each(events)("$operation isolates 32 subscriptions that each mutate all 64 events they receive", ({ setup, expected }) => Effect.gen(function*() {
+    let gate = tracked(makeEvent<[]>().api)
+
+    const { stream, emit, listenerCount } = setup((event) => {
+      const wrapped = tracked(event)
+      gate = wrapped
+
+      return wrapped.source
+    })
+
+    /** Records whether the value arrived untouched by other consumers, then scribbles on it. */
+    const inspect = (value: HistoryItem | RemovedResult, index: number) => Effect.sync(() => {
+      const pristine = isDeepStrictEqual(value, expected(index))
+
+      if ("urls" in value) value.urls.push("https://scribbled.example/")
+      else value.title = "scribbled"
+
+      return pristine
+    })
+
+    const consumer = Stream.runCollect(Stream.mapEffect(Stream.zipWithIndex(Stream.take(stream, 64)), ([value, index]) => inspect(value, index)))
+    const fibers = yield* Effect.forEach(range(0, 32), () => Effect.forkScoped(consumer))
+    yield* Effect.promise(() => gate.waitFor(32))
+
+    for (let index = 0; index < 64; index++) emit(index)
+
+    for (const pristine of yield* Effect.forEach(fibers, Fiber.join)) expect(pristine).toStrictEqual(range(0, 64).map(() => true))
+
+    expect(listenerCount()).toBe(0)
+  }))
+
+  it.effect.each(events)("$operation churns 512 subscriptions interrupted at every stage down to zero listeners",({ operation, setup, expected }) => Effect.gen(function*() {
     const random = seeded(0x0151_7a9e)
     let gate = tracked(makeEvent<[]>().api)
 
@@ -490,11 +522,11 @@ describe("makeHistory stress", () => {
 
     const pages = fixture.controls.pages()
     expect(pages).toHaveLength(10_000)
-    expect(pages.reduce((total, item) => total + (item.visitCount ?? 0), 0)).toBe(40_000)
+    expect(pages.reduce((total, item) => total + item.visitCount, 0)).toBe(40_000)
 
     const all = yield* history.search({ text: "", maxResults: 0 })
     expect(all).toHaveLength(10_000)
-    expect(all.every((item, index) => index === 0 || (all[index - 1]?.lastVisitTime ?? 0) >= (item.lastVisitTime ?? 0))).toBe(true)
+    expect(all.every((item, index) => index === 0 || (all[index - 1]?.lastVisitTime ?? 0) >= item.lastVisitTime)).toBe(true)
     expect(yield* history.search({ text: "" })).toStrictEqual(all.slice(0, 100))
     expect(yield* history.search({ text: "site-9999" })).toHaveLength(1)
 
@@ -502,12 +534,12 @@ describe("makeHistory stress", () => {
     yield* Effect.promise(fixture.controls.onVisitRemoved.waitForListener)
     yield* history.deleteRange({ startTime: now - 500_000, endTime: now })
     const remaining = fixture.controls.pages()
-    expect(remaining.every((item) => (item.lastVisitTime ?? now) < now - 500_000)).toBe(true)
+    expect(remaining.every((item) => item.lastVisitTime < now - 500_000)).toBe(true)
     yield* history.deleteAll
     const [ranged, cleared] = yield* Fiber.join(fiber)
     expect(ranged?.allHistory).toBe(false)
     const kept = new Set(remaining.map((item) => item.url))
-    const purged = pages.flatMap((item) => item.url === undefined || kept.has(item.url) ? [] : [item.url])
+    const purged = pages.flatMap((item) => kept.has(item.url) ? [] : [item.url])
     expect(purged.length).toBeGreaterThan(0)
     expect(kept.size).toBeGreaterThan(0)
     expect(ranged?.urls).toHaveLength(purged.length)
@@ -554,5 +586,27 @@ describe("makeHistory stress", () => {
     expect(fixture.controls.pages()).toHaveLength(1024)
     expect(fixture.controls.onVisited.listenerCount).toBe(0)
     expect(yield* history.search({ text: "concurrent", maxResults: 0 })).toHaveLength(1024)
+  }))
+
+  it.effect("records only the recordable half of 2,048 concurrent addUrl calls mixing in Chrome's internal schemes", () => Effect.gen(function*() {
+    const random = seeded(0x5c4e3e)
+    const fixture = makeHistory()
+    fixture.controls.setNow(now)
+    const history = make(fixture.api)
+    const internal = ["about:blank", "chrome://settings/", "javascript:void(0)", "view-source:https://a.example/", "devtools://devtools/x", "chrome-untrusted://t/"]
+    let visited = 0
+    fixture.api.onVisited.addListener(() => { visited += 1 })
+
+    const urls = range(0, 2048).map((index) => random() < 0.5
+      ? internal[Math.floor(random() * internal.length)] ?? "about:blank"
+      : `https://kept-${index % 512}.example/`)
+
+    yield* Effect.forEach(urls, (address) => history.addUrl(address), { concurrency: "unbounded", discard: true })
+    const recordable = urls.filter((address) => address.startsWith("https://kept-"))
+    expect(recordable.length).toBeGreaterThan(900)
+    expect(visited).toBe(recordable.length)
+    const pages = yield* history.search({ text: "", maxResults: 0 })
+    expect(new Set(pages.map((item) => item.url))).toEqual(new Set(recordable))
+    expect(pages.reduce((total, item) => total + item.visitCount, 0)).toBe(recordable.length)
   }))
 })

@@ -1,7 +1,7 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Effect, Exit, Fiber, Stream } from "effect"
-import { describe, expect, it, vi } from "@effect/vitest"
+import { Deferred, Effect, Exit, Fiber, Stream } from "effect"
+import { describe, expect, expectTypeOf, it, vi } from "@effect/vitest"
 import { ChromeHistory, ChromeHistoryError, layer, layerLive, make } from "../src/ChromeHistory.js"
 import type { ChromeHistoryApi, ChromeHistoryService, HistoryItem, HistoryQuery, Range, RemovedResult, VisitItem } from "../src/ChromeHistory.js"
 import { makeEvent } from "../src/testing/Event.js"
@@ -40,8 +40,8 @@ const mockApi = () => {
 
   return {
     api: {
-      search: vi.fn((_query: HistoryQuery) => respond("search", [page])),
-      getVisits: vi.fn((_details: chrome.history.UrlDetails) => respond("getVisits", [visit])),
+      search: vi.fn((_query: HistoryQuery) => respond<Array<chrome.history.HistoryItem>>("search", [page])),
+      getVisits: vi.fn((_details: chrome.history.UrlDetails) => respond<Array<chrome.history.VisitItem>>("getVisits", [visit])),
       addUrl: vi.fn((_details: chrome.history.UrlDetails) => respond("addUrl", undefined)),
       deleteUrl: vi.fn((_details: chrome.history.UrlDetails) => respond("deleteUrl", undefined)),
       deleteRange: vi.fn((_range: Range) => respond("deleteRange", undefined)),
@@ -190,6 +190,55 @@ describe("ChromeHistory", () => {
     const history = make(mock.api)
     expect(yield* history.search({ text: "nothing" })).toEqual([])
     expect(yield* history.getVisits("https://never.example/")).toEqual([])
+  }))
+
+  it.effect("types every field Chrome always sets as present, filling a field a non-conforming API leaves out", () => Effect.gen(function*() {
+    expectTypeOf<HistoryItem>().toEqualTypeOf<{ id: string; url: string; title: string; lastVisitTime: number; visitCount: number; typedCount: number }>()
+    expectTypeOf<VisitItem["visitTime"]>().toEqualTypeOf<number>()
+    const mock = mockApi()
+    const extra = { ...page, future: true }
+    mock.api.search.mockResolvedValueOnce([{ id: "7" }, extra])
+    mock.api.getVisits.mockResolvedValueOnce([{ id: "7", visitId: "8", referringVisitId: "0", transition: "link", isLocal: true }])
+    const history = make(mock.api)
+    expect(yield* history.search({ text: "" })).toStrictEqual([
+      { id: "7", url: "", title: "", lastVisitTime: 0, visitCount: 0, typedCount: 0 },
+      extra
+    ])
+    expect(yield* history.getVisits(url)).toStrictEqual([{ id: "7", visitId: "8", referringVisitId: "0", transition: "link", isLocal: true, visitTime: 0 }])
+  }))
+
+  it.effect("gives each onVisited consumption its own item, leaving Chrome's shared argument untouched", () => Effect.gen(function*() {
+    const mock = mockApi()
+    const shared: HistoryItem = { ...page }
+    const mutated = yield* Deferred.make<void>()
+    const gate = gateListeners(mock.api.onVisited, 2)
+    const service = make({ ...mock.api, onVisited: gate.source })
+    const mutate = (item: HistoryItem) => Effect.andThen(Effect.sync(() => { item.title = "mutated" }), Deferred.succeed(mutated, undefined))
+    const left = yield* Effect.forkScoped(Stream.runCollect(Stream.take(Stream.tap(service.onVisited, mutate), 1)))
+    const afterMutation = (item: HistoryItem) => Effect.as(Deferred.await(mutated), item)
+    const right = yield* Effect.forkScoped(Stream.runCollect(Stream.mapEffect(Stream.take(service.onVisited, 1), afterMutation)))
+    yield* Effect.promise(() => gate.opened)
+    mock.onVisited.emit(shared)
+    expect((yield* Fiber.join(left))[0]?.title).toBe("mutated")
+    expect(yield* Fiber.join(right)).toStrictEqual([page])
+    expect(shared).toStrictEqual(page)
+  }))
+
+  it.effect("gives each onVisitRemoved consumption its own urls, leaving Chrome's shared argument untouched", () => Effect.gen(function*() {
+    const mock = mockApi()
+    const shared: chrome.history.RemovedResult = { allHistory: false, urls: [url] }
+    const mutated = yield* Deferred.make<void>()
+    const gate = gateListeners(mock.api.onVisitRemoved, 2)
+    const service = make({ ...mock.api, onVisitRemoved: gate.source })
+    const mutate = (removed: RemovedResult) => Effect.andThen(Effect.sync(() => { removed.urls.push("https://injected.example/") }), Deferred.succeed(mutated, undefined))
+    const left = yield* Effect.forkScoped(Stream.runCollect(Stream.take(Stream.tap(service.onVisitRemoved, mutate), 1)))
+    const afterMutation = (removed: RemovedResult) => Effect.as(Deferred.await(mutated), removed)
+    const right = yield* Effect.forkScoped(Stream.runCollect(Stream.mapEffect(Stream.take(service.onVisitRemoved, 1), afterMutation)))
+    yield* Effect.promise(() => gate.opened)
+    mock.onVisitRemoved.emit(shared)
+    expect((yield* Fiber.join(left))[0]?.urls).toHaveLength(2)
+    expect(yield* Fiber.join(right)).toStrictEqual([{ allHistory: false, urls: [url] }])
+    expect(shared).toStrictEqual({ allHistory: false, urls: [url] })
   }))
 
   it.effect("creating the service reads no event and registers no listener", () => Effect.gen(function*() {
@@ -507,6 +556,37 @@ describe("makeHistory", () => {
     expect(controls.pages()).toEqual([])
   }))
 
+  it.effect("search throws synchronously for a negative or fractional maxResults, as Chrome's schema does", () => Effect.gen(function*() {
+    const { api, controls, service } = fixture()
+    controls.seed({ url, visitTime: now - 1 })
+    expect(() => api.search({ text: "", maxResults: -1 })).toThrow("Error at property 'maxResults': Value must be at least 0.")
+    expect(() => api.search({ text: "", maxResults: 1.5 })).toThrow("Error at property 'maxResults': Invalid type: expected integer, found number.")
+    const error = yield* Effect.flip(service.search({ text: "", maxResults: -1 }))
+    expect(error).toMatchObject({ operation: "search" })
+    expect(error.cause).toBeInstanceOf(TypeError)
+    expect(yield* service.search({ text: "", maxResults: 0 })).toHaveLength(1)
+  }))
+
+  it.effect("addUrl accepts a URL Chrome keeps out of history, recording and reporting nothing", () => Effect.gen(function*() {
+    const { controls, service } = fixture()
+    const fiber = yield* consume(service.onVisited, 1, controls.onVisited.waitForListener)
+
+    const ignored = [
+      "about:blank", "about:version", "chrome://settings/", "chrome-untrusted://terminal/", "javascript:void(0)",
+      "view-source:https://app.example/", "devtools://devtools/bundled/inspector.html", "chrome-native://newtab/",
+      "chrome-search://local-ntp/", "chrome-distiller://abc/", "content://media/1", "CHROME://history/"
+    ]
+
+    for (const address of ignored) yield* service.addUrl(address)
+
+    yield* service.addUrl("data:text/plain,kept")
+    expect(yield* Fiber.join(fiber)).toStrictEqual([
+      { id: "1", url: "data:text/plain,kept", title: "", lastVisitTime: now, visitCount: 1, typedCount: 0 }
+    ])
+    expect(controls.pages().map((item) => item.url)).toEqual(["data:text/plain,kept"])
+    expect(yield* service.getVisits("chrome://settings/")).toEqual([])
+  }))
+
   it.effect("addUrl records a link visit now and reports it on onVisited", () => Effect.gen(function*() {
     const { controls, service } = fixture()
     controls.seed({ url, title: "App", visitTime: now - hour, transition: "typed" })
@@ -666,7 +746,7 @@ describe("makeHistory", () => {
     expect(item.lastVisitTime).toBeGreaterThanOrEqual(before)
     expect(item.lastVisitTime).toBeLessThanOrEqual(Date.now())
     history.controls.setNow(42)
-    expect(history.controls.seed({ url }).lastVisitTime).toBe(Math.max(42, item.lastVisitTime ?? 0))
+    expect(history.controls.seed({ url }).lastVisitTime).toBe(Math.max(42, item.lastVisitTime))
     expect((yield* make(history.api).getVisits(url)).map((visit) => visit.visitTime)).toEqual([42, item.lastVisitTime])
     history.controls.setNow(undefined)
     expect(history.controls.seed({ url: "https://later.example/" }).lastVisitTime).toBeGreaterThanOrEqual(before)

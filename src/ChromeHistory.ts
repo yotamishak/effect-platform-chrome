@@ -8,13 +8,26 @@ export class ChromeHistoryError extends Schema.TaggedError<ChromeHistoryError>()
 }) {}
 
 /**
- * A page in history. Chrome always fills `url`, `title` (empty when unknown), `lastVisitTime`
- * (its latest visit, whatever the query's range), `visitCount` and `typedCount`.
+ * A page in history. Chrome sets every field, though its declared type leaves all but `id`
+ * optional: `title` is empty when unknown, and `lastVisitTime` is the page's latest visit,
+ * whatever the query's range. Each item is a copy the caller owns.
  */
-export type HistoryItem = chrome.history.HistoryItem
+export interface HistoryItem {
+  id: string
+  url: string
+  title: string
+  lastVisitTime: number
+  visitCount: number
+  typedCount: number
+}
 
-/** One visit to a page, linked to its `HistoryItem` by `id`. `isLocal` needs Chrome 115. */
-export type VisitItem = chrome.history.VisitItem
+/**
+ * One visit to a page, linked to its `HistoryItem` by `id`. Chrome always sets `visitTime`;
+ * `isLocal` needs Chrome 115.
+ */
+export interface VisitItem extends chrome.history.VisitItem {
+  visitTime: number
+}
 
 /** How a visit was reached from its referrer, such as `"link"` or `"typed"`. */
 export type TransitionType = VisitItem["transition"]
@@ -36,13 +49,13 @@ export interface RemovedResult {
 
 /** The Promise-based MV3 subset this module needs. */
 export interface ChromeHistoryApi {
-  search(query: HistoryQuery): Promise<Array<HistoryItem>>
-  getVisits(details: chrome.history.UrlDetails): Promise<Array<VisitItem>>
+  search(query: HistoryQuery): Promise<Array<chrome.history.HistoryItem>>
+  getVisits(details: chrome.history.UrlDetails): Promise<Array<chrome.history.VisitItem>>
   addUrl(details: chrome.history.UrlDetails): Promise<void>
   deleteUrl(details: chrome.history.UrlDetails): Promise<void>
   deleteRange(range: Range): Promise<void>
   deleteAll(): Promise<void>
-  readonly onVisited: EventSource<[result: HistoryItem]>
+  readonly onVisited: EventSource<[result: chrome.history.HistoryItem]>
   readonly onVisitRemoved: EventSource<[removed: chrome.history.RemovedResult]>
 }
 
@@ -57,12 +70,18 @@ export interface ChromeHistoryService {
    * One item per page with a visit in the query's range, most recently visited first.
    * `text` (empty for all) matches words of the URL or title. Without `startTime` the range
    * starts 24 hours ago, and without `endTime` it ends now; `maxResults` defaults to 100,
-   * and 0 means no limit. Subframe and keyword-generated visits never match.
+   * and 0 means no limit, while a negative or fractional one fails. Subframe and
+   * keyword-generated visits never match, nor do visits answered with a 404.
    */
   readonly search: (query: HistoryQuery) => Effect.Effect<Array<HistoryItem>, ChromeHistoryError>
-  /** Every visit to the URL, oldest first; empty for a URL not in history. */
+  /** Every visit to the URL except those answered with a 404, oldest first; empty for a URL not in history. */
   readonly getVisits: (url: string) => Effect.Effect<Array<VisitItem>, ChromeHistoryError>
-  /** Records a visit to the URL now, with the "link" transition, firing `onVisited`. */
+  /**
+   * Records a visit to the URL now, with the "link" transition, firing `onVisited`. A URL
+   * Chrome keeps out of history (`about:`, `chrome:`, `chrome-untrusted:`, `devtools:`,
+   * `javascript:`, `view-source:` and Chrome's other internal schemes) succeeds without
+   * recording anything or firing `onVisited`.
+   */
   readonly addUrl: (url: string) => Effect.Effect<void, ChromeHistoryError>
   /** Removes the page and every visit to it, firing `onVisitRemoved` when it was in history. */
   readonly deleteUrl: (url: string) => Effect.Effect<void, ChromeHistoryError>
@@ -91,21 +110,36 @@ const invoke = invoker((operation, cause) => new ChromeHistoryError({ operation,
 
 const eventError = (operation: string) => (cause: unknown) => new ChromeHistoryError({ operation, cause })
 
-/** Chrome always sends `urls`, but its declared type leaves it optional. */
+/**
+ * Chrome sets every field, so the fallbacks only cover a non-conforming API. The copy keeps
+ * Chrome's event argument, which every listener in the context shares, safe from consumers.
+ */
+const historyItem = (item: chrome.history.HistoryItem): HistoryItem => ({
+  ...item,
+  url: item.url ?? "",
+  title: item.title ?? "",
+  lastVisitTime: item.lastVisitTime ?? 0,
+  visitCount: item.visitCount ?? 0,
+  typedCount: item.typedCount ?? 0
+})
+
+const visitItem = (visit: chrome.history.VisitItem): VisitItem => ({ ...visit, visitTime: visit.visitTime ?? 0 })
+
+/** Chrome always sends `urls`, but its declared type leaves it optional; the copy is the consumer's own. */
 const removedResult = (removed: chrome.history.RemovedResult): RemovedResult => ({
   allHistory: removed.allHistory,
-  urls: removed.urls ?? []
+  urls: Array.from(removed.urls ?? [])
 })
 
 /** Creates the service without reading browser globals or registering listeners. */
 export const make = (api: ChromeHistoryApi): ChromeHistoryService => ChromeHistory.of({
-  search: (query) => invoke("search", () => api.search(query)),
-  getVisits: (url) => invoke("getVisits", () => api.getVisits({ url })),
+  search: (query) => invoke("search", () => api.search(query)).pipe(Effect.map((items) => items.map(historyItem))),
+  getVisits: (url) => invoke("getVisits", () => api.getVisits({ url })).pipe(Effect.map((visits) => visits.map(visitItem))),
   addUrl: (url) => invoke("addUrl", () => api.addUrl({ url })),
   deleteUrl: (url) => invoke("deleteUrl", () => api.deleteUrl({ url })),
   deleteRange: (range) => invoke("deleteRange", () => api.deleteRange(range)),
   deleteAll: invoke("deleteAll", () => api.deleteAll()),
-  onVisited: observe(() => api.onVisited, (result) => result, eventError("onVisited")),
+  onVisited: observe(() => api.onVisited, historyItem, eventError("onVisited")),
   onVisitRemoved: observe(() => api.onVisitRemoved, removedResult, eventError("onVisitRemoved"))
 })
 

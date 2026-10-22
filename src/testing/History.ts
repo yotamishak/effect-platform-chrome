@@ -54,6 +54,23 @@ const canonical = (url: string): string => {
   return parsed.protocol === "isolated-app:" ? fail("Url is invalid.") : parsed.href
 }
 
+/** Schemes `addUrl` accepts but Chrome never records (its `CanAddURLToHistory`). */
+const unrecorded: ReadonlySet<string> = new Set([
+  "about:", "chrome:", "chrome-untrusted:", "chrome-native:", "chrome-search:", "chrome-distiller:",
+  "content:", "devtools:", "javascript:", "view-source:"
+])
+
+const schemaError = "Error in invocation of history.search(history.HistoryQuery query, optional function callback): Error at parameter 'query': Error at property 'maxResults': "
+
+/** Chrome's schema check, which throws synchronously before the call starts. */
+const checkMaxResults = (maxResults: number | undefined) => {
+  if (maxResults === undefined) return
+
+  if (!Number.isInteger(maxResults)) throw new TypeError(`${schemaError}Invalid type: expected integer, found number.`)
+
+  if (maxResults < 0) throw new TypeError(`${schemaError}Value must be at least 0.`)
+}
+
 const words = (text: string): Array<string> => text.toLowerCase().split(/\s+/).filter((word) => word.length > 0)
 
 /** Most recent first, the later-recorded visit first on a tie, as Chrome's visit queries order them. */
@@ -88,12 +105,15 @@ const visitItem = (page: Page, visit: Visit): ChromeHistory.VisitItem => ({
  * keyword-generated one) falls in `[startTime, endTime)`, most recent first. Without
  * `startTime` the range starts 24 hours before the fixture's clock, and without `endTime` it
  * ends at the clock, inclusive, so a visit recorded "now" is found; `maxResults` defaults to
- * 100, with 0 or less meaning no limit. Text matching approximates Chrome's: every whitespace-separated word of
+ * 100 and 0 means no limit, while a negative or fractional one throws Chrome's schema error
+ * synchronously. Text matching approximates Chrome's: every whitespace-separated word of
  * `text` must appear in the URL or title, ignoring case. Items report every field, with
  * `visitCount` counting every visit and `typedCount` the `"typed"` ones. `getVisits` lists a
  * page's visits oldest first, and an unknown page has none.
  *
- * `addUrl` records a `"link"` visit at the fixture's clock and emits `onVisited`. `deleteUrl`
+ * `addUrl` records a `"link"` visit at the fixture's clock and emits `onVisited`, except for
+ * a URL Chrome keeps out of history (`about:`, `chrome:`, `javascript:` and its other internal
+ * schemes), which it accepts and ignores; `seed` and `visit` record any valid URL. `deleteUrl`
  * emits `onVisitRemoved` only when the page existed; `deleteRange` removes visits in
  * `[startTime, endTime)` and emits only when it removed one, listing the pages left without
  * visits; `deleteAll` always emits `allHistory`. Events are emitted synchronously before the
@@ -145,34 +165,40 @@ export const makeHistory = (overrides: Partial<ChromeHistory.ChromeHistoryApi> =
     removed.controls.emit({ allHistory, urls })
   }
 
+  const searchHistory = async (query: ChromeHistory.HistoryQuery): Promise<Array<ChromeHistory.HistoryItem>> => {
+    check("search")
+    const clock = now()
+    const start = query.startTime ?? clock - day
+    const { endTime } = query
+    // Chrome's clock has moved on by the time it searches, so an open range keeps visits made "now".
+    const beforeEnd = (time: number) => endTime === undefined ? time <= clock : time < endTime
+    const limit = query.maxResults ?? defaultMaxResults
+    const terms = words(query.text)
+
+    const matches = Array.from(pages.values()).flatMap((page) => {
+      const haystack = `${page.url} ${page.title}`.toLowerCase()
+
+      if (!terms.every((term) => haystack.includes(term))) return []
+
+      let latest: Visit | undefined
+
+      for (const visit of page.visits) {
+        if (hidden.has(visit.transition) || visit.visitTime < start || !beforeEnd(visit.visitTime)) continue
+
+        if (latest === undefined || recentFirst(visit, latest) < 0) latest = visit
+      }
+
+      return latest === undefined ? [] : [{ page, latest }]
+    }).sort((left, right) => recentFirst(left.latest, right.latest))
+
+    return (limit > 0 ? matches.slice(0, limit) : matches).map(({ page }) => item(page))
+  }
+
   const api: ChromeHistory.ChromeHistoryApi = {
-    search: async (query) => {
-      check("search")
-      const clock = now()
-      const start = query.startTime ?? clock - day
-      const { endTime } = query
-      // Chrome's clock has moved on by the time it searches, so an open range keeps visits made "now".
-      const beforeEnd = (time: number) => endTime === undefined ? time <= clock : time < endTime
-      const limit = query.maxResults ?? defaultMaxResults
-      const terms = words(query.text)
+    search: (query) => {
+      checkMaxResults(query.maxResults)
 
-      const matches = Array.from(pages.values()).flatMap((page) => {
-        const haystack = `${page.url} ${page.title}`.toLowerCase()
-
-        if (!terms.every((term) => haystack.includes(term))) return []
-
-        let latest: Visit | undefined
-
-        for (const visit of page.visits) {
-          if (hidden.has(visit.transition) || visit.visitTime < start || !beforeEnd(visit.visitTime)) continue
-
-          if (latest === undefined || recentFirst(visit, latest) < 0) latest = visit
-        }
-
-        return latest === undefined ? [] : [{ page, latest }]
-      }).sort((left, right) => recentFirst(left.latest, right.latest))
-
-      return (limit > 0 ? matches.slice(0, limit) : matches).map(({ page }) => item(page))
+      return searchHistory(query)
     },
     getVisits: async (details) => {
       check("getVisits")
@@ -182,7 +208,9 @@ export const makeHistory = (overrides: Partial<ChromeHistory.ChromeHistoryApi> =
     },
     addUrl: async (details) => {
       check("addUrl")
-      visited.controls.emit(item(record({ url: details.url })))
+      const url = canonical(details.url)
+
+      if (!unrecorded.has(new URL(url).protocol)) visited.controls.emit(item(record({ url })))
     },
     deleteUrl: async (details) => {
       check("deleteUrl")
