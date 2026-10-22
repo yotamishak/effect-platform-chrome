@@ -171,6 +171,31 @@ describe("ChromeAlarms", () => {
     expect(api.getAll).toHaveBeenCalledTimes(2)
   })
 
+  it.effect("does not undo a create whose fiber is interrupted while Chrome is scheduling it", () => Effect.gen(function*() {
+    const base = makeAlarms()
+    const arrived = Deferred.makeUnsafe<void>()
+    const settled = Deferred.makeUnsafe<void>()
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+
+    const create: ChromeAlarmsApi["create"] = async (...args: CreateArgs) => {
+      Deferred.doneUnsafe(arrived, Effect.void)
+      await gate
+      await (args.length === 1 || args[0] !== "tick" ? Promise.reject(new Error("unexpected")) : base.api.create(args[0], args[1]))
+      Deferred.doneUnsafe(settled, Effect.void)
+    }
+
+    const alarms = make({ ...base.api, create })
+    const fiber = yield* Effect.forkChild(alarms.create("tick", { when: 1 }))
+    yield* Deferred.await(arrived)
+    yield* Fiber.interrupt(fiber)
+    expect(base.controls.alarm("tick")).toBeUndefined()
+
+    release()
+    yield* Deferred.await(settled)
+    expect(yield* alarms.get("tick")).toEqual(Option.some({ name: "tick", scheduledTime: 1, persistAcrossSessions: true }))
+  }))
+
   it.effect("emits alarms and removes the identical listener when the stream ends", () => Effect.gen(function*() {
     const { api, service, listeners, nextRegistration } = fixture()
     const registered = nextRegistration()
@@ -414,9 +439,8 @@ describe("makeAlarms", () => {
     yield* alarms.create("once", { delayInMinutes: 1 })
     yield* alarms.create("repeat", { delayInMinutes: 1, periodInMinutes: 2 })
     yield* alarms.create("later", { delayInMinutes: 30 })
-    yield* alarms.create("zero-period", { when: 0, periodInMinutes: 0 })
 
-    const fired = yield* Effect.forkScoped(Stream.runCollect(Stream.take(alarms.onAlarm, 5)))
+    const fired = yield* Effect.forkScoped(Stream.runCollect(Stream.take(alarms.onAlarm, 4)))
     yield* Effect.promise(() => fixture.controls.onAlarm.waitForListener())
 
     expect(fixture.controls.advance(30_000)).toEqual([])
@@ -432,28 +456,96 @@ describe("makeAlarms", () => {
     expect(fixture.controls.advance(23 * minute)).toEqual([])
 
     expect((yield* Fiber.join(fired)).map((alarm) => [alarm.name, alarm.scheduledTime])).toEqual([
-      ["zero-period", 0], ["repeat", minute], ["once", minute], ["repeat", 3 * minute], ["later", 30 * minute]
+      ["repeat", minute], ["once", minute], ["repeat", 3 * minute], ["later", 30 * minute]
     ])
     expect(fixture.controls.alarm("repeat")?.scheduledTime).toBe(31 * minute)
     expect(fixture.controls.onAlarm.listenerCount).toBe(0)
   }))
 
-  it.effect("returns listener exceptions and skips alarms a listener cleared", () => Effect.gen(function*() {
+  it.effect("dispatches a poll only after updating every due alarm, so listeners cannot change it", () => Effect.gen(function*() {
+    // Chrome updates its alarms for the whole poll in the browser process and only then do
+    // the extension's listeners run, so a listener sees the polled state and cannot stop
+    // another due alarm of the same poll from firing.
     const fixture = makeAlarms()
     const failure = new Error("listener failed")
-    const seen: Array<string> = []
+    const seen: Array<[name: string, first: boolean, second: boolean]> = []
     yield* Effect.promise(() => fixture.api.create("first", { when: 1 }))
     yield* Effect.promise(() => fixture.api.create("second", { when: 1 }))
     fixture.api.onAlarm.addListener((alarm) => {
-      seen.push(alarm.name)
+      seen.push([alarm.name, fixture.controls.alarm("first") !== undefined, fixture.controls.alarm("second") !== undefined])
       void fixture.api.clear("first")
+      void fixture.api.create("late", { when: 0 })
       throw failure
     })
 
-    expect(fixture.controls.advance(1)).toEqual([failure])
-    expect(seen).toEqual(["second"])
+    expect(fixture.controls.advance(1)).toEqual([failure, failure])
+    expect(seen).toEqual([["second", false, false], ["first", false, false]])
+
+    // An alarm created during dispatch, even one already due, waits for the next poll.
+    expect(fixture.controls.alarm("late")?.scheduledTime).toBe(0)
+    expect(fixture.controls.advance(0)).toEqual([failure])
+    expect(seen.map(([name]) => name)).toEqual(["second", "first", "late"])
+  }))
+
+  it.effect("rejects a negative, NaN or infinite clock step", () => Effect.gen(function*() {
+    const fixture = makeAlarms()
+    yield* Effect.promise(() => fixture.api.create("repeat", { when: 1, periodInMinutes: 1 }))
+
     expect(() => fixture.controls.advance(-1)).toThrow("Cannot move the clock by -1 ms")
-    expect(() => fixture.controls.advance(Number.NaN)).toThrow()
+    expect(() => fixture.controls.advance(Number.NaN)).toThrow("Cannot move the clock by NaN ms")
+    expect(() => fixture.controls.advance(Number.POSITIVE_INFINITY)).toThrow("Cannot move the clock by Infinity ms")
+    expect(fixture.controls.now).toBe(0)
+    expect(fixture.controls.alarm("repeat")?.scheduledTime).toBe(1)
+  }))
+
+  it.effect("keeps a zero-period alarm and fires it on every poll, as Chrome does", () => Effect.gen(function*() {
+    // Chrome repeats any alarm whose periodInMinutes is present, and a zero period leaves its
+    // scheduled time in the past; only an absent period makes a one-shot alarm.
+    const fixture = makeAlarms()
+    const alarms = make(fixture.api)
+    const seen: Array<Alarm> = []
+    fixture.api.onAlarm.addListener((alarm) => { seen.push(alarm) })
+    yield* alarms.create("zero", { when: 5, periodInMinutes: 0 })
+    yield* alarms.create("once", { when: 5 })
+
+    expect(fixture.controls.advance(5)).toEqual([])
+    expect(fixture.controls.advance(minute)).toEqual([])
+    expect(fixture.controls.advance(0)).toEqual([])
+    expect(seen.map((alarm) => alarm.name)).toEqual(["once", "zero", "zero", "zero"])
+    expect(yield* alarms.getAll).toEqual([
+      { name: "zero", scheduledTime: 5, periodInMinutes: 0, persistAcrossSessions: true }
+    ])
+  }))
+
+  it.effect("treats re-creating an identical alarm as a no-op that keeps its place", () => Effect.gen(function*() {
+    const fixture = makeAlarms()
+    const alarms = make(fixture.api)
+    const names = Effect.map(alarms.getAll, (all) => all.map((alarm) => alarm.name))
+
+    yield* alarms.create("a", { when: 5 })
+    yield* alarms.create("b", { delayInMinutes: 1 })
+    yield* alarms.create("c", { when: 5, periodInMinutes: 1, persistAcrossSessions: false })
+
+    // Identical name, scheduled time, period and persistence: Chrome keeps the alarm as it is.
+    yield* alarms.create("a", { when: 5 })
+    yield* alarms.create({ name: "b", delayInMinutes: 1 })
+    expect(yield* names).toEqual(["a", "b", "c"])
+    yield* alarms.create("c", { when: 5, periodInMinutes: 1, persistAcrossSessions: false })
+    expect(yield* names).toEqual(["a", "b", "c"])
+
+    // Any difference replaces it and moves it last.
+    yield* alarms.create("a", { when: 5, persistAcrossSessions: false })
+    expect(yield* names).toEqual(["b", "c", "a"])
+    yield* alarms.create("b", { delayInMinutes: 1, periodInMinutes: 1 })
+    expect(yield* names).toEqual(["c", "a", "b"])
+    yield* alarms.create("c", { when: 6, periodInMinutes: 1, persistAcrossSessions: false })
+    expect(yield* names).toEqual(["a", "b", "c"])
+
+    // The same delay later on the clock is a different scheduled time.
+    expect(fixture.controls.advance(1)).toEqual([])
+    yield* alarms.create("a", { when: 5, persistAcrossSessions: false })
+    yield* alarms.create("b", { delayInMinutes: 1, periodInMinutes: 1 })
+    expect(yield* names).toEqual(["a", "c", "b"])
   }))
 
   it.effect("drops non-persistent alarms on a simulated browser restart", () => Effect.gen(function*() {

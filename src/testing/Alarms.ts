@@ -11,6 +11,11 @@ const minute = 60_000
 
 const nameBytes = new TextEncoder()
 
+/** Chrome's own equality: re-creating an alarm equal in all of these is a no-op. */
+const identical = (left: ChromeAlarms.Alarm, right: ChromeAlarms.Alarm): boolean =>
+  left.name === right.name && left.scheduledTime === right.scheduledTime &&
+  left.periodInMinutes === right.periodInMinutes && left.persistAcrossSessions === right.persistAcrossSessions
+
 type CreateArgs = [info: ChromeAlarms.AlarmCreateInfo] | [name: string | undefined, info: ChromeAlarms.AlarmCreateInfo]
 
 /**
@@ -20,10 +25,14 @@ type CreateArgs = [info: ChromeAlarms.AlarmCreateInfo] | [name: string | undefin
  * bytes, and a 501st alarm all reject with Chrome's messages; the cap applies even when
  * replacing) and replaces an alarm of the same name, moving it last. Names default to the
  * empty string, `persistAcrossSessions` to true, and `periodInMinutes` is present only when
- * given. The fixture behaves like an unpacked extension: no 30-second minimum. `advance` is
- * one Chrome poll: due alarms fire once each, newest first as Chrome does, one-shot alarms are
- * removed, and repeating ones move to their first slot after the new time on their original
- * grid. `clearAll` resolves `true`. Pass `overrides` to replace any API member.
+ * given. Re-creating an alarm identical in name, scheduled time, period and persistence is a
+ * no-op that keeps its place, as in Chrome. The fixture behaves like an unpacked extension: no
+ * 30-second minimum. `advance` is one Chrome poll: every due alarm is updated first (one-shot
+ * alarms removed, repeating ones moved to their first slot after the new time on their
+ * original grid, a zero period left due so it fires on every poll), then each fires once,
+ * newest first as Chrome does. Listeners therefore see the polled state, and an alarm they
+ * create or clear affects only later polls. `clearAll` resolves `true`. Pass `overrides` to
+ * replace any API member.
  */
 export const makeAlarms = (overrides: Partial<ChromeAlarms.ChromeAlarmsApi> = {}) => {
   const alarms = new Map<string, ChromeAlarms.Alarm>()
@@ -64,6 +73,11 @@ export const makeAlarms = (overrides: Partial<ChromeAlarms.ChromeAlarmsApi> = {}
     }
 
     if (info.periodInMinutes !== undefined) alarm.periodInMinutes = info.periodInMinutes
+
+    const existing = alarms.get(alarmName)
+
+    // Chrome leaves an identical alarm untouched, keeping its place.
+    if (existing !== undefined && identical(existing, alarm)) return
 
     alarms.delete(alarmName)
     alarms.set(alarmName, alarm)
@@ -106,30 +120,27 @@ export const makeAlarms = (overrides: Partial<ChromeAlarms.ChromeAlarmsApi> = {}
        * poll does after a wake. Returns the exceptions thrown by listeners.
        */
       advance: (milliseconds: number): ReadonlyArray<unknown> => {
-        if (Number.isNaN(milliseconds) || milliseconds < 0) throw new Error(`Cannot move the clock by ${milliseconds} ms`)
+        if (!Number.isFinite(milliseconds) || milliseconds < 0) {
+          throw new Error(`Cannot move the clock by ${milliseconds} ms`)
+        }
 
         now += milliseconds
         const due = Array.from(alarms.values()).filter((alarm) => alarm.scheduledTime <= now).reverse()
-        const errors: Array<unknown> = []
 
+        // Chrome updates every due alarm in the browser before any listener runs, so the
+        // listeners see the polled state and cannot affect this poll.
         for (const alarm of due) {
-          // A listener may already have cleared or replaced it.
-          if (alarms.get(alarm.name) !== alarm) continue
-
-          const period = alarm.periodInMinutes ?? 0
-
-          if (period > 0) {
-            const span = period * minute
-            const elapsed = Math.floor((now - alarm.scheduledTime) / span)
-            alarms.set(alarm.name, { ...alarm, scheduledTime: alarm.scheduledTime + span * (elapsed + 1) })
-          } else {
+          if (alarm.periodInMinutes === undefined) {
             alarms.delete(alarm.name)
+          } else if (alarm.periodInMinutes !== 0) {
+            // Chrome truncates the missed periods; a zero period keeps the alarm due.
+            const span = alarm.periodInMinutes * minute
+            const missed = Math.trunc((now - alarm.scheduledTime) / span)
+            alarms.set(alarm.name, { ...alarm, scheduledTime: alarm.scheduledTime + span * (missed + 1) })
           }
-
-          errors.push(...onAlarm.controls.emit(structuredClone(alarm)))
         }
 
-        return errors
+        return due.flatMap((alarm) => onAlarm.controls.emit(structuredClone(alarm)))
       },
       /** The browser restarts: alarms created with `persistAcrossSessions: false` are gone. */
       restart: () => {

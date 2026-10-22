@@ -245,8 +245,13 @@ describe("ChromeAlarms stress", () => {
 
       if (name === undefined) return base.api.create(undefined, info)
 
-      model.delete(name)
-      model.set(name, info.when ?? Number.NaN)
+      const when = info.when ?? Number.NaN
+
+      // Chrome leaves an identical alarm in place.
+      if (model.get(name) !== when) {
+        model.delete(name)
+        model.set(name, when)
+      }
 
       return base.api.create(name, info)
     }
@@ -328,5 +333,50 @@ describe("ChromeAlarms stress", () => {
     const remaining = yield* alarms.getAll
     expect(remaining).toHaveLength(250)
     expect(remaining.every((value) => value.periodInMinutes === 1 && value.scheduledTime > 5_000)).toBe(true)
+  }))
+
+  it.effect("delivers a whole 500-alarm poll while listeners clear and re-create alarms mid-dispatch", () => Effect.gen(function*() {
+    const fixture = makeAlarms()
+    const alarms = make(fixture.api)
+    const random = seeded(0xA1A3)
+    const seen: Array<string> = []
+    const rejected: Array<unknown> = []
+    let fresh = 0
+
+    for (let index = 0; index < 500; index++) {
+      yield* alarms.create(`alarm-${index}`, index % 2 === 0 ? { when: index } : { when: index, periodInMinutes: 1 })
+    }
+
+    // Each listener call clears a random alarm and creates an already-due one, which Chrome
+    // can only apply after the poll that is being dispatched.
+    fixture.api.onAlarm.addListener((alarm) => {
+      seen.push(alarm.name)
+      void fixture.api.clear(`alarm-${Math.floor(random() * 500)}`)
+      void fixture.api.create(`fresh-${fresh++}`, { when: 0 }).catch((cause: unknown) => { rejected.push(cause) })
+    })
+
+    expect(fixture.controls.advance(500)).toEqual([])
+    expect(seen).toEqual(Array.from({ length: 500 }, (_, index) => `alarm-${499 - index}`))
+
+    // The next poll fires exactly what was due once the previous dispatch had finished.
+    const before = yield* alarms.getAll
+    const due = before.filter((alarm) => alarm.scheduledTime <= fixture.controls.now).map((alarm) => alarm.name).reverse()
+    expect(due.length).toBeGreaterThan(0)
+    expect(due.every((name) => name.startsWith("fresh-"))).toBe(true)
+    // The surviving repeating alarms plus the creations reach the cap mid-dispatch.
+    expect(rejected.length).toBeGreaterThan(0)
+    expect(new Set(rejected.map(String))).toEqual(new Set(["Error: An extension cannot have more than 500 active alarms."]))
+    expect(before).toHaveLength(500)
+
+    seen.length = 0
+    const created = fresh
+    expect(fixture.controls.advance(0)).toEqual([])
+    expect(seen).toEqual(due)
+
+    // What is left is repeating alarms on their next slot and the second dispatch's creations.
+    for (const alarm of yield* alarms.getAll) {
+      if (alarm.name.startsWith("fresh-")) expect(Number(alarm.name.slice(6))).toBeGreaterThanOrEqual(created)
+      else expect([alarm.periodInMinutes, alarm.scheduledTime > 500]).toEqual([1, true])
+    }
   }))
 })
