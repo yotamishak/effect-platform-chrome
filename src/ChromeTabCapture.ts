@@ -1,5 +1,4 @@
-import { Context, Effect, Layer, Schema, Stream } from "effect"
-import type { Scope } from "effect"
+import { Context, Effect, Exit, Layer, Schema, Scope, Stream } from "effect"
 import { invoker, liveLayer } from "./internal/api.js"
 import { observe, type EventSource } from "./internal/event.js"
 
@@ -58,7 +57,9 @@ export interface ChromeTabCaptureService {
    * `getMediaStreamId` is the way to capture. The tab needs the extension's `activeTab`
    * grant from a user invocation, must not be captured already, and `options` must request
    * `audio` or `video`. While the tab's audio is captured it stops playing to the user.
-   * Interrupting the wait, or closing the scope first, stops a stream Chrome delivers later.
+   * Interrupting the wait, or closing the scope first, stops a stream Chrome delivers later;
+   * an already closed scope fails without calling Chrome, and a failed attempt leaves no
+   * finalizer in the scope.
    */
   readonly capture: (options: CaptureOptions) => Effect.Effect<MediaStream, ChromeTabCaptureError, Scope.Scope>
   /**
@@ -74,6 +75,8 @@ export class ChromeTabCapture extends Context.Service<ChromeTabCapture, ChromeTa
 
 const fail = (operation: string) => (cause: unknown) => new ChromeTabCaptureError({ operation, cause })
 
+const scopeClosed = () => fail("capture")(new Error("The capture's scope closed before Chrome delivered the stream"))
+
 const invoke = invoker((operation, cause) => new ChromeTabCaptureError({ operation, cause }))
 
 /** Ends the capture: Chrome stops capturing a tab once every track of its stream has stopped. */
@@ -85,7 +88,10 @@ const stopTracks = (stream: MediaStream): void => {
  * Bridges the callback-only `capture`. The stream is owned from the moment Chrome delivers
  * it, before the fiber resumes, so it is stopped exactly when the scope closes, when the wait
  * fails or is interrupted (including after delivery but before the fiber takes it), or at
- * once when it arrives after that. A repeated callback cannot leak a second stream.
+ * once when it arrives after that. A repeated callback cannot leak a second stream. The
+ * release lives in a child of the caller's scope that a failed wait closes, so failed
+ * attempts in a long-lived scope (a retry loop) leave nothing behind, and a scope that is
+ * already closed never starts a capture in Chrome.
  */
 const captureStream = (
   api: ChromeTabCaptureApi,
@@ -113,6 +119,12 @@ const captureStream = (
       return
     }
 
+    if (released) {
+      resume(Effect.fail(scopeClosed()))
+
+      return
+    }
+
     try {
       api.capture(options, (stream) => {
         // Chrome only exposes lastError for the duration of this callback.
@@ -128,7 +140,7 @@ const captureStream = (
         called = true
 
         if (released) {
-          resume(Effect.fail(fail("capture")(new Error("The capture's scope closed before Chrome delivered the stream"))))
+          resume(Effect.fail(scopeClosed()))
         } else if (lastError !== undefined) {
           // Any stream delivered alongside the error is stopped by the failure's release.
           resume(Effect.fail(fail("capture")(lastError)))
@@ -143,10 +155,13 @@ const captureStream = (
     }
   })
 
-  return Effect.uninterruptibleMask((restore) => Effect.andThen(
-    Effect.addFinalizer(() => Effect.sync(release)),
-    Effect.onError(restore(wait), () => Effect.sync(release))
-  ))
+  return Effect.uninterruptibleMask((restore) => Effect.gen(function*() {
+    // A closed scope yields a closed child, whose finalizer runs (and releases) at once.
+    const owner = yield* Scope.fork(yield* Effect.scope)
+    yield* Scope.addFinalizer(owner, Effect.sync(release))
+
+    return yield* Effect.onError(restore(wait), (cause) => Scope.close(owner, Exit.failCause(cause)))
+  }))
 })
 
 /** Creates the service without reading browser globals or registering listeners. */

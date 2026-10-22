@@ -1,6 +1,6 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Cause, Effect, Exit, Fiber, Scope, Stream } from "effect"
+import { Cause, Effect, Exit, Fiber, Predicate, Scope, Stream } from "effect"
 import { describe, expect, it } from "@effect/vitest"
 import { ChromeTabCaptureError, make } from "../../src/ChromeTabCapture.js"
 import type { CaptureInfo, CaptureOptions, ChromeTabCaptureApi, MediaStreamOptions } from "../../src/ChromeTabCapture.js"
@@ -49,6 +49,13 @@ const at = <A>(items: ReadonlyArray<A>, index: number): A => {
   if (item === undefined) throw new Error(`No item at ${index}`)
 
   return item
+}
+
+/** How many finalizers a scope still holds. */
+const finalizers = (scope: Scope.Scope): number => {
+  const state = scope.state
+
+  return Predicate.isTagged(state, "Open") ? state.finalizers?.size ?? 1 : 0
 }
 
 const info = (tabId: number): CaptureInfo => ({ tabId, status: "active", fullscreen: tabId % 2 === 0 })
@@ -702,5 +709,32 @@ describe("ChromeTabCapture stress: fixture", () => {
     expect(fake.controls.captures()).toEqual([])
     const again = yield* Effect.scoped(Effect.map(capture.capture({ video: true }), (stream) => stream.active))
     expect(again).toBe(true)
+  }))
+
+  it.effect("a 2,048-attempt retry loop in one long-lived scope keeps only the winning capture's finalizer", () => Effect.gen(function*() {
+    const fake = makeTabCapture()
+    const capture = make(fake.api)
+    fake.controls.invoke()
+    const holder = yield* Scope.make()
+    const held = yield* Scope.provide(capture.capture({ video: true }), holder)
+    const scope = yield* Scope.make()
+    let failures = 0
+
+    const attempt = Scope.provide(capture.capture({ video: true, audio: true }), scope).pipe(
+      Effect.tapError(() => Effect.suspend(() => {
+        failures += 1
+
+        return failures === 2048 ? Scope.close(holder, Exit.void) : Effect.void
+      }))
+    )
+
+    const stream = yield* Effect.retry(attempt, { times: 4096 })
+    expect(failures).toBe(2048)
+    expect(held.active).toBe(false)
+    expect(stream.active).toBe(true)
+    expect(finalizers(scope)).toBe(1)
+    yield* Scope.close(scope, Exit.void)
+    expect(stream.active).toBe(false)
+    expect(fake.controls.captures()).toEqual([])
   }))
 })

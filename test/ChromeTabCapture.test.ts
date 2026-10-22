@@ -309,6 +309,55 @@ describe("ChromeTabCapture.capture", () => {
     })
   }))
 
+  it.effect("never starts a Chrome capture in a scope that is already closed", () => Effect.gen(function*() {
+    const mock = mockApi()
+    const scope = yield* Scope.make()
+    yield* Scope.close(scope, Exit.void)
+    const error = yield* Effect.flip(Scope.provide(make(mock.api).capture({ video: true }), scope))
+    expect(error).toMatchObject({
+      operation: "capture", cause: new Error("The capture's scope closed before Chrome delivered the stream")
+    })
+    expect(mock.api.capture).not.toHaveBeenCalled()
+  }))
+
+  it.effect("a failed or interrupted capture leaves no finalizer behind in a long-lived scope", () => Effect.gen(function*() {
+    const mock = mockApi()
+    const capture = make(mock.api)
+    const scope = yield* Scope.make()
+
+    const attempt = (index: number, settle: () => void) => Effect.gen(function*() {
+      const fiber = yield* Effect.forkChild(Effect.exit(Scope.provide(capture.capture({ video: true }), scope)))
+      yield* Effect.promise(() => mock.captureCalled(index + 1))
+      settle()
+
+      return yield* Fiber.join(fiber)
+    })
+
+    // A retry loop in one scope: lastError, a null stream, a stream with lastError, a throw
+    // (which never reaches a callback), then an interruption.
+    yield* attempt(0, () => mock.respond(0, null, { message: tabCaptureErrors.sameTab }))
+    yield* attempt(1, () => mock.respond(1, null))
+    const errored = streamOf("errored")
+    yield* attempt(2, () => mock.respond(2, errored.media, { message: "Capture failed" }))
+    expect(errored.stream.active).toBe(false)
+    mock.api.capture.mockImplementationOnce(() => { throw new TypeError("invalid options") })
+    expect(Exit.isFailure(yield* Effect.exit(Scope.provide(capture.capture({ video: true }), scope)))).toBe(true)
+    const interrupted = yield* Effect.forkChild(Scope.provide(capture.capture({ video: true }), scope))
+    yield* Effect.promise(() => mock.captureCalled(4))
+    yield* Fiber.interrupt(interrupted)
+    expect(scope.state._tag).toBe("Empty")
+
+    // A successful capture still owns its stream until the scope closes.
+    const kept = streamOf("kept")
+    expect(Exit.isSuccess(yield* attempt(4, () => mock.respond(4, kept.media)))).toBe(true)
+    expect(scope.state._tag).toBe("Open")
+    const late = streamOf("late")
+    mock.respond(3, late.media)
+    expect(late.stream.active).toBe(false)
+    yield* Scope.close(scope, Exit.void)
+    expect(kept.stream.active).toBe(false)
+  }))
+
   it.effect("ignores a repeated callback, stopping any second stream at once", () => Effect.gen(function*() {
     const mock = mockApi()
     const first = streamOf("first")

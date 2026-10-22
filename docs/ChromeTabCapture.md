@@ -91,7 +91,11 @@ outlives its owner:
 - a stream delivered together with a `lastError` is stopped, and the call fails with it;
 - a `null` stream without `lastError` fails with "chrome.tabCapture.capture delivered no
   stream";
-- a repeated callback is ignored, and any stream it carries is stopped.
+- a repeated callback is ignored, and any stream it carries is stopped;
+- a scope that is already closed fails at once with that error, without starting a capture
+  in Chrome;
+- a failed or interrupted attempt leaves no finalizer in the scope, so a retry loop inside
+  one long-lived scope holds only the winning capture's release.
 
 Each run of the Effect is an independent capture.
 
