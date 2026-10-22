@@ -374,7 +374,10 @@ describe("makeAlarms", () => {
     yield* alarms.create(undefined, { when: 7 })
 
     expect(yield* alarms.get()).toEqual(Option.some({ name: "", scheduledTime: 7, persistAcrossSessions: true }))
-    expect(yield* alarms.getAll).toEqual([
+    // A one-shot alarm has no periodInMinutes key at all, as Chrome serializes it.
+    expect(Object.keys((yield* Effect.promise(() => fixture.api.get("when"))) ?? {}))
+      .toEqual(["name", "scheduledTime", "persistAcrossSessions"])
+    expect(yield* alarms.getAll).toStrictEqual([
       { name: "when", scheduledTime: 5_000, persistAcrossSessions: false },
       { name: "period", scheduledTime: 3 * minute, periodInMinutes: 3, persistAcrossSessions: true },
       { name: "in-info", scheduledTime: minute, periodInMinutes: 4, persistAcrossSessions: true },
@@ -415,6 +418,15 @@ describe("makeAlarms", () => {
     expect(yield* rejection(alarms.create("é".repeat(513), { when: 1 })))
       .toBe("Alarm name size is 1026 bytes which exceeds the limit of 1024 bytes.")
 
+    // Chrome reports the first rule broken: the name in both places, then when with
+    // delayInMinutes, then no schedule, and only then the name size.
+    expect(yield* rejection(alarms.create("a", unchecked({ name: "b" }))))
+      .toBe("Cannot set alarm name in both separate argument and object form.")
+    expect(yield* rejection(alarms.create("x".repeat(1025), unchecked({ when: 1, delayInMinutes: 1 }))))
+      .toBe("Cannot set both when and delayInMinutes.")
+    expect(yield* rejection(alarms.create("x".repeat(1025), unchecked({}))))
+      .toBe("Must set at least one of when, delayInMinutes, or periodInMinutes.")
+
     yield* alarms.create("x".repeat(1024), { when: 1 })
     expect((yield* alarms.getAll).map((alarm) => alarm.name.length)).toEqual([1024])
   }))
@@ -427,6 +439,16 @@ describe("makeAlarms", () => {
     expect(yield* rejection(alarms.create("alarm-500", { delayInMinutes: 60 })))
       .toBe("An extension cannot have more than 500 active alarms.")
     expect(yield* rejection(alarms.create("alarm-0", { delayInMinutes: 1 })))
+      .toBe("An extension cannot have more than 500 active alarms.")
+    // The cap comes before Chrome's identical re-create no-op, so even that is rejected.
+    expect(yield* rejection(alarms.create("alarm-1", { delayInMinutes: 60 })))
+      .toBe("An extension cannot have more than 500 active alarms.")
+    // Only the name given twice is checked before the cap; every other rule after it.
+    expect(yield* rejection(alarms.create("a", unchecked({ name: "b", when: 1 }))))
+      .toBe("Cannot set alarm name in both separate argument and object form.")
+    expect(yield* rejection(alarms.create(unchecked({ when: 1, delayInMinutes: 1 }))))
+      .toBe("An extension cannot have more than 500 active alarms.")
+    expect(yield* rejection(alarms.create("x".repeat(1025), { when: 1 })))
       .toBe("An extension cannot have more than 500 active alarms.")
     expect(yield* alarms.clear("alarm-0")).toBe(true)
     yield* alarms.create("alarm-500", { delayInMinutes: 60 })
@@ -481,10 +503,45 @@ describe("makeAlarms", () => {
     expect(fixture.controls.advance(1)).toEqual([failure, failure])
     expect(seen).toEqual([["second", false, false], ["first", false, false]])
 
-    // An alarm created during dispatch, even one already due, waits for the next poll.
+    // An alarm created during dispatch, even one already due, waits for the next poll, which
+    // comes no sooner than a second later.
     expect(fixture.controls.alarm("late")?.scheduledTime).toBe(0)
-    expect(fixture.controls.advance(0)).toEqual([failure])
+    expect(fixture.controls.advance(999)).toEqual([])
+    expect(fixture.controls.advance(1)).toEqual([failure])
     expect(seen.map(([name]) => name)).toEqual(["second", "first", "late"])
+  }))
+
+  it.effect("polls at most once a second, counting only polls that fired, as Chrome does", () => Effect.gen(function*() {
+    // Chrome skips an extension until its last firing poll plus its minimum granularity, one
+    // second for an unpacked extension and, from Chrome 153, for every MV3 extension.
+    const fixture = makeAlarms()
+    const seen: Array<[name: string, at: number]> = []
+    fixture.api.onAlarm.addListener((alarm) => { seen.push([alarm.name, fixture.controls.now]) })
+    const create = (name: string, when: number) => Effect.promise(() => fixture.api.create(name, { when }))
+
+    yield* create("a", 0)
+    yield* create("b", 500)
+    expect(fixture.controls.advance(0)).toEqual([])
+    expect(seen).toEqual([["a", 0]])
+
+    // "b" is due at 500 but waits for the poll a second after the one that fired "a".
+    expect(fixture.controls.advance(500)).toEqual([])
+    expect(fixture.controls.advance(499)).toEqual([])
+    expect(seen).toEqual([["a", 0]])
+    expect(fixture.controls.advance(1)).toEqual([])
+    expect(seen).toEqual([["a", 0], ["b", 1_000]])
+
+    // A poll that fires nothing does not restart the wait.
+    yield* create("c", 2_500)
+    expect(fixture.controls.advance(1_000)).toEqual([])
+    expect(fixture.controls.advance(500)).toEqual([])
+    expect(seen).toEqual([["a", 0], ["b", 1_000], ["c", 2_500]])
+
+    // A browser restart forgets the last poll.
+    yield* create("d", 0)
+    fixture.controls.restart()
+    expect(fixture.controls.advance(0)).toEqual([])
+    expect(seen).toEqual([["a", 0], ["b", 1_000], ["c", 2_500], ["d", 2_500]])
   }))
 
   it.effect("rejects a negative, NaN or infinite clock step", () => Effect.gen(function*() {
@@ -500,7 +557,8 @@ describe("makeAlarms", () => {
 
   it.effect("keeps a zero-period alarm and fires it on every poll, as Chrome does", () => Effect.gen(function*() {
     // Chrome repeats any alarm whose periodInMinutes is present, and a zero period leaves its
-    // scheduled time in the past; only an absent period makes a one-shot alarm.
+    // scheduled time in the past; only an absent period makes a one-shot alarm. Polls, and so
+    // its firings, come at most once a second.
     const fixture = makeAlarms()
     const alarms = make(fixture.api)
     const seen: Array<Alarm> = []
@@ -511,6 +569,10 @@ describe("makeAlarms", () => {
     expect(fixture.controls.advance(5)).toEqual([])
     expect(fixture.controls.advance(minute)).toEqual([])
     expect(fixture.controls.advance(0)).toEqual([])
+    expect(fixture.controls.advance(1)).toEqual([])
+    expect(fixture.controls.advance(998)).toEqual([])
+    expect(seen.map((alarm) => alarm.name)).toEqual(["once", "zero", "zero"])
+    expect(fixture.controls.advance(1)).toEqual([])
     expect(seen.map((alarm) => alarm.name)).toEqual(["once", "zero", "zero", "zero"])
     expect(yield* alarms.getAll).toEqual([
       { name: "zero", scheduledTime: 5, periodInMinutes: 0, persistAcrossSessions: true }

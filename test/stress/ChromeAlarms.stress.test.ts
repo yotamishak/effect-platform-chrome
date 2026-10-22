@@ -219,8 +219,12 @@ describe("ChromeAlarms stress", () => {
     const results = yield* Effect.forEach(Array.from({ length: 1024 }, (_, index) => index), (index) =>
       Effect.result(alarms.create(`alarm-${index % 600}`, { delayInMinutes: 1 + index })), { concurrency: "unbounded" })
 
+    // Exactly the first 500 succeed: the next 100 are new names over the cap, and the last
+    // 424 would replace alarm-0..alarm-423 but Chrome checks the cap before replacing.
     const failures = results.filter(Result.isFailure).map((result) => result.failure)
-    expect(results.filter(Result.isSuccess).length).toBeGreaterThanOrEqual(500)
+    expect(results.filter(Result.isSuccess)).toHaveLength(500)
+    expect(failures).toHaveLength(524)
+    expect(results.slice(0, 500).every(Result.isSuccess)).toBe(true)
 
     for (const failure of failures) {
       expect(failure.operation).toBe("create")
@@ -358,9 +362,13 @@ describe("ChromeAlarms stress", () => {
     expect(fixture.controls.advance(500)).toEqual([])
     expect(seen).toEqual(Array.from({ length: 500 }, (_, index) => `alarm-${499 - index}`))
 
-    // The next poll fires exactly what was due once the previous dispatch had finished.
+    // The next poll, a second later, fires exactly what was due once the previous dispatch had
+    // finished; one sooner fires nothing.
+    expect(fixture.controls.advance(999)).toEqual([])
+    expect(seen).toHaveLength(500)
+    const next = fixture.controls.now + 1
     const before = yield* alarms.getAll
-    const due = before.filter((alarm) => alarm.scheduledTime <= fixture.controls.now).map((alarm) => alarm.name).reverse()
+    const due = before.filter((alarm) => alarm.scheduledTime <= next).map((alarm) => alarm.name).reverse()
     expect(due.length).toBeGreaterThan(0)
     expect(due.every((name) => name.startsWith("fresh-"))).toBe(true)
     // The surviving repeating alarms plus the creations reach the cap mid-dispatch.
@@ -370,7 +378,7 @@ describe("ChromeAlarms stress", () => {
 
     seen.length = 0
     const created = fresh
-    expect(fixture.controls.advance(0)).toEqual([])
+    expect(fixture.controls.advance(1)).toEqual([])
     expect(seen).toEqual(due)
 
     // What is left is repeating alarms on their next slot and the second dispatch's creations.

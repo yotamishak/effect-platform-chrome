@@ -9,9 +9,15 @@ const maxNameBytes = 1024
 
 const minute = 60_000
 
+/**
+ * Chrome's minimum time between an extension's firing polls: `kDevDelayMinimum` for an
+ * unpacked extension, and from Chrome 153 `kMV3ReleaseDelayMinimum` for a packed MV3 one.
+ */
+const granularity = 1_000
+
 const nameBytes = new TextEncoder()
 
-/** Chrome's own equality: re-creating an alarm equal in all of these is a no-op. */
+/** Chrome 157+'s own equality: re-creating an alarm equal in all of these is a no-op. */
 const identical = (left: ChromeAlarms.Alarm, right: ChromeAlarms.Alarm): boolean =>
   left.name === right.name && left.scheduledTime === right.scheduledTime &&
   left.periodInMinutes === right.periodInMinutes && left.persistAcrossSessions === right.persistAcrossSessions
@@ -26,18 +32,23 @@ type CreateArgs = [info: ChromeAlarms.AlarmCreateInfo] | [name: string | undefin
  * replacing) and replaces an alarm of the same name, moving it last. Names default to the
  * empty string, `persistAcrossSessions` to true, and `periodInMinutes` is present only when
  * given. Re-creating an alarm identical in name, scheduled time, period and persistence is a
- * no-op that keeps its place, as in Chrome. The fixture behaves like an unpacked extension: no
- * 30-second minimum. `advance` is one Chrome poll: every due alarm is updated first (one-shot
- * alarms removed, repeating ones moved to their first slot after the new time on their
- * original grid, a zero period left due so it fires on every poll), then each fires once,
- * newest first as Chrome does. Listeners therefore see the polled state, and an alarm they
- * create or clear affects only later polls. `clearAll` resolves `true`. Pass `overrides` to
- * replace any API member.
+ * no-op that keeps its place, as from Chrome 157 (earlier versions replace it, moving it last).
+ * The fixture behaves like an unpacked extension, or any MV3 extension from Chrome 153: polls
+ * that fire come at least one second apart. `advance` moves the clock and makes the poll Chrome
+ * would make at the new time. Within a second of the last poll that fired an alarm there is
+ * none, and due alarms wait for a later `advance`. Otherwise every due alarm is updated first
+ * (one-shot alarms removed, repeating ones moved to their first slot after the new time on
+ * their original grid, a zero period left due so it fires on every poll), then each fires
+ * once, newest first as Chrome does. Listeners therefore see the polled state, and an alarm
+ * they create or clear affects only later polls. `clearAll` resolves `true`. Pass `overrides`
+ * to replace any API member.
  */
 export const makeAlarms = (overrides: Partial<ChromeAlarms.ChromeAlarmsApi> = {}) => {
   const alarms = new Map<string, ChromeAlarms.Alarm>()
   const onAlarm = TestEvent.makeEvent<[ChromeAlarms.Alarm]>()
   let now = 0
+  /** When a poll last fired an alarm; Chrome keeps it in memory only. */
+  let lastPoll: number | undefined
 
   const schedule = (args: CreateArgs): void => {
     const name = args.length === 1 ? undefined : args[0]
@@ -76,7 +87,7 @@ export const makeAlarms = (overrides: Partial<ChromeAlarms.ChromeAlarmsApi> = {}
 
     const existing = alarms.get(alarmName)
 
-    // Chrome leaves an identical alarm untouched, keeping its place.
+    // Chrome 157+ leaves an identical alarm untouched, keeping its place.
     if (existing !== undefined && identical(existing, alarm)) return
 
     alarms.delete(alarmName)
@@ -116,8 +127,9 @@ export const makeAlarms = (overrides: Partial<ChromeAlarms.ChromeAlarmsApi> = {}
         return alarm === undefined ? undefined : structuredClone(alarm)
       },
       /**
-       * Moves the clock forward by `milliseconds` and fires every due alarm once, as one Chrome
-       * poll does after a wake. Returns the exceptions thrown by listeners.
+       * Moves the clock forward by `milliseconds` and, unless a poll fired an alarm less than a
+       * second ago, fires every due alarm once, as one Chrome poll does after a wake. Returns
+       * the exceptions thrown by listeners.
        */
       advance: (milliseconds: number): ReadonlyArray<unknown> => {
         if (!Number.isFinite(milliseconds) || milliseconds < 0) {
@@ -125,7 +137,14 @@ export const makeAlarms = (overrides: Partial<ChromeAlarms.ChromeAlarmsApi> = {}
         }
 
         now += milliseconds
+
+        // Chrome skips the extension until its minimum granularity has passed.
+        if (lastPoll !== undefined && lastPoll + granularity > now) return []
+
         const due = Array.from(alarms.values()).filter((alarm) => alarm.scheduledTime <= now).reverse()
+
+        // Only a poll that fires an alarm starts the wait, as in Chrome.
+        if (due.length > 0) lastPoll = now
 
         // Chrome updates every due alarm in the browser before any listener runs, so the
         // listeners see the polled state and cannot affect this poll.
@@ -142,8 +161,13 @@ export const makeAlarms = (overrides: Partial<ChromeAlarms.ChromeAlarmsApi> = {}
 
         return due.flatMap((alarm) => onAlarm.controls.emit(structuredClone(alarm)))
       },
-      /** The browser restarts: alarms created with `persistAcrossSessions: false` are gone. */
+      /**
+       * The browser restarts: alarms created with `persistAcrossSessions: false` are gone, and
+       * so is the time of the last poll.
+       */
       restart: () => {
+        lastPoll = undefined
+
         for (const alarm of Array.from(alarms.values())) {
           if (!alarm.persistAcrossSessions) alarms.delete(alarm.name)
         }

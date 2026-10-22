@@ -38,11 +38,12 @@ export interface ChromeAlarmsService {
    * defaults to true. The first firing comes from exactly one of `when` or `delayInMinutes`,
    * or from `periodInMinutes` when neither is set. Chrome fails the call when the extension
    * already has 500 alarms (even when this one would replace one of them) or the name exceeds
-   * 1,024 bytes. Packed extensions fire at most every 30 seconds; shorter delays only warn.
-   * Re-creating an identical alarm (same name, scheduled time, period and persistence) leaves
-   * it in place. Any present `periodInMinutes` repeats, and `0` keeps the alarm due so it
-   * fires on every poll: omit the field for a one-shot alarm. Interrupting the Effect does not
-   * cancel a create Chrome has already started.
+   * 1,024 bytes. An extension's alarms fire at most once a second; before Chrome 153 a packed
+   * MV3 extension's fire at most every 30 seconds. Shorter delays only warn. From Chrome 157,
+   * re-creating an identical alarm (same name, scheduled time, period and persistence) leaves
+   * it in place; earlier versions replace it. Any present `periodInMinutes` repeats, and `0`
+   * keeps the alarm due so it fires on every poll: omit the field for a one-shot alarm.
+   * Interrupting the Effect does not cancel a create Chrome has already started.
    */
   create(info: AlarmCreateInfo): Effect.Effect<void, ChromeAlarmsError>
   create(name: undefined, info: AlarmCreateInfo): Effect.Effect<void, ChromeAlarmsError>
