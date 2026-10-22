@@ -26,6 +26,11 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
 })
 ```
 
+`fail(error)` copies exactly `code` and `message` out of `error`. Any value with those two
+fields works: an `Error` subclass with a `code` keeps its message, which JSON would otherwise
+drop because an `Error`'s `message` is not enumerable, and a received `ChromeMessageError` is
+relayed without its `_tag`. Other keys are never sent.
+
 The value travels as it is given, so a sender decoding with a transforming schema (for
 example `Schema.FiniteFromString`) expects its encoded form.
 `Schema.encodeEffect(ChromeMessage.Response(value))` encodes a whole envelope with the value

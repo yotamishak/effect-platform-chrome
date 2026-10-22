@@ -52,8 +52,15 @@ export const Response = <Value extends Schema.Constraint>(value: Value): Respons
 /** A success envelope. The value travels as given, so send the value schema's encoded form. */
 export const succeed = <A>(value: A): Response<A> => ({ ok: true, value })
 
-/** A failure envelope. */
-export const fail = (error: WorkerError): Response<never> => ({ ok: false, error })
+/**
+ * A failure envelope carrying exactly `code` and `message`. Both are copied out, so an `Error`
+ * that fits `WorkerError` keeps its non-enumerable `message` over JSON, and extra keys (a
+ * relayed `ChromeMessageError`'s `_tag`, unserializable context) are never sent.
+ */
+export const fail = (error: WorkerError): Response<never> => ({
+  ok: false,
+  error: { code: error.code, message: error.message }
+})
 
 /** The receiver answered, but with a failure envelope. */
 export class ChromeMessageError extends Schema.TaggedError<ChromeMessageError>()("ChromeMessageError", {

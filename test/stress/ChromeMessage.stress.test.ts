@@ -42,6 +42,16 @@ type Outcome =
   | { readonly kind: "failure"; readonly code: ErrorCode; readonly message: string }
   | { readonly kind: "invalid" }
 
+/** A fuzzed reply field: anything JSON delivers, or a key left out. */
+type Wild = undefined | null | boolean | number | string | symbol | ReadonlyArray<number> | { readonly [key: string]: string | number }
+
+/** A fuzzed reply object; each envelope key may be missing or of any kind. */
+interface Fuzzed {
+  ok?: Wild
+  value?: Wild
+  error?: Wild
+}
+
 interface Case {
   readonly reply: unknown
   readonly expected: Outcome
@@ -148,6 +158,93 @@ describe("ChromeMessage stress", () => {
     })
     expect(finished).toBe(stages.filter((stage) => stage === 2).length)
     expect(new Set(stages)).toStrictEqual(new Set([0, 1, 2]))
+  }))
+
+  it.effect("agrees with decoding the whole Response envelope on 1,024 fuzzed replies", () => Effect.gen(function*() {
+    const random = seeded(0xE7E10E)
+    const pick = <A>(items: ReadonlyArray<A>): A => items[Math.floor(random() * items.length)]!
+
+    const schemas = [
+      Schema.FiniteFromString,
+      Schema.UndefinedOr(Schema.FiniteFromString),
+      Schema.Struct({ count: Schema.FiniteFromString }),
+      Schema.NullOr(Schema.Finite),
+      Schema.Unknown,
+      Schema.Void
+    ] as const
+
+    const absent = Symbol("absent")
+    const oks: ReadonlyArray<Wild> = [true, true, false, false, "true", 1, null, undefined, absent]
+    const values: ReadonlyArray<Wild> = [absent, undefined, null, 0, 7, "7", "x", "", { count: "3" }, { count: 3 }, [1], {}]
+
+    const errors: ReadonlyArray<Wild> = [
+      absent, null, "boom", { code: "Overflow", message: "full" }, { code: "Disposed", message: "" },
+      { code: "Other", message: "m" }, { code: "Overflow" }, { code: "HandlerFailed", message: "m", stack: "s" }
+    ]
+
+    const replies = Array.from({ length: 1024 }, (): Fuzzed | Wild => {
+      if (random() < 0.05) return pick<Wild>([undefined, null, 0, "", [], true])
+
+      const reply: Fuzzed = {}
+
+      for (const [key, choices] of [["ok", oks], ["value", values], ["error", errors]] as const) {
+        const choice = pick(choices)
+
+        if (choice !== absent) reply[key] = choice
+      }
+
+      return reply
+    })
+
+    const summary = <A>(decoded: Effect.Effect<A, ChromeMessageError | Schema.SchemaError>) => decoded.pipe(
+      Effect.map((value) => ({ kind: "value", value }) as const),
+      Effect.catchTags({
+        ChromeMessageError: (error) => Effect.succeed({ kind: "failure", code: error.code, message: error.message } as const),
+        SchemaError: (error) => Effect.succeed({ kind: "invalid", message: error.message } as const)
+      })
+    )
+
+    const direct = yield* Effect.forEach(replies, (reply, index) => summary(decodeResponse(schemas[index % schemas.length]!)(reply)))
+
+    const whole = yield* Effect.forEach(replies, (reply, index) => summary(Effect.flatMap(
+      Schema.decodeUnknownEffect(Response(schemas[index % schemas.length]!))(reply),
+      (response) => response.ok ? Effect.succeed(response.value) : Effect.fail(new ChromeMessageError(response.error))
+    )))
+
+    expect(direct).toStrictEqual(whole)
+    expect(new Set(direct.map(({ kind }) => kind))).toStrictEqual(new Set(["value", "failure", "invalid"]))
+  }))
+
+  it.effect("delivers 1,024 fail envelopes of every kind of WorkerError over JSON as the same code and message", () => Effect.gen(function*() {
+    const random = seeded(0xFA11)
+
+    class CodedError extends Error {
+      constructor(readonly code: ErrorCode, message: string) {
+        super(message)
+      }
+    }
+
+    const senders: ReadonlyArray<(code: ErrorCode, message: string) => WorkerError> = [
+      (code, message) => ({ code, message }),
+      (code, message) => new CodedError(code, message),
+      (code, message) => new ChromeMessageError({ code, message }),
+      (code, message) => ({ code, message, stack: "s", cause: { nested: [1, 2] } })
+    ]
+
+    const decode = decodeResponse(Schema.Never)
+
+    const sent = Array.from({ length: 1024 }, (_, index) => ({
+      code: codes[Math.floor(random() * codes.length)]!,
+      message: random() < 0.1 ? "" : `failure ${index} \u{1F600}`
+    }))
+
+    const received = yield* Effect.forEach(sent, ({ code, message }, index) => Effect.flip(Effect.catchTag(
+      decode(overTheWire(fail(senders[index % senders.length]!(code, message)))),
+      "SchemaError",
+      Effect.die
+    )))
+
+    expect(received.map(({ code, message }) => ({ code, message }))).toStrictEqual(sent)
   }))
 
   it.effect("keeps 512 concurrently built decoders for different schemas apart", () => Effect.gen(function*() {

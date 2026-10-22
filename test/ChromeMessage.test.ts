@@ -61,6 +61,41 @@ describe("ChromeMessage", () => {
     it("defines exactly the four codes ChromeServiceWorker reports", () => {
       expect(ErrorCode.literals).toStrictEqual(codes)
     })
+
+    it.effect("fails with an Error that is a WorkerError, whose message JSON would drop", () => Effect.gen(function*() {
+      class HandlerFailure extends Error {
+        readonly code = "HandlerFailed" as const
+      }
+
+      const failure = new HandlerFailure("boom")
+
+      // An Error's own message is not enumerable, so JSON would send it as { code } alone.
+      expect(JSON.parse(JSON.stringify(failure))).toStrictEqual({ code: "HandlerFailed" })
+
+      const error = yield* messageFailure(decodeResponse(Value)(overTheWire(fail(failure))))
+
+      expect({ code: error.code, message: error.message }).toStrictEqual({ code: "HandlerFailed", message: "boom" })
+      expect(fail(failure)).toStrictEqual({ ok: false, error: { code: "HandlerFailed", message: "boom" } })
+    }))
+
+    it.effect("relays a received ChromeMessageError as exactly the envelope it came from", () => Effect.gen(function*() {
+      const received = yield* messageFailure(decodeResponse(Value)(fail({ code: "Overflow", message: "full" })))
+
+      expect(fail(received)).toStrictEqual({ ok: false, error: { code: "Overflow", message: "full" } })
+      expect(overTheWire(fail(received))).toStrictEqual({ ok: false, error: { code: "Overflow", message: "full" } })
+    }))
+
+    it("sends no WorkerError key beyond code and message, so extra context cannot break serialization", () => {
+      interface Cyclic { self?: Cyclic }
+
+      const cyclic: Cyclic = {}
+
+      cyclic.self = cyclic
+
+      const error = { code: "HandlerFailed" as const, message: "m", context: cyclic }
+
+      expect(overTheWire(fail(error))).toStrictEqual({ ok: false, error: { code: "HandlerFailed", message: "m" } })
+    })
   })
 
   describe("decodeResponse", () => {
