@@ -45,7 +45,10 @@ add its id in the same call.
 it reads the current ids, then removes all of them and adds `rules` in a single
 update. Each service runs its writes to one set (updates and replacements) one at a
 time, so concurrent replacements from the same service never read a stale set and
-collide. Writers in other extension contexts (a popup, an options page) have their own
+collide. Chrome applies rule updates in call order but answers reads at once, and
+cannot take back an update it has received, so interrupting (or timing out) a write
+waits until Chrome has settled it; only then can the next write read the set. Writers
+in other extension contexts (a popup, an options page) have their own
 service and can still interleave with a replacement; keep rule writes in one context
 when that matters. Session writes do not wait for dynamic ones.
 
@@ -127,8 +130,11 @@ It follows Chromium's implementation:
   enable/disable precedence match Chrome. Ruleset sizes are not modelled;
   `getAvailableStaticRuleCount` reports `setup.availableStaticRuleCount` (30,000 by
   default) until `controls.setAvailableStaticRuleCount`.
-- `isRegexSupported` approximates RE2: JavaScript's `RegExp` minus lookarounds and
-  backreferences.
+- `isRegexSupported` (and `regexFilter` validation) approximates RE2: it accepts RE2-only
+  syntax (flag groups such as `(?i)`, `(?P<name>…)`, `\A`, `\z`, `\Q…\E`, `\x{…}`, octal
+  escapes) and rejects what JavaScript allows but RE2 does not (lookarounds,
+  backreferences, letter escapes RE2 does not define such as `\u` or `\Z`, repeat counts
+  above 1,000). It never reports `memoryLimitExceeded`.
 - Requests are never matched: `getMatchedRules` returns what `controls.recordMatch`
   recorded (filtered like Chrome, with no quota), and `testMatchOutcome` validates the
   request and returns no rules.

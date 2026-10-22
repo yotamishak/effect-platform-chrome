@@ -34,56 +34,157 @@ const isAscii = (text: string): boolean => {
   return true
 }
 
-/**
- * Whether `regex` uses JavaScript syntax that RE2 rejects: lookarounds and backreferences.
- * Escapes and character classes are skipped, so `\(?=` and `[(?=]` are not lookaheads.
- */
-const usesSyntaxRe2Lacks = (regex: string): boolean => {
-  let inClass = false
+/** RE2's largest repeat count: `a{1001}` is a syntax error. */
+const maxRepeat = 1000
 
-  for (let index = 0; index < regex.length; index += 1) {
-    const char = regex[index]
+/** The letter escapes RE2 defines outside a character class; any other letter is a syntax error. */
+const re2Escapes: ReadonlySet<string> = new Set("afnrtvxdDsSwWbBAzQECpP")
+
+/** Inside a class RE2 allows only C escapes, `\x`, Perl classes and Unicode groups. */
+const re2ClassEscapes: ReadonlySet<string> = new Set("afnrtvxdDsSwWpP")
+
+const isOctal = (char: string): boolean => char >= "0" && char <= "7"
+
+/** A JavaScript `\uXXXX` escape, clamped to the BMP: only whether it compiles matters. */
+const unitEscape = (codePoint: number): string => `\\u${Math.min(codePoint, 0xffff).toString(16).padStart(4, "0")}`
+
+/**
+ * Reads the escape starting at the backslash `regex[index]` as RE2 does: its JavaScript
+ * equivalent and length, or undefined when RE2 rejects it.
+ */
+const readEscape = (regex: string, index: number, inClass: boolean): { readonly js: string, readonly length: number } | undefined => {
+  const next = regex.charAt(index + 1)
+
+  // \0, and \1-\7 followed by an octal digit, are octal escapes of up to three digits; a lone
+  // \1-\9 would be a backreference, and \8 or \9 is nothing.
+  if (next >= "0" && next <= "9") {
+    if (next === "8" || next === "9" || (next !== "0" && !isOctal(regex.charAt(index + 2)))) return undefined
+
+    let digits = next
+
+    while (digits.length < 3 && isOctal(regex.charAt(index + 1 + digits.length))) digits += regex.charAt(index + 1 + digits.length)
+
+    return { js: unitEscape(Number.parseInt(digits, 8)), length: 1 + digits.length }
+  }
+
+  if (next === "x") {
+    const hex = /^(?:([0-9A-Fa-f]{2})|\{([0-9A-Fa-f]+)\})/.exec(regex.slice(index + 2))
+
+    if (hex === null) return undefined
+
+    const codePoint = Number.parseInt(hex[1] ?? hex[2] ?? "", 16)
+
+    return codePoint > 0x10ffff ? undefined : { js: unitEscape(codePoint), length: 2 + hex[0].length }
+  }
+
+  // \Q…\E (or to the end) is literal text.
+  if (!inClass && next === "Q") {
+    const end = regex.indexOf("\\E", index + 2)
+    const text = regex.slice(index + 2, end === -1 ? regex.length : end)
+
+    return { js: text.replace(/[\\^$.*+?()[\]{}|/-]/g, "\\$&"), length: (end === -1 ? regex.length : end + 2) - index }
+  }
+
+  if (/^[A-Za-z]$/.test(next) && !(inClass ? re2ClassEscapes : re2Escapes).has(next)) return undefined
+
+  // Punctuation is literal; a trailing backslash is left for RegExp to reject.
+  return { js: `\\${next}`, length: 2 }
+}
+
+/**
+ * Translates an RE2 pattern into JavaScript that compiles when RE2 would parse it, or
+ * returns undefined when RE2 rejects it outright. RE2-only syntax (flag groups such as
+ * `(?i)`, `(?P<name>…)`, `\A`, `\z`, `\Q…\E`, `\C`, `\x{…}`, octal escapes, a leading `]` in a
+ * class) is translated; what JavaScript accepts but RE2 does not (lookarounds,
+ * backreferences, undefined letter escapes such as `\u` or `\Z`, repeat counts above 1000)
+ * is rejected.
+ */
+const toJavaScript = (regex: string): string | undefined => {
+  let js = ""
+  let inClass = false
+  let index = 0
+
+  while (index < regex.length) {
+    const char = regex.charAt(index)
 
     if (char === "\\") {
-      const next = regex[index + 1] ?? ""
+      const escape = readEscape(regex, index, inClass)
 
-      if (!inClass && (/[1-9]/.test(next) || (next === "k" && regex[index + 2] === "<"))) return true
+      if (escape === undefined) return undefined
 
-      index += 1
+      js += escape.js
+      index += escape.length
       continue
     }
 
     if (inClass) {
       if (char === "]") inClass = false
 
+      js += char
+      index += 1
       continue
     }
 
     if (char === "[") {
+      const opening = regex.charAt(index + 1) === "^" ? "[^" : "["
+      const literalBracket = regex.charAt(index + opening.length) === "]"
       inClass = true
+      js += literalBracket ? `${opening}\\]` : opening
+      index += opening.length + (literalBracket ? 1 : 0)
       continue
     }
 
-    if (char === "(" && regex[index + 1] === "?") {
-      const marker = regex.slice(index + 2, index + 4)
+    if (char === "{") {
+      const repeat = /^\{(\d+)(?:,(\d*))?\}/.exec(regex.slice(index))
 
-      if (marker.startsWith("=") || marker.startsWith("!") || marker === "<=" || marker === "<!") return true
+      if (repeat !== null && [repeat[1], repeat[2]].some((count) => count !== undefined && count !== "" && Number(count) > maxRepeat)) return undefined
     }
+
+    if (char === "(" && regex.charAt(index + 1) === "?") {
+      const rest = regex.slice(index + 2)
+
+      // Lookarounds and (?P=name) backreferences.
+      if (/^(?:[=!]|<[=!]|P=)/.test(rest)) return undefined
+
+      if (rest.startsWith("P<")) {
+        js += "(?<"
+        index += 4
+        continue
+      }
+
+      const flags = /^([imsU]*(?:-[imsU]+)?)([:)])/.exec(rest)
+
+      if (flags !== null) {
+        const set = flags[1] ?? ""
+        const end = flags[2] ?? ""
+
+        // `(?)` sets no flags and opens no group.
+        if (set === "" && end === ")") return undefined
+
+        js += end === ":" ? "(?:" : ""
+        index += 2 + flags[0].length
+        continue
+      }
+    }
+
+    js += char
+    index += 1
   }
 
-  return false
+  return js
 }
 
 /**
- * Approximates RE2: accepts what JavaScript's `RegExp` compiles, except lookarounds and
- * backreferences. RE2-only syntax such as `(?P<name>…)` is rejected, and no expression
- * is ever too large.
+ * Approximates RE2 by compiling the `toJavaScript` translation with `RegExp`. Expressions
+ * are never too large, and invalid names in `\p{…}` or `[[:…:]]` are not detected.
  */
 const regexSupport = (options: ChromeDeclarativeNetRequest.RegexOptions): ChromeDeclarativeNetRequest.RegexSupport => {
-  if (usesSyntaxRe2Lacks(options.regex)) return { isSupported: false, reason: "syntaxError" }
+  const translated = toJavaScript(options.regex)
+
+  if (translated === undefined) return { isSupported: false, reason: "syntaxError" }
 
   try {
-    new RegExp(options.regex, options.isCaseSensitive === false ? "i" : "")
+    new RegExp(translated, options.isCaseSensitive === false ? "i" : "")
 
     return { isSupported: true }
   } catch {

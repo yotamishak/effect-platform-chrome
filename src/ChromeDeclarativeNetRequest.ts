@@ -89,7 +89,10 @@ export interface ChromeDeclarativeNetRequestApi {
  *
  * Each service runs its dynamic-rule writes (`updateDynamicRules`, `replaceDynamicRules`)
  * one at a time, and likewise its session-rule writes, so a replacement's read and write
- * are never interleaved with another write from the same service.
+ * are never interleaved with another write from the same service. Chrome queues rule
+ * updates but serves reads at once and cannot cancel an update it has, so interrupting a
+ * writer (or timing it out) waits for Chrome to settle its update before the next one
+ * starts.
  */
 export interface ChromeDeclarativeNetRequestService {
   /**
@@ -210,13 +213,20 @@ export const make = (api: ChromeDeclarativeNetRequestApi): ChromeDeclarativeNetR
   const dynamicWrites = Semaphore.makeUnsafe(1)
   const sessionWrites = Semaphore.makeUnsafe(1)
 
-  const updateDynamicRules = (options: UpdateRuleOptions) => invoke("updateDynamicRules", () => api.updateDynamicRules(options))
+  // Chrome queues rule updates but serves reads at once, and cannot cancel an update it
+  // has. An interrupted writer therefore keeps the permit until Chrome settles its update;
+  // otherwise the next replacement could read the set before that update lands.
+  const updateDynamicRules = (options: UpdateRuleOptions) => Effect.uninterruptible(
+    invoke("updateDynamicRules", () => api.updateDynamicRules(options))
+  )
 
   const getDynamicRules = (filter?: GetRulesFilter) => invoke("getDynamicRules", () => filter === undefined
     ? api.getDynamicRules()
     : api.getDynamicRules(filter))
 
-  const updateSessionRules = (options: UpdateRuleOptions) => invoke("updateSessionRules", () => api.updateSessionRules(options))
+  const updateSessionRules = (options: UpdateRuleOptions) => Effect.uninterruptible(
+    invoke("updateSessionRules", () => api.updateSessionRules(options))
+  )
 
   const getSessionRules = (filter?: GetRulesFilter) => invoke("getSessionRules", () => filter === undefined
     ? api.getSessionRules()

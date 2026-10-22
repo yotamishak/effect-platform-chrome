@@ -382,11 +382,16 @@ describe("ChromeDeclarativeNetRequest stress", () => {
 
     const writing = yield* Effect.forkScoped(rules.replaceDynamicRules([block(2, "writing")]), { startImmediately: true })
     yield* Effect.promise(() => writeStarted.opened)
-    yield* Fiber.interrupt(writing)
+    // Chrome cannot cancel the write, so the interruption waits for it before freeing the permit.
+    const interrupting = yield* Effect.forkScoped(Fiber.interrupt(writing), { startImmediately: true })
+    const after = yield* Effect.forkScoped(rules.replaceDynamicRules([block(3, "after")]), { startImmediately: true })
+    expect(getDynamicRules).toHaveBeenCalledTimes(2)
+    expect(interrupting.pollUnsafe()).toBeUndefined()
     write.open()
+    yield* Fiber.join(interrupting)
+    expect(Exit.hasInterrupts(yield* Fiber.await(writing))).toBe(true)
     yield* Effect.promise(() => landed)
-    expect(fixture.controls.dynamicRules()).toEqual([block(2, "writing")])
-    yield* rules.replaceDynamicRules([block(3, "after")])
+    yield* Fiber.join(after)
     expect(fixture.controls.dynamicRules()).toEqual([block(3, "after")])
     expect(updateDynamicRules.mock.calls.map(([options]) => options)).toEqual([
       { removeRuleIds: [], addRules: [block(2, "writing")] },
@@ -460,6 +465,107 @@ describe("ChromeDeclarativeNetRequest stress", () => {
     yield* rules.updateDynamicRules({ removeRuleIds: [1], addRules: [regexRule(601)] })
     expect(fixture.controls.dynamicRules()).toHaveLength(600)
     expect(fixture.controls.sessionRules()).toHaveLength(400)
+  }))
+
+  it.effect("never reads a stale set when 384 writers are interrupted at random points while Chrome queues their updates", () => Effect.gen(function*() {
+    const random = seeded(384)
+    const fixture = TestDeclarativeNetRequest.makeDeclarativeNetRequest()
+    /** Settles after `count` microtask hops. */
+    const hops = (count: number): Promise<void> => range(0, count).reduce((pending) => pending.then(() => undefined), Promise.resolve())
+    const applied: Array<{ readonly scope: "dynamic" | "session", readonly options: UpdateRuleOptions }> = []
+    const rejected: Array<unknown> = []
+    /** The operations whose replacement Chrome has but has not applied yet. */
+    const inFlight = new Set<number>()
+    const operationOf = (options: UpdateRuleOptions) => Number(options.addRules?.[0]?.condition.urlFilter?.slice(3) ?? Number.NaN)
+    // Chrome applies updates one at a time in call order, each a few hops after the last,
+    // but serves reads immediately from the current set.
+    let tail: Promise<unknown> = Promise.resolve()
+
+    const queued = (scope: "dynamic" | "session", apply: (options: UpdateRuleOptions) => Promise<void>) => (options: UpdateRuleOptions) => {
+      const delay = Math.floor(random() * 6)
+      const operation = operationOf(options)
+      inFlight.add(operation)
+
+      const result = tail.then(() => hops(delay)).then(() => apply(options)).finally(() => inFlight.delete(operation)).then(
+        () => { applied.push({ scope, options: structuredClone(options) }) },
+        (cause: unknown) => {
+          rejected.push(cause)
+          throw cause
+        }
+      )
+
+      tail = result.catch(() => undefined)
+
+      return result
+    }
+
+    const rules = make({
+      ...fixture.api,
+      updateDynamicRules: queued("dynamic", (options) => fixture.api.updateDynamicRules(options)),
+      updateSessionRules: queued("session", (options) => fixture.api.updateSessionRules(options))
+    })
+
+    const fibers: Array<Fiber.Fiber<void, ChromeDeclarativeNetRequestError>> = []
+    const interrupters: Array<Fiber.Fiber<void>> = []
+
+    for (const index of range(0, 384)) {
+      // Every replacement reuses ids 1..k, so one built from a stale read collides.
+      const replacement = range(1, 1 + Math.floor(random() * 4)).map((id) => block(id, `op-${index}`))
+
+      const operations = {
+        replaceDynamic: rules.replaceDynamicRules(replacement),
+        replaceSession: rules.replaceSessionRules(replacement),
+        removeDynamic: rules.updateDynamicRules({ removeRuleIds: [1] })
+      }
+
+      const kind = pick(random, ["replaceDynamic", "replaceSession", "removeDynamic"] as const)
+      fibers.push(yield* Effect.forkScoped(operations[kind], { startImmediately: true }))
+
+      if (random() < 0.4) {
+        // Half the time, a writer whose update Chrome already holds.
+        const writer = inFlight.size > 0 && random() < 0.5 ? fibers[pick(random, Array.from(inFlight))] : undefined
+        const target = writer ?? pick(random, fibers)
+        interrupters.push(yield* Effect.forkScoped(Fiber.interrupt(target), { startImmediately: true }))
+      }
+
+      yield* Effect.promise(() => hops(Math.floor(random() * 8)))
+    }
+
+    yield* Effect.forEach(interrupters, Fiber.join, { discard: true })
+    const exits = yield* Effect.forEach(fibers, Fiber.await)
+    yield* Effect.promise(() => tail)
+    // No write ever collided with a rule its replacement failed to see.
+    expect(rejected).toEqual([])
+
+    for (const exit of exits) {
+      if (Exit.isFailure(exit)) expect(Exit.hasInterrupts(exit) && !Cause.hasFails(exit.cause)).toBe(true)
+    }
+
+    const interrupted = exits.filter(Exit.hasInterrupts).length
+    expect(interrupted).toBeGreaterThan(40)
+    expect(exits.length - interrupted).toBeGreaterThan(150)
+
+    // Some writers were interrupted after Chrome already had their update.
+    const writtenThenInterrupted = exits.filter((exit, index) => Exit.hasInterrupts(exit)
+      && applied.some(({ options }) => options.addRules?.some((rule) => rule.condition.urlFilter === `op-${index}`))).length
+
+    expect(writtenThenInterrupted).toBeGreaterThan(5)
+    // Replaying Chrome's applied updates in order reproduces the final sets, and every
+    // replacement removed exactly the ids present when Chrome applied it.
+    const replay = { dynamic: new Map<number, Rule>(), session: new Map<number, Rule>() }
+
+    for (const { scope, options } of applied) {
+      const set = replay[scope]
+
+      if (options.addRules !== undefined) expect([...(options.removeRuleIds ?? [])].sort((a, b) => a - b)).toEqual(Array.from(set.keys()).sort((a, b) => a - b))
+
+      for (const id of options.removeRuleIds ?? []) set.delete(id)
+
+      for (const rule of options.addRules ?? []) set.set(rule.id, rule)
+    }
+
+    expect(fixture.controls.dynamicRules()).toEqual(Array.from(replay.dynamic.values()))
+    expect(fixture.controls.sessionRules()).toEqual(Array.from(replay.session.values()))
   }))
 
   it.effect("starts 4096 gesture calls at once, settling run and abandoned ones without leaks", () => Effect.gen(function*() {

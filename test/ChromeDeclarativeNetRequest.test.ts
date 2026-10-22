@@ -465,6 +465,136 @@ describe("ChromeDeclarativeNetRequest", () => {
   })
 })
 
+describe("ChromeDeclarativeNetRequest edge cases", () => {
+  it.effect("delivers a debug match Chrome dispatches while the listener is being added", () => Effect.gen(function*() {
+    const event = makeEvent<[MatchedRuleDebug]>()
+
+    const eager: EventSource<[MatchedRuleDebug]> = {
+      addListener: (listener) => {
+        event.api.addListener(listener)
+        listener(debugMatch("during-registration"))
+      },
+      removeListener: (listener) => event.api.removeListener(listener)
+    }
+
+    const rules = make({ ...mockApi().api, onRuleMatchedDebug: eager })
+    expect(yield* Stream.runCollect(Stream.take(rules.onRuleMatchedDebug, 1))).toEqual([debugMatch("during-registration")])
+    expect(event.controls.listenerCount).toBe(0)
+  }))
+
+  it.effect("ignores a dispatch that reaches a listener after its stream ended", () => Effect.gen(function*() {
+    const event = makeEvent<[MatchedRuleDebug]>()
+    const added: Array<(info: MatchedRuleDebug) => void> = []
+
+    const capturing: EventSource<[MatchedRuleDebug]> = {
+      addListener: (listener) => {
+        added.push(listener)
+        event.api.addListener(listener)
+      },
+      removeListener: (listener) => event.api.removeListener(listener)
+    }
+
+    const rules = make({ ...mockApi().api, onRuleMatchedDebug: capturing })
+    const fiber = yield* Effect.forkScoped(Stream.runCollect(Stream.take(rules.onRuleMatchedDebug, 1)))
+    yield* Effect.promise(() => event.controls.waitForListener())
+    event.controls.emit(debugMatch("1"))
+    expect(yield* Fiber.join(fiber)).toEqual([debugMatch("1")])
+    // Chrome may still run a listener for an event it queued before the removal.
+    expect(() => added[0]?.(debugMatch("late"))).not.toThrow()
+    expect(added).toHaveLength(1)
+  }))
+
+  it.effect("shares one gesture call between every fiber that awaits it", () => Effect.gen(function*() {
+    const mock = mockApi()
+    const settle = gate()
+
+    mock.api.getMatchedRules.mockImplementationOnce(async () => {
+      await settle.opened
+
+      return { rulesMatchedInfo: [matchInfo] }
+    })
+
+    const started = make(mock.api).getMatchedRulesFromUserGesture()
+    const [first, second, third] = yield* Effect.forEach([1, 2, 3], () => Effect.forkScoped(started, { startImmediately: true }))
+    yield* Fiber.interrupt(present(first))
+    settle.open()
+    expect(yield* Fiber.join(present(second))).toEqual([matchInfo])
+    expect(yield* Fiber.join(present(third))).toEqual([matchInfo])
+    expect(yield* started).toEqual([matchInfo])
+    expect(mock.api.getMatchedRules).toHaveBeenCalledOnce()
+  }))
+
+  it.effect.each(["dynamic", "session"] as const)("holds the %s write permit until an interrupted writer's Chrome write settles", (scope) => Effect.gen(function*() {
+    const fixture = TestDeclarativeNetRequest.makeDeclarativeNetRequest()
+    const write = gate()
+    const issued = gate()
+    // Chrome queues rule updates FIFO but serves reads at once: a read issued while an
+    // update is still queued sees the old set.
+    let applied: Promise<unknown> = write.opened
+
+    const queued = (apply: (options: UpdateRuleOptions) => Promise<void>) => vi.fn((options: UpdateRuleOptions) => {
+      const result = applied.then(() => apply(options))
+      applied = result.catch(() => undefined)
+      issued.open()
+
+      return result
+    })
+
+    const updateDynamicRules = queued((options) => fixture.api.updateDynamicRules(options))
+    const updateSessionRules = queued((options) => fixture.api.updateSessionRules(options))
+    const rules = make({ ...fixture.api, updateDynamicRules, updateSessionRules })
+    const replace = scope === "dynamic" ? rules.replaceDynamicRules : rules.replaceSessionRules
+    const current = scope === "dynamic" ? fixture.controls.dynamicRules : fixture.controls.sessionRules
+    const writing = yield* Effect.forkScoped(replace([block(1, "first")]), { startImmediately: true })
+    yield* Effect.promise(() => issued.opened)
+    const interrupting = yield* Effect.forkScoped(Fiber.interrupt(writing), { startImmediately: true })
+    const next = yield* Effect.forkScoped(replace([block(1, "second")]), { startImmediately: true })
+    write.open()
+    yield* Fiber.join(interrupting)
+    // The next replacement read the set only after the interrupted write landed.
+    yield* Fiber.join(next)
+    expect(current()).toEqual([block(1, "second")])
+    expect((scope === "dynamic" ? updateDynamicRules : updateSessionRules).mock.calls.map(([options]) => options)).toEqual([
+      { removeRuleIds: [], addRules: [block(1, "first")] },
+      { removeRuleIds: [1], addRules: [block(1, "second")] }
+    ])
+  }))
+
+  it.effect("lets a queued writer run after the holder's write is rejected", () => Effect.gen(function*() {
+    const mock = mockApi()
+    const write = gate()
+
+    mock.api.updateDynamicRules.mockImplementationOnce(async () => {
+      await write.opened
+
+      throw new Error("Dynamic rule count exceeded.")
+    })
+
+    const rules = make(mock.api)
+    const holder = yield* Effect.forkScoped(rules.replaceDynamicRules([block(1, "a.example")]), { startImmediately: true })
+    const queued = yield* Effect.forkScoped(rules.replaceDynamicRules([block(2, "b.example")]), { startImmediately: true })
+    write.open()
+    expect(yield* Effect.flip(Fiber.join(holder))).toMatchObject({ operation: "updateDynamicRules" })
+    yield* Fiber.join(queued)
+    expect(mock.api.getDynamicRules).toHaveBeenCalledTimes(2)
+    expect(mock.controls.dynamicRules()).toEqual([block(2, "b.example")])
+  }))
+
+  it.effect("reads the replacement when the Effect runs, and re-reads the current set on every run", () => Effect.gen(function*() {
+    const mock = mockApi()
+    const rules = make(mock.api)
+    const replacement = [block(1, "a.example")]
+    const replace = rules.replaceDynamicRules(replacement)
+    replacement.push(block(2, "b.example"))
+    yield* replace
+    expect(mock.controls.dynamicRules().map((rule) => rule.id)).toEqual([1, 2])
+    yield* replace
+    expect(mock.api.updateDynamicRules).toHaveBeenLastCalledWith({
+      removeRuleIds: [1, 2], addRules: [block(1, "a.example"), block(2, "b.example")]
+    })
+  }))
+})
+
 describe("DeclarativeNetRequest fixture", () => {
   const run = <A>(promise: () => Promise<A>) => Effect.tryPromise(promise)
   const rejection = <A>(promise: () => Promise<A>) => Effect.map(Effect.flip(run(promise)), (error) => String(error.cause))
@@ -592,7 +722,7 @@ describe("DeclarativeNetRequest fixture", () => {
       run(() => api.isRegexSupported(isCaseSensitive === undefined ? { regex } : { regex, isCaseSensitive }))
         .pipe(Effect.map((result) => result.isSupported))
 
-    for (const regex of ["^https://a\\.example/", "\\(?=", "[(?=]", "a(?:b)c", "(a)|\\\\", "[\\1]"]) {
+    for (const regex of ["^https://a\\.example/", "\\(?=", "[(?=]", "a(?:b)c", "(a)|\\\\"]) {
       expect(yield* supported(regex)).toBe(true)
     }
 
@@ -602,6 +732,32 @@ describe("DeclarativeNetRequest fixture", () => {
 
     expect(yield* supported("A", false)).toBe(true)
     expect(yield* run(() => api.isRegexSupported({ regex: "(?=x)" }))).toEqual({ isSupported: false, reason: "syntaxError" })
+  }))
+
+  it.effect("follows RE2 where JavaScript differs: escapes, octal digits, repeat counts and flag groups", () => Effect.gen(function*() {
+    const { api } = TestDeclarativeNetRequest.makeDeclarativeNetRequest()
+    const supported = (regex: string) => run(() => api.isRegexSupported({ regex })).pipe(Effect.map((result) => result.isSupported))
+
+    // RE2 syntax JavaScript lacks: flag groups, (?P<name>…), \A, \z, \Q…\E, \C, \x{…}, \pL and octal escapes.
+    for (const regex of ["(?i)ads\\.example", "(?i:a)b", "(?s-m)a.b", "(?P<host>[a-z]+)\\.example", "\\Ahttps\\z", "\\Qa.b\\E", "a\\Cb",
+      "\\x{41}", "\\pL+", "[\\d\\s\\w\\pN]", "\\0", "a\\12", "(a)\\12", "a{1000}", "a{3,}", "a{,5}", "\\_", "\\-\\/\\."]) {
+      expect([regex, yield* supported(regex)]).toEqual([regex, true])
+    }
+
+    // JavaScript accepts these, RE2 does not: letter escapes it does not define, a lone non-zero digit,
+    // \8 and \9, repeat counts above 1000, (?P=name) backreferences and \b inside a class.
+    for (const regex of ["\\u0041", "\\cK", "\\Z", "\\e", "\\y", "[\\1]", "\\8", "a\\9", "a{1001}", "a{2,1001}", "(?P<x>a)(?P=x)", "[\\b]"]) {
+      expect([regex, yield* supported(regex)]).toEqual([regex, false])
+    }
+  }))
+
+  it.effect("rejects a rule whose regexFilter RE2 refuses even though JavaScript compiles it", () => Effect.gen(function*() {
+    const { api, controls } = TestDeclarativeNetRequest.makeDeclarativeNetRequest()
+    const rule: Rule = { id: 1, action: { type: "block" }, condition: { regexFilter: "^https://a\\.example/\\u0061" } }
+    expect(yield* rejection(() => api.updateDynamicRules({ addRules: [rule] }))).toContain("Rule with id 1 specifies an incorrect value for the \"regexFilter\" key.")
+    yield* run(() => api.updateSessionRules({ addRules: [{ ...rule, condition: { regexFilter: "(?i)^https://a\\.example/" } }] }))
+    expect(controls.sessionRules()).toHaveLength(1)
+    expect(controls.dynamicRules()).toEqual([])
   }))
 
   it.effect("returns recorded matches filtered by tab and an inclusive minimum timestamp", () => Effect.gen(function*() {
