@@ -1,6 +1,6 @@
 import { Effect, Layer, Schema, Stream } from "effect"
 import * as ChromeStorage from "effect-platform-chrome/ChromeStorage"
-import { ChromePort } from "effect-platform-chrome/ChromePort"
+import * as ChromePort from "effect-platform-chrome/ChromePort"
 import * as ChromeServiceWorker from "effect-platform-chrome/ChromeServiceWorker"
 import * as ChromeRpc from "effect-platform-chrome/ChromeRpc"
 import { DemoRejected, DemoRpc, rpcChannel } from "../shared/rpc.js"
@@ -30,7 +30,7 @@ export default defineBackground(() => {
   // already exist before Chrome dispatches the event which started this worker.
   const worker = ChromeServiceWorker.start({
     chrome,
-    layer: Layer.mergeAll(ChromeStorage.layer, ChromePort.layerLive),
+    layer: Layer.mergeAll(ChromeStorage.layerLive, ChromePort.layerLive),
     maxPending: 32,
     initialize: Effect.gen(function*() {
       // Deliberate short delay makes the initialization gate visible: requests
@@ -70,7 +70,7 @@ export default defineBackground(() => {
       }
       if (native.name !== channel) return Effect.void
       return Effect.scoped(Effect.gen(function*() {
-        const ports = yield* ChromePort
+        const ports = yield* ChromePort.ChromePort
         // Owned adoption disconnects this side and removes listeners on scope
         // exit. Stream completion (popup disconnect) closes the handler scope.
         const port = yield* ports.adopt(native, "owned")

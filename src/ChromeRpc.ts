@@ -8,7 +8,7 @@ import * as RpcSerialization from "effect/rpc/RpcSerialization"
 import * as RpcMessage from "effect/rpc/RpcMessage"
 import type * as Rpc from "effect/rpc/Rpc"
 import type * as RpcGroup from "effect/rpc/RpcGroup"
-import type { NativePort, Ownership, RuntimeApi } from "./ChromePort.js"
+import type { ChromePortApi, NativePort, Ownership } from "./ChromePort.js"
 import * as PortLink from "./internal/port.js"
 
 /** Limits apply per port. Overflow terminates the transport rather than losing frames. */
@@ -70,7 +70,7 @@ const clientError = (cause: ChromeRpcError) => new RpcClientError({
 const protocolMessages = Data.taggedEnum<Data.TaggedEnum<{ ClientProtocolError: { readonly error: RpcClientError } }>>()
 
 const transport = Effect.fnUntraced(function*(
-  api: RuntimeApi, native: NativePort, ownership: Ownership, options: Options
+  api: ChromePortApi, native: NativePort, ownership: Ownership, options: Options
 ) {
   const capacity = options.capacity ?? 256
   const maxFrameLength = options.maxFrameLength ?? 1024 * 1024
@@ -152,7 +152,7 @@ const transport = Effect.fnUntraced(function*(
  * Does not consume ChromePort.messages (its sliding buffer is unsuitable for RPC).
  */
 export const makeClientProtocol = Effect.fnUntraced(function*(
-  api: RuntimeApi, native: NativePort, ownership: Ownership, options: Options = {}
+  api: ChromePortApi, native: NativePort, ownership: Ownership, options: Options = {}
 ) {
   const wire = yield* transport(api, native, ownership, options)
   let used = false
@@ -232,7 +232,7 @@ export const makeClientProtocol = Effect.fnUntraced(function*(
 
 /** Acquires one server connection. Run RpcServer.make in the same owning scope. */
 export const makeServerProtocol = Effect.fnUntraced(function*(
-  api: RuntimeApi, native: NativePort, ownership: Ownership, options: Options = {}
+  api: ChromePortApi, native: NativePort, ownership: Ownership, options: Options = {}
 ) {
   const wire = yield* transport(api, native, ownership, options)
   const disconnects = yield* Queue.make<number>({ capacity: 1 })
@@ -292,7 +292,7 @@ export const makeServerProtocol = Effect.fnUntraced(function*(
  * all handlers. Provide the group's handler layer and middleware to this Effect.
  */
 export const serve = Effect.fnUntraced(function*<Rpcs extends Rpc.Any>(
-  api: RuntimeApi, port: NativePort, ownership: Ownership, group: RpcGroup.RpcGroup<Rpcs>, options: Options = {}
+  api: ChromePortApi, port: NativePort, ownership: Ownership, group: RpcGroup.RpcGroup<Rpcs>, options: Options = {}
 ) {
   const protocol = yield* makeServerProtocol(api, port, ownership, options)
 
@@ -335,9 +335,9 @@ export const finishAccepted = <const Handlers extends { readonly [Tag in keyof H
 }
 
 /** Scoped client protocol layer; the port must be dedicated to this RPC connection. */
-export const layerClient = (api: RuntimeApi, port: NativePort, ownership: Ownership, options: Options = {}) =>
+export const layerClient = (api: ChromePortApi, port: NativePort, ownership: Ownership, options: Options = {}) =>
   Layer.effect(RpcClient.Protocol, makeClientProtocol(api, port, ownership, options))
 
 /** Scoped single-connection server protocol layer. */
-export const layerServer = (api: RuntimeApi, port: NativePort, ownership: Ownership, options: Options = {}) =>
+export const layerServer = (api: ChromePortApi, port: NativePort, ownership: Ownership, options: Options = {}) =>
   Layer.effect(RpcServer.Protocol, makeServerProtocol(api, port, ownership, options))

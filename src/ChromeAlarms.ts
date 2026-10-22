@@ -1,6 +1,6 @@
-import { Context, Effect, Layer, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { invoker, liveLayer } from "./internal/api.js"
-import { observe } from "./internal/event.js"
+import { observe, type EventSource } from "./internal/event.js"
 
 export type Alarm = chrome.alarms.Alarm
 
@@ -18,10 +18,7 @@ export interface ChromeAlarmsApi {
   getAll(): Promise<Array<Alarm>>
   clear(name?: string): Promise<boolean>
   clearAll(): Promise<boolean>
-  readonly onAlarm: {
-    addListener(listener: (alarm: Alarm) => void): void
-    removeListener(listener: (alarm: Alarm) => void): void
-  }
+  readonly onAlarm: EventSource<[alarm: Alarm]>
 }
 
 export class ChromeAlarmsError extends Schema.TaggedError<ChromeAlarmsError>()("ChromeAlarmsError", {
@@ -36,7 +33,8 @@ export interface ChromeAlarmsService {
     name: string,
     info: T & (T extends { name: string } ? never : unknown)
   ): Effect.Effect<void, ChromeAlarmsError>
-  get(name?: string): Effect.Effect<Alarm | undefined, ChromeAlarmsError>
+  /** The named alarm, or the unnamed one when `name` is omitted; None when no such alarm exists. */
+  get(name?: string): Effect.Effect<Option.Option<Alarm>, ChromeAlarmsError>
   readonly getAll: Effect.Effect<Array<Alarm>, ChromeAlarmsError>
   clear(name?: string): Effect.Effect<boolean, ChromeAlarmsError>
   readonly clearAll: Effect.Effect<boolean, ChromeAlarmsError>
@@ -54,9 +52,9 @@ export class ChromeAlarms extends Context.Service<ChromeAlarms, ChromeAlarmsServ
   "effect-platform-chrome/ChromeAlarms"
 ) {}
 
-const operation = invoker((name, cause) => new ChromeAlarmsError({ operation: name, cause }))
+const invoke = invoker((operation, cause) => new ChromeAlarmsError({ operation, cause }))
 
-/** Creates an injectable implementation without reading browser globals. */
+/** Creates the service without reading browser globals or registering listeners. */
 export const make = (api: ChromeAlarmsApi): ChromeAlarmsService => {
   function create(info: AlarmCreateInfo): Effect.Effect<void, ChromeAlarmsError>
   function create(name: undefined, info: AlarmCreateInfo): Effect.Effect<void, ChromeAlarmsError>
@@ -68,7 +66,7 @@ export const make = (api: ChromeAlarmsApi): ChromeAlarmsService => {
     nameOrInfo: string | undefined | AlarmCreateInfo,
     info?: AlarmCreateInfo
   ): Effect.Effect<void, ChromeAlarmsError> {
-    return operation("create", () => {
+    return invoke("create", () => {
       // Already typed by the public overloads; this dispatches Chrome's object/name overloads.
       // oxlint-disable-next-line anti-slop/no-runtime-typeof
       if (typeof nameOrInfo === "object") return api.create(nameOrInfo)
@@ -82,20 +80,21 @@ export const make = (api: ChromeAlarmsApi): ChromeAlarmsService => {
 
   return ChromeAlarms.of({
     create,
-    get: (name) => operation("get", () => api.get(name)),
-    getAll: operation("getAll", () => api.getAll()),
-    clear: (name) => operation("clear", () => api.clear(name)),
-    clearAll: operation("clearAll", () => api.clearAll()),
-    onAlarm: observe(() => api.onAlarm, (alarm: Alarm) => alarm,
-      (cause) => new ChromeAlarmsError({ operation: "onAlarm.addListener", cause }))
+    get: (name) => invoke("get", () => name === undefined ? api.get() : api.get(name)).pipe(
+      Effect.map(Option.fromNullishOr)
+    ),
+    getAll: invoke("getAll", () => api.getAll()),
+    clear: (name) => invoke("clear", () => name === undefined ? api.clear() : api.clear(name)),
+    clearAll: invoke("clearAll", () => api.clearAll()),
+    onAlarm: observe(() => api.onAlarm, (alarm) => alarm,
+      (cause) => new ChromeAlarmsError({ operation: "onAlarm", cause }))
   })
 }
 
-/** Resolves chrome.alarms only when the layer is built, never at import time. */
-export const layer: Layer.Layer<ChromeAlarms, ChromeAlarmsError> = liveLayer(
+export const layer = (api: ChromeAlarmsApi): Layer.Layer<ChromeAlarms> => Layer.succeed(ChromeAlarms, make(api))
+
+/** The global is read only when the layer is built, never at import time. */
+export const layerLive: Layer.Layer<ChromeAlarms, ChromeAlarmsError> = liveLayer(
   ChromeAlarms, "alarms", (chrome) => chrome.alarms, make,
   (cause) => new ChromeAlarmsError({ operation: "initialize", cause })
 )
-
-/** The same live layer as `layer`, under the name the other modules use. */
-export const layerLive = layer

@@ -22,10 +22,10 @@ declare global {
 }
 
 export function installAdvanced(log: (label: string, data: unknown) => void, value: () => string) {
-  const storageLayer = ChromeStorage.layer
+  const storageLayer = ChromeStorage.layerLive
   const runtime = ManagedRuntime.make(Layer.mergeAll(
     storageLayer,
-    ChromeSchemaStorage.layer(chrome.storage.onChanged).pipe(Layer.provide(storageLayer)),
+    ChromeSchemaStorage.layer.pipe(Layer.provide(storageLayer)),
     ChromePermissions.layerLive, ChromeScripting.layerLive, ChromeTabs.layerLive
   ))
   type Services = ChromeStorage.ChromeStorage | ChromeSchemaStorage.ChromeSchemaStorage |

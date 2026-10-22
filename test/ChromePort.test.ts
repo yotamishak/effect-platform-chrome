@@ -2,8 +2,8 @@
 /* oxlint-disable effecttsgo/unstable-api-usage */
 import { Cause, Effect, Exit, Fiber, Scope, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
-import { ChromePort, ChromePortError, make } from "../src/ChromePort.js"
-import type { NativePort, RuntimeApi } from "../src/ChromePort.js"
+import { ChromePort, ChromePortError, layer, layerLive, make } from "../src/ChromePort.js"
+import type { ChromePortApi, NativePort } from "../src/ChromePort.js"
 
 const fixture = () => {
   const messages = new Set<(message: unknown, port: NativePort) => void>()
@@ -36,14 +36,14 @@ const fixture = () => {
   }
 
   let lastError: { message: string } | undefined
-  const connect = vi.fn<RuntimeApi["connect"]>(() => native)
+  const connect = vi.fn<ChromePortApi["connect"]>(() => native)
 
   // SAFETY: Chrome exposes lastError only during callbacks; the getter mirrors that
   // lifetime, including undefined outside callbacks despite its optional declaration.
   const api = {
     connect,
     get lastError() { return lastError }
-  } as RuntimeApi
+  } as ChromePortApi
 
   return {
     native, api, connect, postMessage, disconnect, messages, disconnects,
@@ -415,7 +415,7 @@ describe("ChromePort", () => {
       const service = yield* ChromePort
 
       return yield* Effect.flip(service.connect())
-    })).pipe(Effect.provide(ChromePort.layer(f.api)))
+    })).pipe(Effect.provide(layer(f.api)))
 
     expect(failure.operation).toBe("connect")
     expect(failure.cause).toBe(cause)
@@ -451,9 +451,9 @@ describe("ChromePort", () => {
     vi.stubGlobal("chrome", undefined)
 
     const failure = yield* Effect.flip(
-      ChromePort.pipe(Effect.provide(ChromePort.layerLive))
+      ChromePort.pipe(Effect.provide(layerLive))
     )
 
-    expect(failure.operation).toBe("unavailable")
+    expect(failure.operation).toBe("initialize")
   }))
 })

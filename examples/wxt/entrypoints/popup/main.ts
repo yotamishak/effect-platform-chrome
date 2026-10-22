@@ -1,9 +1,9 @@
-import { Effect, Fiber, Layer, ManagedRuntime, Schema, Stream } from "effect"
+import { Effect, Fiber, Layer, ManagedRuntime, Option, Schema, Stream } from "effect"
 import * as KeyValueStore from "effect/persistence/KeyValueStore"
 import * as ChromeStorage from "effect-platform-chrome/ChromeStorage"
 import * as ChromeKeyValueStore from "effect-platform-chrome/ChromeKeyValueStore"
 import * as ChromeRuntime from "effect-platform-chrome/ChromeRuntime"
-import { ChromePort, type Port } from "effect-platform-chrome/ChromePort"
+import * as ChromePort from "effect-platform-chrome/ChromePort"
 import * as ChromeTabs from "effect-platform-chrome/ChromeTabs"
 import * as ChromeAlarms from "effect-platform-chrome/ChromeAlarms"
 import { alarmName, channel, Request, Response, storageKey } from "../../shared/protocol"
@@ -12,8 +12,8 @@ import { installAdvanced } from "./advanced.js"
 import { installLimits } from "./limits.js"
 
 const runtime = ManagedRuntime.make(Layer.mergeAll(
-  ChromeStorage.layer, ChromeRuntime.layer, ChromePort.layerLive,
-  ChromeTabs.layerLive, ChromeAlarms.layer,
+  ChromeStorage.layerLive, ChromeRuntime.layerLive, ChromePort.layerLive,
+  ChromeTabs.layerLive, ChromeAlarms.layerLive,
   ChromeKeyValueStore.layerLocal({ namespace: "wxt-seven-modules-demo" })
 ))
 const output = document.querySelector<HTMLPreElement>("#output")!
@@ -24,7 +24,7 @@ const log = (label: string, data: unknown) => {
   output.textContent = `[${new Date().toLocaleTimeString()}] ${label}\n${text}\n\n${output.textContent}`.slice(0, 24000)
 }
 
-type Services = ChromeStorage.ChromeStorage | ChromeRuntime.ChromeRuntime | ChromePort |
+type Services = ChromeStorage.ChromeStorage | ChromeRuntime.ChromeRuntime | ChromePort.ChromePort |
   ChromeTabs.ChromeTabs | ChromeAlarms.ChromeAlarms | KeyValueStore.KeyValueStore
 function button<A, E>(id: string, action: () => Effect.Effect<A, E, Services>) {
   const element = document.querySelector<HTMLButtonElement>(`#${id}`)!
@@ -87,13 +87,13 @@ const fork = <A, E>(effect: Effect.Effect<A, E, Services>) => {
   fiber.addObserver(() => fibers.delete(fiber))
   return fiber
 }
-let port: Port | undefined
+let port: ChromePort.Port | undefined
 let portReady = false
 let portFiber: Fiber.Fiber<unknown, unknown> | undefined
 button("connect", () => Effect.sync(() => {
   if (portFiber) return "Already connected / connecting"
   portFiber = fork(Effect.scoped(Effect.gen(function*() {
-    const service = yield* ChromePort
+    const service = yield* ChromePort.ChromePort
     port = yield* service.connect({ name: channel })
     // onConnect is gated during worker initialization. Wait for the server's
     // greeting instead of sending before it has adopted the native port.
@@ -135,11 +135,11 @@ button("content", () => Effect.gen(function*() {
 button("alarm-create", () => Effect.gen(function*() {
   const alarms = yield* ChromeAlarms.ChromeAlarms
   yield* alarms.create(alarmName, { delayInMinutes: 1 })
-  return yield* alarms.get(alarmName)
+  return Option.getOrNull(yield* alarms.get(alarmName))
 }))
 button("alarm-query", () => Effect.gen(function*() {
   const alarms = yield* ChromeAlarms.ChromeAlarms
-  return { demo: (yield* alarms.get(alarmName)) ?? null, all: yield* alarms.getAll }
+  return { demo: Option.getOrNull(yield* alarms.get(alarmName)), all: yield* alarms.getAll }
 }))
 button("alarm-clear", () => Effect.gen(function*() {
   const alarms = yield* ChromeAlarms.ChromeAlarms

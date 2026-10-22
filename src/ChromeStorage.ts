@@ -1,6 +1,6 @@
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
-import { liveLayer } from "./internal/api.js"
-import { observeSome } from "./internal/event.js"
+import { invoker, liveLayer } from "./internal/api.js"
+import { observeSome, type EventSource } from "./internal/event.js"
 
 export type AreaName = chrome.storage.AreaName
 
@@ -12,6 +12,9 @@ export type Keys = string | Array<string> | null
 
 /** Who may use an area: extension pages and the worker only, or content scripts as well. */
 export type AccessLevel = `${chrome.storage.AccessLevel}`
+
+/** The changes Chrome reports for one area in one `onChanged` event, by key. */
+export type Changes = Record<string, chrome.storage.StorageChange>
 
 /** Promise-based storage boundary; unrelated Chrome members are not required by injected APIs. */
 export interface StorageAreaApi {
@@ -26,12 +29,13 @@ export interface StorageAreaApi {
   readonly getKeys?: () => Promise<Array<string>>
 }
 
-export interface StorageApi {
+/** The Promise-based MV3 subset this module needs. */
+export interface ChromeStorageApi {
   readonly local: StorageAreaApi
   readonly sync: StorageAreaApi
   readonly session: StorageAreaApi
   readonly managed: Pick<StorageAreaApi, "get" | "getBytesInUse" | "getKeys">
-  readonly onChanged: Pick<typeof chrome.storage.onChanged, "addListener" | "removeListener">
+  readonly onChanged: EventSource<[changes: Changes, areaName: AreaName]>
 }
 
 export class ChromeStorageError extends Schema.TaggedError<ChromeStorageError>()("ChromeStorageError", {
@@ -42,7 +46,7 @@ export class ChromeStorageError extends Schema.TaggedError<ChromeStorageError>()
 
 export interface Change {
   readonly area: AreaName
-  readonly changes: Readonly<Record<string, chrome.storage.StorageChange>>
+  readonly changes: Readonly<Changes>
 }
 
 /** Each subscription retains at most 64 events, dropping the oldest on overflow.
@@ -75,34 +79,50 @@ export interface WritableArea extends ReadOnlyArea {
   readonly setAccessLevel: (accessLevel: AccessLevel) => Effect.Effect<void, ChromeStorageError>
 }
 
-export interface Service {
+export interface ChromeStorageService {
   readonly local: WritableArea
   readonly sync: WritableArea
   readonly session: WritableArea
   readonly managed: ReadOnlyArea
+  /**
+   * Changes in every area, as observational subscriptions that cannot wake an MV3 service
+   * worker. Each buffers at most 64 events, dropping the oldest.
+   */
   readonly onChanged: Stream.Stream<Change, ChromeStorageError>
+  /**
+   * Low level: the native `storage.onChanged` event of the API this service wraps, for
+   * code that must add a listener synchronously before an Effect starts, such as a read
+   * that must not miss a change made while it is in flight (ChromeSchemaStorage). The
+   * caller owns each listener it adds and must remove it; prefer `onChanged`, which does.
+   */
+  readonly changeEvent: EventSource<[changes: Changes, areaName: AreaName]>
 }
 
-export class ChromeStorage extends Context.Service<ChromeStorage, Service>()(
+export class ChromeStorage extends Context.Service<ChromeStorage, ChromeStorageService>()(
   "effect-platform-chrome/ChromeStorage"
 ) {}
 
-/** Wraps the Manifest V3 Promise API. Chrome rejects these promises on API errors.
- * All API access occurs inside effects, including missing-area failures.
+const invokers = {
+  local: invoker((operation, cause) => new ChromeStorageError({ area: "local", operation, cause })),
+  sync: invoker((operation, cause) => new ChromeStorageError({ area: "sync", operation, cause })),
+  session: invoker((operation, cause) => new ChromeStorageError({ area: "session", operation, cause })),
+  managed: invoker((operation, cause) => new ChromeStorageError({ area: "managed", operation, cause }))
+}
+
+/**
+ * Creates the service without reading browser globals or registering listeners. Chrome
+ * rejects these promises on API errors; every API access, a missing area included,
+ * happens inside an Effect.
  */
-export const make = (api: StorageApi): Service => {
-  const call = <A>(area: AreaName, operation: string, run: () => Promise<A>) =>
-    Effect.tryPromise({
-      try: run,
-      catch: (cause) => new ChromeStorageError({ area, operation, cause })
-    })
+export const make = (api: ChromeStorageApi): ChromeStorageService => {
+  const call = <A>(area: AreaName, operation: string, run: () => Promise<A>) => invokers[area](operation, run)
 
   const changes = (area?: AreaName): Stream.Stream<Change, ChromeStorageError> => observeSome(
     () => api.onChanged,
-    (changes: Record<string, chrome.storage.StorageChange>, changedArea: AreaName) => area === undefined || changedArea === area
+    (changes, changedArea) => area === undefined || changedArea === area
       ? Option.some({ area: changedArea, changes })
       : Option.none(),
-    (cause) => new ChromeStorageError({ area: area ?? "all", operation: "onChanged.addListener", cause }),
+    (cause) => new ChromeStorageError({ area: area ?? "all", operation: "onChanged", cause }),
     changeBufferSize
   )
 
@@ -139,15 +159,19 @@ export const make = (api: StorageApi): Service => {
     sync: writable("sync"),
     session: writable("session"),
     managed: readOnly("managed"),
-    onChanged: changes()
+    onChanged: changes(),
+    // Looked up on each call, so building the service never touches the event.
+    changeEvent: {
+      addListener: (listener) => api.onChanged.addListener(listener),
+      removeListener: (listener) => api.onChanged.removeListener(listener)
+    }
   })
 }
 
-/** Resolves the global only when the layer is built, never during import. */
+export const layer = (api: ChromeStorageApi): Layer.Layer<ChromeStorage> => Layer.succeed(ChromeStorage, make(api))
+
+/** The global is read only when the layer is built, never at import time. */
 export const layerLive: Layer.Layer<ChromeStorage, ChromeStorageError> = liveLayer(
   ChromeStorage, "storage", (chrome) => chrome.storage, make,
   (cause) => new ChromeStorageError({ area: "all", operation: "initialize", cause })
 )
-
-/** The same live layer as `layerLive`, under this module's original name. */
-export const layer = layerLive

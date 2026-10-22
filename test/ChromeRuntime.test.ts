@@ -3,7 +3,7 @@
 import { Effect, Fiber, Schema, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
 import { ChromeMessageError, fail, succeed } from "../src/ChromeMessage.js"
-import { ChromeRuntime, ChromeRuntimeError, layer, make, type RuntimeApi } from "../src/ChromeRuntime.js"
+import { ChromeRuntime, ChromeRuntimeError, layer, layerLive, make, type ChromeRuntimeApi } from "../src/ChromeRuntime.js"
 import { makePortPair } from "../src/testing/Port.js"
 
 const event = <A extends ReadonlyArray<unknown>>() => {
@@ -29,15 +29,15 @@ const context: chrome.runtime.ExtensionContext = {
 
 const fake = () => ({
   id: "extension-id",
-  getManifest: vi.fn<RuntimeApi["getManifest"]>(() => ({ manifest_version: 3, name: "Test", version: "1.0.0" })),
+  getManifest: vi.fn<ChromeRuntimeApi["getManifest"]>(() => ({ manifest_version: 3, name: "Test", version: "1.0.0" })),
   getURL: vi.fn((path: string) => `chrome-extension://extension-id/${path}`),
-  sendMessage: vi.fn<RuntimeApi["sendMessage"]>(async () => ({ ok: true })),
-  getContexts: vi.fn<RuntimeApi["getContexts"]>(async () => [context]),
-  openOptionsPage: vi.fn<RuntimeApi["openOptionsPage"]>(async () => undefined),
-  reload: vi.fn<RuntimeApi["reload"]>(() => undefined),
-  setUninstallURL: vi.fn<RuntimeApi["setUninstallURL"]>(async () => undefined),
-  getPlatformInfo: vi.fn<RuntimeApi["getPlatformInfo"]>(async () => ({ os: "mac", arch: "arm64" })),
-  requestUpdateCheck: vi.fn<RuntimeApi["requestUpdateCheck"]>(async () => ({ status: "update_available", version: "2.0.0" })),
+  sendMessage: vi.fn<ChromeRuntimeApi["sendMessage"]>(async () => ({ ok: true })),
+  getContexts: vi.fn<ChromeRuntimeApi["getContexts"]>(async () => [context]),
+  openOptionsPage: vi.fn<ChromeRuntimeApi["openOptionsPage"]>(async () => undefined),
+  reload: vi.fn<ChromeRuntimeApi["reload"]>(() => undefined),
+  setUninstallURL: vi.fn<ChromeRuntimeApi["setUninstallURL"]>(async () => undefined),
+  getPlatformInfo: vi.fn<ChromeRuntimeApi["getPlatformInfo"]>(async () => ({ os: "mac", arch: "arm64" })),
+  requestUpdateCheck: vi.fn<ChromeRuntimeApi["requestUpdateCheck"]>(async () => ({ status: "update_available", version: "2.0.0" })),
   onInstalled: event<[chrome.runtime.InstalledDetails]>(),
   onStartup: event<[]>(),
   onUpdateAvailable: event<[chrome.runtime.UpdateAvailableDetails]>(),
@@ -229,17 +229,25 @@ describe("ChromeRuntime", () => {
   it.effect("imports safely without chrome and resolves the live API lazily", () => Effect.gen(function*() {
     vi.stubGlobal("chrome", undefined)
     const imported = yield* Effect.promise(() => import("../src/ChromeRuntime.js"))
-    expect(imported.layer).toBeDefined()
+    expect(imported.layerLive).toBe(layerLive)
 
-    const error = yield* ChromeRuntime.pipe(Effect.provide(layer), Effect.flip)
+    const error = yield* ChromeRuntime.pipe(Effect.provide(layerLive), Effect.flip)
 
     expect(error).toBeInstanceOf(ChromeRuntimeError)
-    expect(error.operation).toBe("runtime")
+    expect(error.operation).toBe("initialize")
     const runtime = fake()
     vi.stubGlobal("chrome", { runtime })
     expect(yield* Effect.gen(function*() {
       return yield* (yield* ChromeRuntime).id
-    }).pipe(Effect.provide(layer))).toBe("extension-id")
+    }).pipe(Effect.provide(layerLive))).toBe("extension-id")
+  }))
+
+  it.effect("provides an injected API through layer without a global", () => Effect.gen(function*() {
+    vi.stubGlobal("chrome", undefined)
+    const runtime = fake()
+    expect(yield* Effect.gen(function*() {
+      return yield* (yield* ChromeRuntime).getPlatformInfo
+    }).pipe(Effect.provide(layer(runtime)))).toEqual({ os: "mac", arch: "arm64" })
   }))
 
   it.effect("reads metadata lazily and preserves the API receiver", () => Effect.gen(function*() {
@@ -354,11 +362,11 @@ describe("ChromeRuntime", () => {
       throw cause
     })
     const error = yield* Stream.runDrain(make(runtime).onInstalled).pipe(Effect.flip)
-    expect(error).toMatchObject({ operation: "onInstalled.addListener", cause })
+    expect(error).toMatchObject({ operation: "onInstalled", cause })
     expect(runtime.onInstalled.listeners.size).toBe(0)
     runtime.onStartup.addListener.mockImplementationOnce(() => { throw cause })
     expect(yield* Stream.runDrain(make(runtime).onStartup).pipe(Effect.flip)).toMatchObject({
-      operation: "onStartup.addListener", cause
+      operation: "onStartup", cause
     })
     expect(runtime.onStartup.removeListener).toHaveBeenCalledOnce()
   }))
@@ -460,10 +468,10 @@ describe("ChromeRuntime", () => {
     const cause = new Error("registration failed")
 
     const streams = [
-      ["onUpdateAvailable.addListener", runtime.onUpdateAvailable, Stream.runDrain(service.onUpdateAvailable)],
-      ["onSuspend.addListener", runtime.onSuspend, Stream.runDrain(service.onSuspend)],
-      ["onMessageExternal.addListener", runtime.onMessageExternal, Stream.runDrain(service.onMessageExternal)],
-      ["onConnectExternal.addListener", runtime.onConnectExternal, Stream.runDrain(service.onConnectExternal)]
+      ["onUpdateAvailable", runtime.onUpdateAvailable, Stream.runDrain(service.onUpdateAvailable)],
+      ["onSuspend", runtime.onSuspend, Stream.runDrain(service.onSuspend)],
+      ["onMessageExternal", runtime.onMessageExternal, Stream.runDrain(service.onMessageExternal)],
+      ["onConnectExternal", runtime.onConnectExternal, Stream.runDrain(service.onConnectExternal)]
     ] as const
 
     for (const [operation, source, drain] of streams) {

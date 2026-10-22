@@ -1,4 +1,4 @@
-import { Layer, Schema } from "effect"
+import { Schema } from "effect"
 import * as ChromeStorage from "../ChromeStorage.js"
 import * as TestEvent from "./Event.js"
 
@@ -181,11 +181,11 @@ export const makeStorage = () => {
   }
 
   // Assignment checks the structural boundary without narrowing fixture extras.
-  const storageApi: ChromeStorage.StorageApi = api
+  const storageApi: ChromeStorage.ChromeStorageApi = api
 
   return {
     api,
-    layer: Layer.succeed(ChromeStorage.ChromeStorage, ChromeStorage.make(storageApi)),
+    layer: ChromeStorage.layer(storageApi),
     controls: {
       onChanged: globalEvent.controls,
       areas: {

@@ -5,7 +5,7 @@ import * as ChromeIdentity from "effect-platform-chrome/ChromeIdentity"
 import * as ChromeKeyValueStore from "effect-platform-chrome/ChromeKeyValueStore"
 import * as ChromeNotifications from "effect-platform-chrome/ChromeNotifications"
 import * as ChromePermissions from "effect-platform-chrome/ChromePermissions"
-import { ChromePort } from "effect-platform-chrome/ChromePort"
+import * as ChromePort from "effect-platform-chrome/ChromePort"
 import * as ChromeRuntime from "effect-platform-chrome/ChromeRuntime"
 import * as ChromeSchemaStorage from "effect-platform-chrome/ChromeSchemaStorage"
 import * as ChromeScripting from "effect-platform-chrome/ChromeScripting"
@@ -60,7 +60,7 @@ export const layer = Layer.mergeAll(
   ChromeAlarms.layerLive, ChromeCookies.layerLive, ChromeIdentity.layerLive,
   ChromeKeyValueStore.layerLocal({ namespace: "wxt-limits" }), ChromeNotifications.layerLive,
   ChromePermissions.layerLive, ChromePort.layerLive, ChromeRuntime.layerLive,
-  ChromeSchemaStorage.layer(chrome.storage.onChanged).pipe(Layer.provide(storage)),
+  ChromeSchemaStorage.layer.pipe(Layer.provide(storage)),
   ChromeScripting.layerLive, storage, ChromeTabs.layerLive, ChromeWebNavigation.layerLive,
   ChromeWindows.layerLive
 )

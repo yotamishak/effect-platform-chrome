@@ -54,7 +54,7 @@ export const makePortPair = (name = "") => {
       }
     }
 
-    const api: ChromePort.RuntimeApi = {
+    const api: ChromePort.ChromePortApi = {
       get lastError() { return lastError },
       connect: () => {
         check("connect")
@@ -68,7 +68,7 @@ export const makePortPair = (name = "") => {
     return {
       port: native,
       api,
-      layer: ChromePort.ChromePort.layer(api),
+      layer: ChromePort.layer(api),
       events: { message: message.controls, disconnect: disconnect.controls },
       notifyDisconnect: (error?: string) => {
         lastError = error === undefined ? undefined : { message: error }

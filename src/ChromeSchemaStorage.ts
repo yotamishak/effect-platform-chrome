@@ -1,6 +1,6 @@
 import { Context, Effect, Layer, Option, Predicate, Queue, Schema, Stream } from "effect"
 import { ChromeStorage, ChromeStorageError } from "./ChromeStorage.js"
-import type { AreaName, Service as StorageService, StorageApi } from "./ChromeStorage.js"
+import type { AreaName, Changes, ChromeStorageService } from "./ChromeStorage.js"
 
 export class ChromeSchemaStorageError extends Schema.TaggedError<ChromeSchemaStorageError>()("ChromeSchemaStorageError", {
   key: Schema.String,
@@ -34,11 +34,11 @@ export interface Entry<S extends Schema.Constraint, E, R> {
   readonly observe: Stream.Stream<Option.Option<S["Type"]>, EntryError | E, R | S["DecodingServices"] | S["EncodingServices"]>
 }
 
-export interface Service {
+export interface ChromeSchemaStorageService {
   readonly entry: <S extends Schema.Constraint, E = never, R = never>(options: EntryOptions<S, E, R>) => Entry<S, E, R>
 }
 
-export class ChromeSchemaStorage extends Context.Service<ChromeSchemaStorage, Service>()(
+export class ChromeSchemaStorage extends Context.Service<ChromeSchemaStorage, ChromeSchemaStorageService>()(
   "effect-platform-chrome/ChromeSchemaStorage"
 ) {}
 
@@ -106,8 +106,11 @@ const jsonPayload = (key: string, payload: unknown) => Effect.try({
   catch: (cause) => new ChromeSchemaStorageError({ key, reason: "json", cause })
 }).pipe(Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(Schema.Json))))
 
-/** Events must come from the same API as the injected storage service. */
-export const make = (storage: StorageService, events: StorageApi["onChanged"]): Service => {
+/**
+ * Creates the service over a ChromeStorage service, reading and observing through it.
+ * Observation registers on its `changeEvent` synchronously, before the initial read.
+ */
+export const make = (storage: ChromeStorageService): ChromeSchemaStorageService => {
   const entry = <S extends Schema.Constraint, E = never, R = never>(options: EntryOptions<S, E, R>): Entry<S, E, R> => {
     const key = storageKey(options.namespace, options.key)
     const area = storage[options.area]
@@ -205,7 +208,7 @@ export const make = (storage: StorageService, events: StorageApi["onChanged"]): 
       let revision = 0
 
       // Chrome's newValue is untyped. Decode it at this boundary, never assert it.
-      const listener: Parameters<StorageApi["onChanged"]["addListener"]>[0] = (changes, changedArea) => {
+      const listener = (changes: Changes, changedArea: AreaName) => {
         if (changedArea !== options.area || !Object.hasOwn(changes, key)) return
         revision++
         Queue.offerUnsafe(signals, { revision, change: changes[key] })
@@ -215,11 +218,12 @@ export const make = (storage: StorageService, events: StorageApi["onChanged"]): 
       // Install cleanup before registration: injected APIs may register then throw.
       yield* Effect.acquireRelease(
         Effect.void,
-        () => Effect.sync(() => events.removeListener(listener))
+        () => Effect.sync(() => storage.changeEvent.removeListener(listener))
       )
+      // Synchronous registration before the initial read, so no change can slip between them.
       yield* Effect.try({
-        try: () => { events.addListener(listener) },
-        catch: (cause) => new ChromeStorageError({ area: options.area, operation: "onChanged.addListener", cause })
+        try: () => { storage.changeEvent.addListener(listener) },
+        catch: (cause) => new ChromeStorageError({ area: options.area, operation: "onChanged", cause })
       })
       const initial = yield* Effect.result(get())
 
@@ -240,7 +244,8 @@ export const make = (storage: StorageService, events: StorageApi["onChanged"]): 
   return ChromeSchemaStorage.of({ entry })
 }
 
-export const layer = (events: StorageApi["onChanged"]) => Layer.effect(
+/** Builds on the ChromeStorage service in context, injected or live. */
+export const layer: Layer.Layer<ChromeSchemaStorage, never, ChromeStorage> = Layer.effect(
   ChromeSchemaStorage,
-  Effect.map(ChromeStorage, (storage) => make(storage, events))
+  Effect.map(ChromeStorage, make)
 )
