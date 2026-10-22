@@ -1,31 +1,54 @@
 // Effect 4.0.4 RPC protocols are intentionally unstable; this adapter targets that pinned API.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Cause, Data, Deferred, Duration, Effect, Fiber, Layer, Predicate, Queue, Schema } from "effect"
+import { Cause, Data, Deferred, Duration, Effect, Fiber, Layer, Option, Predicate, Queue, Schema } from "effect"
+import * as Rpc from "effect/rpc/Rpc"
 import * as RpcClient from "effect/rpc/RpcClient"
 import { RpcClientDefect, RpcClientError } from "effect/rpc/RpcClientError"
 import * as RpcServer from "effect/rpc/RpcServer"
+import * as RpcSchema from "effect/rpc/RpcSchema"
 import * as RpcSerialization from "effect/rpc/RpcSerialization"
 import * as RpcMessage from "effect/rpc/RpcMessage"
-import type * as Rpc from "effect/rpc/Rpc"
 import type * as RpcGroup from "effect/rpc/RpcGroup"
 import type { NativePort, Ownership, RuntimeApi } from "./ChromePort.js"
 import * as PortLink from "./internal/port.js"
 
-/** Limits apply per port. Overflow terminates the transport rather than losing frames. */
+/** Limits apply per port. Ingress overflow terminates the transport rather than losing frames. */
 export interface Options {
+  /** Received frames queued before the receive loop takes them (default 256). */
   readonly capacity?: number
-  /** Maximum JSON frame length in UTF-16 code units (default 1 MiB). */
+  /** Maximum JSON frame length in UTF-16 code units, in both directions (default 1 MiB). */
   readonly maxFrameLength?: number
   /**
    * Client only: how long to wait for the server's Pong before failing the transport (default:
    * forever). Chrome connects a port when any script in the target listens on `onConnect`, so a
-   * port that reaches only listeners for other names is never answered.
+   * port that reaches only listeners for other names is never answered. Must be positive;
+   * `"Infinity"` waits forever.
    */
   readonly readyTimeout?: Duration.Input
 }
 
-/** Acquisition, disconnect, serialization, and buffer-limit failures. */
+/** `RpcServer.make`'s own options, such as `concurrency` and `disableFatalDefects`. */
+export type ServerOptions = NonNullable<Parameters<typeof RpcServer.make>[1]>
+
+export interface ServeOptions extends Options {
+  /**
+   * Passed to `RpcServer.make`. By default Effect RPC treats a handler defect as fatal to the
+   * connection: every call in flight on the port fails with it. `disableFatalDefects: true`
+   * fails only the call whose handler died.
+   */
+  readonly server?: ServerOptions
+}
+
+/**
+ * Transport failures. `operation` names the step that failed: `"initialize"` (invalid
+ * `Options`), `"addListener"` (listener registration on the port), `"postMessage"` (encoding,
+ * the outbound size limit, or Chrome refusing the frame), `"onMessage"` (an invalid, oversized
+ * or malformed frame, or ingress overflow), `"onDisconnect"` (Chrome disconnected the port;
+ * `cause` is its `lastError`, if any), `"ready"` (no Pong within `readyTimeout`) and
+ * `"disconnect"` (local termination: scope release or the client ending).
+ */
 export class ChromeRpcError extends Schema.TaggedError<ChromeRpcError>()("ChromeRpcError", {
+  operation: Schema.String,
   message: Schema.String,
   cause: Schema.Defect()
 }) {}
@@ -63,32 +86,56 @@ const fromServer = Schema.Union([
   ]) })
 ])
 
+const failure = (operation: string, message: string, cause?: unknown) =>
+  new ChromeRpcError({ operation, message, cause })
+
 const clientError = (cause: ChromeRpcError) => new RpcClientError({
   reason: new RpcClientDefect({ message: cause.message, cause })
 })
 
 const protocolMessages = Data.taggedEnum<Data.TaggedEnum<{ ClientProtocolError: { readonly error: RpcClientError } }>>()
 
-const transport = Effect.fnUntraced(function*(
-  api: RuntimeApi, native: NativePort, ownership: Ownership, options: Options
-) {
+interface Limits {
+  readonly capacity: number
+  readonly maxFrameLength: number
+  readonly readyTimeout: Option.Option<Duration.Duration>
+}
+
+const isLimit = (value: number) => Number.isSafeInteger(value) && value >= 1
+
+const limits = (options: Options): Effect.Effect<Limits, ChromeRpcError> => Effect.suspend(() => {
   const capacity = options.capacity ?? 256
   const maxFrameLength = options.maxFrameLength ?? 1024 * 1024
 
-  if (!Number.isSafeInteger(capacity) || capacity < 1 || !Number.isSafeInteger(maxFrameLength) || maxFrameLength < 1) {
-    return yield* new ChromeRpcError({ message: "RPC limits must be positive safe integers", cause: undefined })
+  if (!isLimit(capacity) || !isLimit(maxFrameLength)) {
+    return Effect.fail(failure("initialize", "RPC limits must be positive safe integers"))
   }
 
+  if (options.readyTimeout === undefined) return Effect.succeed({ capacity, maxFrameLength, readyTimeout: Option.none() })
+
+  const readyTimeout = Duration.fromInput(options.readyTimeout)
+
+  if (Option.isNone(readyTimeout) || Duration.isNegative(readyTimeout.value) || Duration.isZero(readyTimeout.value)) {
+    return Effect.fail(failure("initialize", "RPC readyTimeout must be a positive duration"))
+  }
+
+  return Effect.succeed({
+    capacity, maxFrameLength, readyTimeout: Duration.isFinite(readyTimeout.value) ? readyTimeout : Option.none()
+  })
+})
+
+const transport = Effect.fnUntraced(function*(api: RuntimeApi, native: NativePort, ownership: Ownership, limits: Limits) {
+  const { capacity, maxFrameLength } = limits
   const queue = yield* Queue.make<string, ChromeRpcError>({ capacity, strategy: "dropping" })
   const ready = yield* Deferred.make<void, ChromeRpcError>()
   const closed = yield* Deferred.make<void>()
   const parser = RpcSerialization.json.makeUnsafe()
-  let failure: ChromeRpcError | undefined
+  let terminal: ChromeRpcError | undefined
 
   // Every termination, including Chrome's own disconnect, also disconnects an owned port.
   const stop = (error: ChromeRpcError) => {
-    if (failure !== undefined) return
-    failure = error
+    if (terminal !== undefined) return
+    terminal = error
     link.close()
 
     try { link.detach() } catch { /* Preserve the first transport failure. */ }
@@ -104,66 +151,111 @@ const transport = Effect.fnUntraced(function*(
   const link = PortLink.make(native, ownership, () => api.lastError, {
     onMessage: (message) => {
       if (!Predicate.isString(message) || message.length > maxFrameLength) {
-        stop(new ChromeRpcError({ message: "Invalid or oversized RPC frame", cause: undefined }))
+        stop(failure("onMessage", "Invalid or oversized RPC frame"))
       } else if (!Queue.offerUnsafe(queue, message)) {
-        stop(new ChromeRpcError({ message: "RPC receive buffer overflow", cause: undefined }))
+        stop(failure("onMessage", "RPC receive buffer overflow"))
       }
     },
     onDisconnect: (lastError) => {
-      stop(new ChromeRpcError({ message: lastError?.message ?? "Chrome RPC port disconnected", cause: undefined }))
+      stop(failure("onDisconnect", lastError?.message ?? "Chrome RPC port disconnected", lastError))
     }
   })
 
   yield* Effect.addFinalizer(() => Effect.sync(() => {
-    stop(new ChromeRpcError({ message: "Chrome RPC scope closed", cause: undefined }))
+    stop(failure("disconnect", "Chrome RPC scope closed"))
     Queue.shutdownUnsafe(queue)
   }))
   yield* Effect.try({
     try: link.register,
     // A callback can close the wire before a hostile registration inserts and throws.
-    catch: (cause) => failure ?? new ChromeRpcError({ message: "Chrome RPC listener registration failed", cause })
+    catch: (cause) => terminal ?? failure("addListener", "Chrome RPC listener registration failed", cause)
   }).pipe(Effect.tapError((error) => Effect.sync(() => stop(error))))
 
   // Registration callbacks may synchronously report an already-dead port.
-  if (failure !== undefined) return yield* failure
+  if (terminal !== undefined) return yield* terminal
 
+  // A frame that cannot be encoded or exceeds the limit never reaches Chrome, so only its own
+  // message fails. A frame Chrome refuses terminates the transport: the port is unusable.
   // The serializer accepts protocol envelopes whose schema payload holes are unknown.
   // oxlint-disable-next-line anti-slop/no-unknown-parameters
-  const send = (message: unknown) => Effect.try({
-    try: () => {
-      if (failure !== undefined) throw failure
-      const frame = parser.encode(message)
+  const send = (message: unknown): Effect.Effect<void, ChromeRpcError> => Effect.suspend(() => {
+    if (terminal !== undefined) return Effect.fail(terminal)
 
-      if (!Predicate.isString(frame) || frame.length > maxFrameLength) {
-        throw new ChromeRpcError({ message: "Invalid or oversized outbound RPC frame", cause: undefined })
-      }
+    let frame: ReturnType<typeof parser.encode>
 
+    try {
+      frame = parser.encode(message)
+    } catch (cause) {
+      return Effect.fail(failure("postMessage", "RPC frame could not be encoded", cause))
+    }
+
+    if (!Predicate.isString(frame) || frame.length > maxFrameLength) {
+      return Effect.fail(failure("postMessage", "Invalid or oversized outbound RPC frame"))
+    }
+
+    try {
       native.postMessage(frame)
-    },
-    catch: (cause) => cause instanceof ChromeRpcError ? cause : new ChromeRpcError({ message: "Chrome RPC send failed", cause })
-  }).pipe(Effect.tapError((error) => Effect.sync(() => stop(error))))
+    } catch (cause) {
+      stop(failure("postMessage", "Chrome RPC send failed", cause))
 
-  return { queue, ready, closed: Deferred.await(closed), send, parser, stop, error: () => failure }
+      return Effect.fail(terminal ?? failure("postMessage", "Chrome RPC send failed", cause))
+    }
+
+    return Effect.void
+  })
+
+  // Takes frames until the transport stops, handing each decoded message to `handle`.
+  const receive = <A>(
+    schema: Schema.Codec<A, unknown>, malformed: string, handle: (message: A) => Effect.Effect<void, ChromeRpcError>
+  ): Effect.Effect<void> => Effect.gen(function*() {
+    while (true) {
+      const frame = yield* Queue.take(queue)
+
+      if (terminal !== undefined) return yield* terminal
+
+      const messages = yield* Effect.try({
+        try: () => parser.decode(frame),
+        catch: (cause) => failure("onMessage", malformed, cause)
+      })
+
+      for (const raw of messages) {
+        yield* handle(yield* Schema.decodeUnknownEffect(schema)(raw).pipe(
+          Effect.mapError((cause) => failure("onMessage", malformed, cause))
+        ))
+      }
+    }
+  }).pipe(Effect.catch((error) => Effect.sync(() => stop(error))))
+
+  const wire = {
+    queue, ready, closed: Deferred.await(closed), send, stop, receive,
+    error: () => terminal,
+    // The terminal failure once the transport has stopped.
+    failure: Effect.sync(() => terminal ?? failure("disconnect", "Chrome RPC transport closed"))
+  }
+
+  return wire
 })
 
 /**
  * Acquires a dedicated native port as an Effect RPC client protocol. Use with exactly
- * one RpcClient.make. Requests wait for Ping/Pong readiness; no restart retries.
- * Does not consume ChromePort.messages (its sliding buffer is unsuitable for RPC).
+ * one RpcClient.make; a second client's calls fail. Requests wait for Ping/Pong readiness;
+ * no restart retries. Does not consume ChromePort.messages (its sliding buffer is unsuitable
+ * for RPC).
  */
 export const makeClientProtocol = Effect.fnUntraced(function*(
   api: RuntimeApi, native: NativePort, ownership: Ownership, options: Options = {}
 ) {
-  const wire = yield* transport(api, native, ownership, options)
-  let used = false
+  const settings = yield* limits(options)
+  const wire = yield* transport(api, native, ownership, settings)
+  let owner: number | undefined
 
   return RpcClient.Protocol.of({
     codecFor: RpcSerialization.json.codecFor,
     supportsAck: true,
     supportsTransferables: false,
-    run: (_clientId, receive) => Effect.gen(function*() {
-      if (used) return yield* Effect.die(new Error("Chrome RPC protocol requires exactly one client"))
-      used = true
+    run: (clientId, receive) => Effect.gen(function*() {
+      if (owner !== undefined) return yield* Effect.die(new Error("Chrome RPC protocol requires exactly one client"))
+      owner = clientId
       yield* Effect.gen(function*() {
         while (!(yield* Deferred.isDone(wire.ready))) {
           yield* wire.send(RpcMessage.constPing)
@@ -171,60 +263,43 @@ export const makeClientProtocol = Effect.fnUntraced(function*(
         }
       }).pipe(Effect.ignore, Effect.forkScoped)
 
-      const { readyTimeout } = options
+      if (Option.isSome(settings.readyTimeout)) {
+        const timeout = settings.readyTimeout.value
 
-      if (readyTimeout !== undefined) {
-        yield* Effect.gen(function*() {
-          yield* Effect.sleep(readyTimeout)
-
-          if (!(yield* Deferred.isDone(wire.ready))) {
-            wire.stop(new ChromeRpcError({
-              message: `Chrome RPC peer did not answer within ${Duration.format(Duration.fromInputUnsafe(readyTimeout))}`,
-              cause: undefined
-            }))
-          }
-        }).pipe(Effect.forkScoped)
+        yield* Deferred.await(wire.ready).pipe(
+          Effect.timeoutOption(timeout),
+          Effect.flatMap(Option.match({
+            onSome: () => Effect.void,
+            onNone: () => Effect.sync(() => wire.stop(failure("ready", `Chrome RPC peer did not answer within ${Duration.format(timeout)}`)))
+          })),
+          Effect.ignore,
+          Effect.forkScoped
+        )
       }
 
-      return yield* Effect.gen(function*() {
-        while (true) {
-          const frame = yield* Queue.take(wire.queue)
-          const error = wire.error()
+      const loop = yield* wire.receive(fromServer, "Malformed RPC response", (message) =>
+        Predicate.isTagged(message, "Pong") ? Deferred.succeed(wire.ready, undefined) : receive(message)
+      ).pipe(Effect.forkScoped)
 
-          if (error !== undefined) return yield* error
+      yield* wire.closed
+      // Fail every call, streams included, before interrupting a receive that a full stream
+      // buffer may block, so consumers see the transport failure rather than an interruption.
+      yield* receive(protocolMessages.ClientProtocolError({ error: clientError(yield* wire.failure) }))
+      yield* Fiber.interrupt(loop)
 
-          const messages = yield* Effect.try({
-            try: () => wire.parser.decode(frame),
-            catch: (cause) => new ChromeRpcError({ message: "Malformed RPC response", cause })
-          })
-
-          for (const raw of messages) {
-            const message = yield* Schema.decodeUnknownEffect(fromServer)(raw).pipe(
-              Effect.mapError((cause) => new ChromeRpcError({ message: "Malformed RPC response", cause }))
-            )
-
-            if (Predicate.isTagged(message, "Pong")) yield* Deferred.succeed(wire.ready, undefined)
-            else yield* receive(message)
-          }
-        }
-      }).pipe(Effect.raceFirst(wire.closed.pipe(Effect.andThen(Effect.suspend(() =>
-        Effect.fail(wire.error() ?? new ChromeRpcError({ message: "Chrome RPC transport closed", cause: undefined }))
-      )))), Effect.catch((error) => Effect.gen(function*() {
-        wire.stop(error)
-        yield* receive(protocolMessages.ClientProtocolError({ error: clientError(error) }))
-
-        return yield* Effect.never
-      })))
+      return yield* Effect.never
     }).pipe(Effect.scoped),
-    send: (_clientId, message) => Effect.gen(function*() {
+    send: (clientId, message) => Effect.gen(function*() {
       // No request reached the peer before readiness, so cancellation must not wait
       // for a peer that may never appear (RPC sends Interrupt from its finalizer).
       if (Predicate.isTagged(message, "Interrupt") && !(yield* Deferred.isDone(wire.ready))) return
+      // Readiness implies `run` started, so the owning client is known from here on.
       yield* Deferred.await(wire.ready)
 
-      const error = wire.error()
+      if (clientId !== owner) {
+        return yield* failure("postMessage", "Chrome RPC protocol already serves another client")
+      }
 
-      if (error !== undefined) return yield* error
       yield* wire.send(message)
     }).pipe(Effect.mapError(clientError))
   })
@@ -234,7 +309,7 @@ export const makeClientProtocol = Effect.fnUntraced(function*(
 export const makeServerProtocol = Effect.fnUntraced(function*(
   api: RuntimeApi, native: NativePort, ownership: Ownership, options: Options = {}
 ) {
-  const wire = yield* transport(api, native, ownership, options)
+  const wire = yield* transport(api, native, ownership, yield* limits(options))
   const disconnects = yield* Queue.make<number>({ capacity: 1 })
   let connected = true
   let used = false
@@ -245,42 +320,26 @@ export const makeServerProtocol = Effect.fnUntraced(function*(
     disconnects,
     clientIds: Effect.sync(() => connected ? new Set([0]) : new Set<number>()),
     initialMessage: Effect.succeedNone,
-    end: () => Effect.sync(() => wire.stop(new ChromeRpcError({ message: "Chrome RPC client ended", cause: undefined }))),
-    send: (_clientId, response) => wire.send(response).pipe(Effect.ignore),
+    end: () => Effect.sync(() => wire.stop(failure("disconnect", "Chrome RPC client ended"))),
+    send: (_clientId, response) => wire.send(response).pipe(Effect.catch((error) => {
+      // The transport already failed every call.
+      if (wire.error() !== undefined) return Effect.void
+
+      // A refused Defect has no request to answer; a refused response is answered with a
+      // request defect by RpcServer, as for a response it cannot encode.
+      return Predicate.isTagged(response, "Defect") ? Effect.sync(() => wire.stop(error)) : Effect.die(error)
+    })),
     run: (receive) => Effect.gen(function*() {
       if (used) return yield* Effect.die(new Error("Chrome RPC protocol requires exactly one server"))
       used = true
 
-      return yield* Effect.gen(function*() {
-        while (true) {
-          const frame = yield* Queue.take(wire.queue)
-          const error = wire.error()
+      yield* wire.receive(fromClient, "Malformed RPC request", (message) =>
+        Predicate.isTagged(message, "Ping") ? wire.send(pong.make({})) : receive(0, message)
+      ).pipe(Effect.raceFirst(wire.closed))
+      connected = false
+      yield* Queue.offer(disconnects, 0)
 
-          if (error !== undefined) return yield* error
-
-          const messages = yield* Effect.try({
-            try: () => wire.parser.decode(frame),
-            catch: (cause) => new ChromeRpcError({ message: "Malformed RPC request", cause })
-          })
-
-          for (const raw of messages) {
-            const message = yield* Schema.decodeUnknownEffect(fromClient)(raw).pipe(
-              Effect.mapError((cause) => new ChromeRpcError({ message: "Malformed RPC request", cause }))
-            )
-
-            if (Predicate.isTagged(message, "Ping")) yield* wire.send(pong.make({}))
-            else yield* receive(0, message)
-          }
-        }
-      }).pipe(Effect.raceFirst(wire.closed.pipe(Effect.andThen(Effect.suspend(() =>
-        Effect.fail(wire.error() ?? new ChromeRpcError({ message: "Chrome RPC transport closed", cause: undefined }))
-      )))), Effect.catch((error) => Effect.gen(function*() {
-        wire.stop(error)
-        connected = false
-        yield* Queue.offer(disconnects, 0)
-
-        return yield* Effect.never
-      })))
+      return yield* Effect.never
     })
   })
 
@@ -292,11 +351,11 @@ export const makeServerProtocol = Effect.fnUntraced(function*(
  * all handlers. Provide the group's handler layer and middleware to this Effect.
  */
 export const serve = Effect.fnUntraced(function*<Rpcs extends Rpc.Any>(
-  api: RuntimeApi, port: NativePort, ownership: Ownership, group: RpcGroup.RpcGroup<Rpcs>, options: Options = {}
+  api: RuntimeApi, port: NativePort, ownership: Ownership, group: RpcGroup.RpcGroup<Rpcs>, options: ServeOptions = {}
 ) {
   const protocol = yield* makeServerProtocol(api, port, ownership, options)
 
-  yield* RpcServer.make(group).pipe(
+  yield* RpcServer.make(group, options.server).pipe(
     Effect.provideService(RpcServer.Protocol, protocol), Effect.raceFirst(protocol.closed)
   )
 }, Effect.scoped)
@@ -306,13 +365,31 @@ export const serve = Effect.fnUntraced(function*<Rpcs extends Rpc.Any>(
 // oxlint-disable-next-line anti-slop/no-unknown-returns
 type Handler = (payload: never, options: never) => unknown
 
+/** The request metadata Effect RPC passes every handler; only the procedure is read here. */
+interface HandlerOptions {
+  readonly rpc: Rpc.AnyWithProps
+}
+
+// An Effect result moves to a detached fiber with its own scope, so neither the caller's
+// disconnect nor the request scope closing ends its work or releases its resources.
+const detach = <A extends object>(result: A): A => {
+  if (!Effect.isEffect(result)) return result
+
+  // SAFETY: the Effect keeps its success, error and requirements (less Scope, now its own).
+  // The caller's group types them; here the channels are opaque, not unknown by design.
+  // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context
+  return Effect.flatMap(Effect.forkDetach(Effect.scoped(result)), Fiber.join) as A
+}
+
 /**
  * Lets each handler's work run to completion when its caller disconnects; only the reply is
  * lost. `serve` otherwise interrupts a connection's handlers when its port closes, unlike
  * `runtime.sendMessage`, whose listener always finishes. Use it for handlers whose work must
  * outlive the caller (an upload, a sign-in, a write), as in
- * `Group.toLayer(ChromeRpc.finishAccepted(handlers))`. Effect results run in a detached fiber
- * with the same success, error and requirements; stream results are left as they are.
+ * `Group.toLayer(ChromeRpc.finishAccepted(handlers))`. Effect results, including those
+ * wrapped by `Rpc.fork` or `Rpc.uninterruptible`, run in a detached fiber with their own scope
+ * and the same success, error and requirements; results of streaming procedures are left as
+ * they are.
  */
 export const finishAccepted = <const Handlers extends { readonly [Tag in keyof Handlers]: Handler }>(
   handlers: Handlers
@@ -320,12 +397,16 @@ export const finishAccepted = <const Handlers extends { readonly [Tag in keyof H
   const finished = new Map<string, Handler>()
 
   for (const [tag, handler] of Object.entries<Handler>(handlers)) {
-    finished.set(tag, (payload, handlerOptions) => {
-      const result = handler(payload, handlerOptions)
+    // SAFETY: Effect RPC calls every handler with its decoded payload and request metadata,
+    // which names the procedure being served.
+    const invoke = handler as (payload: never, options: HandlerOptions) => ReturnType<Handler>
 
-      // The caller's group types the Effect; this only moves it to a detached fiber.
-      // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context
-      return Effect.isEffect(result) ? Effect.flatMap(Effect.forkDetach(result), Fiber.join) : result
+    finished.set(tag, (payload: never, options: HandlerOptions) => {
+      const result = invoke(payload, options)
+
+      if (RpcSchema.isStreamSchema(options.rpc.successSchema) || !Predicate.isObjectKeyword(result)) return result
+
+      return Rpc.wrapMap(result, detach)
     })
   }
 
@@ -335,9 +416,11 @@ export const finishAccepted = <const Handlers extends { readonly [Tag in keyof H
 }
 
 /** Scoped client protocol layer; the port must be dedicated to this RPC connection. */
-export const layerClient = (api: RuntimeApi, port: NativePort, ownership: Ownership, options: Options = {}) =>
-  Layer.effect(RpcClient.Protocol, makeClientProtocol(api, port, ownership, options))
+export const layerClient = (
+  api: RuntimeApi, port: NativePort, ownership: Ownership, options: Options = {}
+): Layer.Layer<RpcClient.Protocol, ChromeRpcError> => Layer.effect(RpcClient.Protocol, makeClientProtocol(api, port, ownership, options))
 
 /** Scoped single-connection server protocol layer. */
-export const layerServer = (api: RuntimeApi, port: NativePort, ownership: Ownership, options: Options = {}) =>
-  Layer.effect(RpcServer.Protocol, makeServerProtocol(api, port, ownership, options))
+export const layerServer = (
+  api: RuntimeApi, port: NativePort, ownership: Ownership, options: Options = {}
+): Layer.Layer<RpcServer.Protocol, ChromeRpcError> => Layer.effect(RpcServer.Protocol, makeServerProtocol(api, port, ownership, options))
