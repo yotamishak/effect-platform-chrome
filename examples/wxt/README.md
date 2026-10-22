@@ -42,7 +42,7 @@ bootstrap deliberately keeps the worker alive.
 | **ChromePort** | **Connect** logs the background greeting and an automatic echo, then **Send value** produces another echo. **Disconnect / close scope** interrupts the popup fiber and releases its owned native port. Reconnect works; closing the popup also ends the background's scoped adopted connection. Initial sends wait for a greeting because adoption is gated by worker initialization. |
 | **ChromeTabs** | **Query tabs** lists current-window tabs. **Open example.com** explicitly creates a tab; reopening the popup and clicking **Message example.com content script** returns the page title/URL. Refresh an existing example.com tab after installing/reloading the extension so its script is present. Create/update/remove/activate events are observed while the popup is open. Nothing navigates or closes existing tabs automatically. |
 | **ChromeAlarms** | **Schedule one-shot (~1 min)** creates only the demo alarm. **Query demo alarm** reads it and lists current alarms. **Clear demo alarm** clears only that name. Leaving the popup open shows an observational alarm event; the independent synchronous background wake handler saves the handled alarm in local storage. |
-| **ChromeServiceWorker** | **Worker / lifecycle / last alarm** shows initialization time, boot ID, last lifecycle event and last handled alarm. **Intentional handler error** produces a clean `{ok:false,error:{code:"HandlerFailed",...}}` response, not a hung response channel. Installation/startup and alarms use synchronous wake listeners; an extra synchronous tab-activation registration uses `worker.register`. |
+| **ChromeServiceWorker** | **Worker / lifecycle / last alarm** shows initialization time, boot ID, last lifecycle event and last handled alarm. **Intentional handler error** produces a clean `{ok:false,error:{code:"HandlerFailed",...}}` response, not a hung response channel. Installation/startup and alarms use synchronous wake listeners; an extra synchronous tab-activation listener is passed as `listeners: [ChromeServiceWorker.listen(...)]`. |
 | **ChromeRpc** | **Typed ping / fail / stream cancellation** opens a dedicated scoped port, waits for the adapter's Ping/Pong handshake, round-trips the input, decodes `DemoRejected`, and takes five streamed numbers (cancelling the remainder). The caller scope releases its connection; the worker's synchronous `onConnect` dispatch selects the RPC port name and serves until disconnect. |
 | **ChromeSchemaStorage** | **Validated local entry** writes a schema-validated version-1 envelope. **Seed v0 / migrate to v1** deliberately replaces only the demo entry with a legacy envelope, validates/migrates it, and writes back version 1. **Subscribe** observes the initial value and updates; **Stop subscription** interrupts its fiber and removes the listener. Closing the popup also releases it. |
 | **ChromePermissions** | **Contains / getAll** reads permission state. **Request example.com access** alone requests optional host access; its click handler calls `requestFromUserGesture` synchronously using an already-resolved service, before any asynchronous Effect execution. No scripted revocation. |
@@ -79,9 +79,10 @@ stress is explicitly opt-in, not a build-time test or a benchmark guarantee.
 - Popup → background: `ChromeRuntime.sendMessageSchema`, decoded by the
   worker handler; `ChromeServiceWorker` wraps its result exactly once.
 - Content → background: the limited `https://example.com/*` content script
-  sends the same schema ping and logs its response in the **page** console.
+  sends the same schema ping through `ChromeRuntime.request`, which unwraps the
+  `ChromeMessage` envelope, and logs the value in the **page** console.
 - Popup → content: `ChromeTabs.sendMessage` addresses an example.com tab;
-  the content listener answers synchronously with a compatible success envelope.
+  the content listener answers synchronously with `ChromeMessage.succeed`.
 - Popup ↔ background port: both endpoints acquire owned, scoped wrappers;
   port stream completion or interruption releases their listeners/connections.
 
@@ -96,8 +97,8 @@ WXT 0.21.4's generated background entrypoint calls `definition.main()`
 synchronously. `entrypoints/background.ts` calls `ChromeServiceWorker.start`
 directly inside that callback, without awaiting anything. This installs message,
 port, install, startup and alarm listeners before layer construction and the
-deliberate 250 ms initialization delay. `worker.register` is also called before
-returning. Up to 32 events/messages can wait for initialization. The queue is
+deliberate 250 ms initialization delay, along with the tab-activation listener
+from `listeners`. Up to 32 events/messages can wait for initialization. The queue is
 in-memory, not durable; Chrome's message channel is not a permanent worker lease.
 
 To manually investigate wakeup:

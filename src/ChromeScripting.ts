@@ -1,4 +1,5 @@
 import { Context, Effect, Layer, Schema } from "effect"
+import { invoker, liveLayer } from "./internal/api.js"
 
 export class ChromeScriptingError extends Schema.TaggedError<ChromeScriptingError>()("ChromeScriptingError", {
   operation: Schema.String,
@@ -45,11 +46,7 @@ export interface ChromeScriptingService {
 
 export class ChromeScripting extends Context.Service<ChromeScripting, ChromeScriptingService>()("effect-platform-chrome/ChromeScripting") {}
 
-const invoke = <A>(operation: string, run: () => Promise<A>): Effect.Effect<A, ChromeScriptingError> =>
-  Effect.tryPromise({
-    try: run,
-    catch: (cause) => new ChromeScriptingError({ operation, cause })
-  })
+const invoke = invoker((operation, cause) => new ChromeScriptingError({ operation, cause }))
 
 export const make = (api: ChromeScriptingApi): ChromeScriptingService => {
   function executeScript<Args extends Array<unknown>, Result>(injection: FunctionInjection<Args, Result>): Effect.Effect<Array<chrome.scripting.InjectionResult<Awaited<Result>>>, ChromeScriptingError>
@@ -76,15 +73,7 @@ export const make = (api: ChromeScriptingApi): ChromeScriptingService => {
 export const layer = (api: ChromeScriptingApi): Layer.Layer<ChromeScripting> => Layer.succeed(ChromeScripting, make(api))
 
 /** Chrome globals are read only when this layer is built. */
-export const layerLive: Layer.Layer<ChromeScripting, ChromeScriptingError> = Layer.effect(ChromeScripting, Effect.try({
-  try: () => {
-    const api = typeof chrome === "undefined" ? undefined : chrome.scripting
-
-    if (api === undefined) {
-      throw new Error("chrome.scripting is unavailable in this context")
-    }
-
-    return make(api)
-  },
-  catch: (cause) => new ChromeScriptingError({ operation: "initialize", cause })
-}))
+export const layerLive: Layer.Layer<ChromeScripting, ChromeScriptingError> = liveLayer(
+  ChromeScripting, "scripting", (chrome) => chrome.scripting, make,
+  (cause) => new ChromeScriptingError({ operation: "initialize", cause })
+)

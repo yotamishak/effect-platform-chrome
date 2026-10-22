@@ -1,4 +1,8 @@
 import { Cause, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect"
+import type { Response, WorkerError } from "./ChromeMessage.js"
+
+/** The reply envelope, defined in ChromeMessage so senders decode the same shape. */
+export type { ErrorCode, Response, WorkerError } from "./ChromeMessage.js"
 
 /** Structural event interface, also suitable for injected test events. */
 export interface ChromeEvent<Listener> {
@@ -6,16 +10,67 @@ export interface ChromeEvent<Listener> {
   readonly removeListener: (listener: Listener) => void
 }
 
-export type ErrorCode = "InitializationFailed" | "HandlerFailed" | "Overflow" | "Disposed"
-
-export interface WorkerError {
-  readonly code: ErrorCode
-  readonly message: string
+/**
+ * An event whose `addListener` also takes a filter, such as webNavigation's URL filters.
+ * A filter keeps Chrome from waking the worker for events it would only discard.
+ */
+export interface FilteredChromeEvent<Listener, Filter> {
+  readonly addListener: (listener: Listener, filter: Filter) => void
+  readonly removeListener: (listener: Listener) => void
 }
 
-export type Response<A = unknown> =
-  | { readonly ok: true; readonly value: A }
-  | { readonly ok: false; readonly error: WorkerError }
+/** Either event shape; the filter is passed only when one was given. */
+interface OptionallyFilteredEvent<Listener, Filter> {
+  readonly addListener: (listener: Listener, filter?: Filter) => void
+  readonly removeListener: (listener: Listener) => void
+}
+
+/** Adds a listener to an event; `start` supplies one that tracks it for disposal. */
+export type Install = <Listener>(event: ChromeEvent<Listener>, listener: Listener) => () => void
+
+/** A wake listener for `start`'s `listeners` option, made with `listen`. */
+export interface Listener<R, E> {
+  readonly attach: (install: Install, dispatch: (run: () => Effect.Effect<unknown, E, R>) => void) => () => void
+}
+
+const makeListener = <Args extends ReadonlyArray<unknown>, Filter, E, R>(
+  event: OptionallyFilteredEvent<(...args: Args) => void, Filter>,
+  handler: (...args: Args) => Effect.Effect<unknown, E, R>,
+  filters: [] | [Filter]
+): Listener<R, E> => {
+  const target: ChromeEvent<(...args: Args) => void> = {
+    // Chrome validates arguments, so an absent filter is not passed as undefined.
+    addListener: (listener) => filters.length === 0 ? event.addListener(listener) : event.addListener(listener, filters[0]),
+    removeListener: (listener) => event.removeListener(listener)
+  }
+
+  return {
+    attach: (install, dispatch) => install(target, (...args: Args) => { dispatch(() => handler(...args)) })
+  }
+}
+
+/**
+ * Pairs any Chrome event with an Effect handler, for `start`'s `listeners` option: for example
+ * `action.onClicked`, `contextMenus.onClicked`, `commands.onCommand`, or a webNavigation event
+ * with its URL filter as the third argument. Handlers cannot answer through a return value,
+ * so `runtime.onMessageExternal` replies are not supported this way.
+ */
+export function listen<Args extends ReadonlyArray<unknown>, E, R>(
+  event: ChromeEvent<(...args: Args) => void>,
+  handler: (...args: Args) => Effect.Effect<unknown, E, R>
+): Listener<R, E>
+export function listen<Args extends ReadonlyArray<unknown>, Filter, E, R>(
+  event: FilteredChromeEvent<(...args: Args) => void, Filter>,
+  handler: (...args: Args) => Effect.Effect<unknown, E, R>,
+  filter: Filter
+): Listener<R, E>
+export function listen<Args extends ReadonlyArray<unknown>, Filter, E, R>(
+  event: OptionallyFilteredEvent<(...args: Args) => void, Filter>,
+  handler: (...args: Args) => Effect.Effect<unknown, E, R>,
+  ...filters: [] | [Filter]
+): Listener<R, E> {
+  return makeListener(event, handler, filters)
+}
 
 export type MessageListener = (
   message: unknown,
@@ -45,6 +100,11 @@ export interface Handlers<R, E = never> {
   readonly onInstalled?: (details: chrome.runtime.InstalledDetails) => Effect.Effect<unknown, E, R>
   readonly onStartup?: () => Effect.Effect<unknown, E, R>
   readonly onAlarm?: (alarm: chrome.alarms.Alarm) => Effect.Effect<unknown, E, R>
+  /**
+   * Any other wake listeners, made with `listen`. They are installed with the named ones,
+   * synchronously and all-or-nothing: if one cannot be added, none stay registered.
+   */
+  readonly listeners?: ReadonlyArray<Listener<R, E>>
 }
 
 export type Options<R, ER, EI = never, EH = never> = Handlers<R, EH> & {
@@ -62,11 +122,22 @@ export type Options<R, ER, EI = never, EH = never> = Handlers<R, EH> & {
 export interface ServiceWorker<R, E> {
   /** Always resolves to an Exit, including initialization failure or interruption. */
   readonly ready: Promise<Exit.Exit<void, E>>
-  /** Registers immediately. Unregister stops future delivery, not already accepted work. */
-  readonly register: <Args extends ReadonlyArray<unknown>, EH>(
-    event: ChromeEvent<(...args: Args) => void>,
-    handler: (...args: Args) => Effect.Effect<unknown, EH, R>
-  ) => () => void
+  /**
+   * Registers immediately, with an optional event filter. Unregister stops future delivery,
+   * not already accepted work. Prefer `start`'s `listeners` for wake listeners, so a failed
+   * registration rolls the others back.
+   */
+  readonly register: {
+    <Args extends ReadonlyArray<unknown>, EH>(
+      event: ChromeEvent<(...args: Args) => void>,
+      handler: (...args: Args) => Effect.Effect<unknown, EH, R>
+    ): () => void
+    <Args extends ReadonlyArray<unknown>, Filter, EH>(
+      event: FilteredChromeEvent<(...args: Args) => void, Filter>,
+      handler: (...args: Args) => Effect.Effect<unknown, EH, R>,
+      filter: Filter
+    ): () => void
+  }
   /** Idempotent. Borrowed runtimes are never disposed. */
   readonly dispose: () => Promise<void>
 }
@@ -163,12 +234,12 @@ export const start = <R, ER, EI = never, EH = never>(options: Options<R, ER, EI,
     return remove
   }
 
-  const register: ServiceWorker<R, ER | EI>["register"] = (event, handler) => {
+  const attach = <EH>(listener: Listener<R, EH>): (() => void) => {
     let registered = true
 
-    const remove = install(event, (...args) => {
+    const remove = listener.attach(install, (run) => {
       if (!registered) return
-      submit(() => execute(() => handler(...args), () => {}, report), report)
+      submit(() => execute(run, () => {}, report), report)
     })
 
     return () => {
@@ -176,6 +247,12 @@ export const start = <R, ER, EI = never, EH = never>(options: Options<R, ER, EI,
       remove()
     }
   }
+
+  const register = <Args extends ReadonlyArray<unknown>, Filter, EH>(
+    event: OptionallyFilteredEvent<(...args: Args) => void, Filter>,
+    handler: (...args: Args) => Effect.Effect<unknown, EH, R>,
+    ...filters: [] | [Filter]
+  ): (() => void) => attach(makeListener(event, handler, filters))
 
   const messageListener = (
     selectMessage: (message: unknown, sender: chrome.runtime.MessageSender) => boolean,
@@ -239,6 +316,8 @@ export const start = <R, ER, EI = never, EH = never>(options: Options<R, ER, EI,
       if (!options.chrome.alarms) throw new Error("Configured onAlarm event is unavailable")
       register(options.chrome.alarms.onAlarm, options.onAlarm)
     }
+
+    for (const listener of options.listeners ?? []) attach(listener)
   } catch (error) {
     state = "disposed"
 

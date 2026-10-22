@@ -2,6 +2,7 @@
 /* oxlint-disable effecttsgo/unstable-api-usage */
 import { Effect, Fiber, Schema, Stream } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
+import { ChromeMessageError, fail, succeed } from "../src/ChromeMessage.js"
 import { ChromeRuntime, ChromeRuntimeError, layer, make, type RuntimeApi } from "../src/ChromeRuntime.js"
 
 const event = <A extends ReadonlyArray<unknown>>() => {
@@ -31,6 +32,29 @@ const fake = () => ({
 })
 
 describe("ChromeRuntime", () => {
+  it.effect("request encodes the message and unwraps the reply envelope", () => Effect.gen(function*() {
+    const runtime = fake()
+    const service = make(runtime)
+    const request = Schema.Struct({ ping: Schema.FiniteFromString })
+    const value = Schema.Struct({ pong: Schema.FiniteFromString })
+
+    runtime.sendMessage.mockResolvedValueOnce(succeed({ pong: "2" }))
+    expect(yield* service.request(request, value, { ping: 1 })).toEqual({ pong: 2 })
+    expect(runtime.sendMessage).toHaveBeenLastCalledWith(undefined, { ping: "1" }, undefined)
+
+    runtime.sendMessage.mockResolvedValueOnce(fail({ code: "Overflow", message: "Startup queue is full" }))
+    const failure = yield* Effect.flip(service.request(request, value, { ping: 1 }))
+    expect(failure).toBeInstanceOf(ChromeMessageError)
+    expect(failure).toMatchObject({ code: "Overflow", message: "Startup queue is full" })
+
+    for (const reply of [{ pong: "2" }, succeed({ pong: "x" }), undefined]) {
+      runtime.sendMessage.mockResolvedValueOnce(reply)
+      const invalid = yield* Effect.flip(service.request(request, value, { ping: 1 }))
+      expect(invalid).toBeInstanceOf(ChromeRuntimeError)
+      expect(invalid).toMatchObject({ operation: "sendMessage.decodeResponse" })
+    }
+  }))
+
   it.effect("encodes transformed requests and decodes transformed responses across 256 exchanges", () => Effect.gen(function*() {
     const runtime = fake()
     const service = make(runtime)

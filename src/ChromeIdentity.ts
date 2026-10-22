@@ -1,4 +1,5 @@
 import { Context, Effect, Layer, Schema } from "effect"
+import { liveLayer } from "./internal/api.js"
 
 export class ChromeIdentityError extends Schema.TaggedError<ChromeIdentityError>()("ChromeIdentityError", {
   operation: Schema.String,
@@ -38,15 +39,7 @@ export const make = (api: ChromeIdentityApi): ChromeIdentityService => ChromeIde
 export const layer = (api: ChromeIdentityApi): Layer.Layer<ChromeIdentity> => Layer.succeed(ChromeIdentity, make(api))
 
 /** The global is read only when the layer is built, never at import time. */
-export const layerLive: Layer.Layer<ChromeIdentity, ChromeIdentityError> = Layer.effect(ChromeIdentity, Effect.try({
-  try: () => {
-    const api = typeof chrome === "undefined" ? undefined : chrome.identity
-
-    if (api === undefined) {
-      throw new Error("chrome.identity is unavailable in this context")
-    }
-
-    return make(api)
-  },
-  catch: (cause) => new ChromeIdentityError({ operation: "initialize", cause })
-}))
+export const layerLive: Layer.Layer<ChromeIdentity, ChromeIdentityError> = liveLayer(
+  ChromeIdentity, "identity", (chrome) => chrome.identity, make,
+  (cause) => new ChromeIdentityError({ operation: "initialize", cause })
+)

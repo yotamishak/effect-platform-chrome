@@ -1,4 +1,5 @@
 import { Context, Effect, Layer, Schema } from "effect"
+import { invoker, liveLayer } from "./internal/api.js"
 
 export class ChromeWindowsError extends Schema.TaggedError<ChromeWindowsError>()("ChromeWindowsError", {
   operation: Schema.String,
@@ -23,11 +24,7 @@ export interface ChromeWindowsService {
 
 export class ChromeWindows extends Context.Service<ChromeWindows, ChromeWindowsService>()("effect-platform-chrome/ChromeWindows") {}
 
-const invoke = <A>(operation: string, run: () => Promise<A>): Effect.Effect<A, ChromeWindowsError> =>
-  Effect.tryPromise({
-    try: run,
-    catch: (cause) => new ChromeWindowsError({ operation, cause })
-  })
+const invoke = invoker((operation, cause) => new ChromeWindowsError({ operation, cause }))
 
 /** Creates the service without reading browser globals. */
 export const make = (api: ChromeWindowsApi): ChromeWindowsService => {
@@ -49,15 +46,7 @@ export const make = (api: ChromeWindowsApi): ChromeWindowsService => {
 export const layer = (api: ChromeWindowsApi): Layer.Layer<ChromeWindows> => Layer.succeed(ChromeWindows, make(api))
 
 /** The global is read only when the layer is built, never at import time. */
-export const layerLive: Layer.Layer<ChromeWindows, ChromeWindowsError> = Layer.effect(ChromeWindows, Effect.try({
-  try: () => {
-    const api = typeof chrome === "undefined" ? undefined : chrome.windows
-
-    if (api === undefined) {
-      throw new Error("chrome.windows is unavailable in this context")
-    }
-
-    return make(api)
-  },
-  catch: (cause) => new ChromeWindowsError({ operation: "initialize", cause })
-}))
+export const layerLive: Layer.Layer<ChromeWindows, ChromeWindowsError> = liveLayer(
+  ChromeWindows, "windows", (chrome) => chrome.windows, make,
+  (cause) => new ChromeWindowsError({ operation: "initialize", cause })
+)

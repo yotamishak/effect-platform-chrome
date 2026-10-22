@@ -2,8 +2,8 @@
 /* oxlint-disable effecttsgo/unstable-api-usage */
 import { Effect, Exit, Layer, ManagedRuntime } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
-import { start } from "../src/ChromeServiceWorker.js"
-import type { ChromeEvent, MessageListener, Response } from "../src/ChromeServiceWorker.js"
+import { listen, start } from "../src/ChromeServiceWorker.js"
+import type { ChromeEvent, FilteredChromeEvent, MessageListener, Response } from "../src/ChromeServiceWorker.js"
 
 const event = <Listener>(): ChromeEvent<Listener> & { listeners: Set<Listener> } => {
   const listeners = new Set<Listener>()
@@ -31,6 +31,31 @@ const setup = () => {
   }
 
   return { chrome: { runtime: { onMessage, onStartup, onInstalled, onConnect }, alarms: { onAlarm } }, sender, send }
+}
+
+interface UrlFilter { readonly url: ReadonlyArray<{ readonly hostEquals: string }> }
+
+/** Like Chrome's webNavigation events, the filter is optional; every addListener call is recorded. */
+interface RecordedEvent<Listener> {
+  addListener(listener: Listener, filter?: UrlFilter): void
+  removeListener(listener: Listener): void
+  readonly listeners: Set<Listener>
+  readonly calls: Array<ReadonlyArray<Listener | UrlFilter | undefined>>
+}
+
+const filteredEvent = <Listener>(): RecordedEvent<Listener> => {
+  const calls: Array<ReadonlyArray<Listener | UrlFilter | undefined>> = []
+  const listeners = new Set<Listener>()
+
+  return {
+    listeners,
+    calls,
+    addListener: (...args) => {
+      calls.push(args)
+      listeners.add(args[0])
+    },
+    removeListener: (listener) => { listeners.delete(listener) }
+  }
 }
 
 const gate = () => {
@@ -635,5 +660,101 @@ describe("ChromeServiceWorker", () => {
       "selectMessage and onMessage must be configured together"
     )
     expect(api.chrome.runtime.onMessage.listeners.size).toBe(0)
+  })
+
+  describe("listeners", () => {
+    it("installs listen() entries with the named ones, before initialization, passing filters only when given", async () => {
+      const api = setup()
+      const clicked = event<(tab: chrome.tabs.Tab) => void>()
+      const committed = filteredEvent<(details: { readonly url: string }) => void>()
+      const unfiltered = filteredEvent<(details: { readonly url: string }) => void>()
+      const hydrated = gate()
+      const seen: Array<string> = []
+      const filter: UrlFilter = { url: [{ hostEquals: "example.com" }] }
+
+      const layer = Layer.effectDiscard(Effect.gen(function*() {
+        expect(clicked.listeners.size).toBe(1)
+        expect(committed.listeners.size).toBe(1)
+        yield* hydrated.effect
+      }))
+
+      const worker = start({
+        ...api, layer,
+        listeners: [
+          listen(clicked, (tab) => Effect.sync(() => { seen.push(`clicked ${tab.id}`) })),
+          listen(committed, (details) => Effect.sync(() => { seen.push(`committed ${details.url}`) }), filter),
+          listen(unfiltered, () => Effect.void)
+        ]
+      })
+
+      expect(committed.calls).toEqual([[expect.any(Function), filter]])
+      expect(unfiltered.calls).toEqual([[expect.any(Function)]])
+
+      // SAFETY: the handler only reads tab.id.
+      const tab = { id: 7 } as chrome.tabs.Tab
+
+      for (const listener of clicked.listeners) listener(tab)
+
+      for (const listener of committed.listeners) listener({ url: "https://example.com/" })
+
+      expect(seen).toEqual([])
+
+      hydrated.release()
+      await worker.ready
+      await vi.waitFor(() => expect(seen).toEqual(["clicked 7", "committed https://example.com/"]))
+      await worker.dispose()
+      expect(clicked.listeners.size + committed.listeners.size + unfiltered.listeners.size).toBe(0)
+    })
+
+    it("accepts Chrome's own filtered events, with and without a filter", () => {
+      const listeners = (onCommitted: typeof chrome.webNavigation.onCommitted) => [
+        listen(onCommitted, (details) => Effect.sync(() => details.url)),
+        listen(onCommitted, (details) => Effect.sync(() => details.url), { url: [{ hostEquals: "example.com" }] })
+      ]
+
+      const required: FilteredChromeEvent<(url: string) => void, UrlFilter> = { addListener: () => {}, removeListener: () => {} }
+
+      expect(listeners).toBeTypeOf("function")
+      expect(listen(required, () => Effect.void, { url: [] })).toHaveProperty("attach")
+    })
+
+    it("rolls back every listener when one cannot be added", () => {
+      const api = setup()
+      const first = event<() => void>()
+
+      const failing: ChromeEvent<() => void> = {
+        addListener: () => { throw new Error("no such event") },
+        removeListener: () => {}
+      }
+
+      expect(() => start({
+        ...api, layer: Layer.empty,
+        onStartup: () => Effect.void,
+        listeners: [listen(first, () => Effect.void), listen(failing, () => Effect.void)]
+      })).toThrow("no such event")
+
+      expect(first.listeners.size).toBe(0)
+      expect(api.chrome.runtime.onStartup.listeners.size).toBe(0)
+    })
+
+    it("registers a filtered event after start and reports handler failures", async () => {
+      const api = setup()
+      const onError = vi.fn()
+      const worker = start({ ...api, layer: Layer.empty, onError })
+      const committed = filteredEvent<(url: string) => void>()
+      const filter: UrlFilter = { url: [{ hostEquals: "example.com" }] }
+      const unregister = worker.register(committed, (url) => Effect.fail(`failed ${url}`), filter)
+
+      expect(committed.calls).toEqual([[expect.any(Function), filter]])
+
+      await worker.ready
+
+      for (const listener of committed.listeners) listener("https://example.com/")
+      await vi.waitFor(() => expect(onError).toHaveBeenCalledWith(expect.objectContaining({ code: "HandlerFailed" })))
+
+      unregister()
+      expect(committed.listeners.size).toBe(0)
+      await worker.dispose()
+    })
   })
 })

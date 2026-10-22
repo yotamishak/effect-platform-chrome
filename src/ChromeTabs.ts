@@ -1,4 +1,6 @@
-import { Context, Effect, Layer, Queue, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Schema, Stream } from "effect"
+import { invoker, liveLayer } from "./internal/api.js"
+import { observe, type EventSource } from "./internal/event.js"
 
 export class ChromeTabsError extends Schema.TaggedError<ChromeTabsError>()("ChromeTabsError", {
   operation: Schema.String,
@@ -56,36 +58,13 @@ export interface ChromeTabsService {
 
 export class ChromeTabs extends Context.Service<ChromeTabs, ChromeTabsService>()("effect-platform-chrome/ChromeTabs") {}
 
-const invoke = <A>(operation: string, run: () => Promise<A>): Effect.Effect<A, ChromeTabsError> =>
-  Effect.tryPromise({
-    try: run,
-    catch: (cause) => new ChromeTabsError({ operation, cause })
-  })
+const invoke = invoker((operation, cause) => new ChromeTabsError({ operation, cause }))
 
-interface EventSource<Args extends Array<unknown>> {
-  addListener(listener: (...args: Args) => void): void
-  removeListener(listener: (...args: Args) => void): void
-}
-
-const observe = <Args extends Array<unknown>, A>(
+const tabEvents = <Args extends Array<unknown>, A>(
   operation: string,
-  source: EventSource<Args>,
+  getSource: () => EventSource<Args>,
   project: (...args: Args) => A
-): Stream.Stream<A, ChromeTabsError> => Stream.callback<A, ChromeTabsError>((queue) => {
-  const listener = (...args: Args) => { Queue.offerUnsafe(queue, project(...args)) }
-
-  return Effect.gen(function*() {
-    // Install cleanup before registration, which may partially succeed then throw.
-    yield* Effect.acquireRelease(
-      Effect.succeed(listener),
-      () => Effect.sync(() => source.removeListener(listener))
-    )
-    yield* Effect.try({
-      try: () => source.addListener(listener),
-      catch: (cause) => new ChromeTabsError({ operation, cause })
-    })
-  })
-}, { bufferSize: 64, strategy: "sliding" })
+): Stream.Stream<A, ChromeTabsError> => observe(getSource, project, (cause) => new ChromeTabsError({ operation, cause }))
 
 /**
  * Each stream consumption owns a listener, removed when its scope closes (including
@@ -107,22 +86,16 @@ export const make = (api: ChromeTabsApi): ChromeTabsService => ChromeTabs.of({
     catch: (cause) => new ChromeTabsError({ operation: "connect", cause })
   }),
   captureVisibleTab: (windowId, options = {}) => invoke("captureVisibleTab", () => api.captureVisibleTab(windowId, options)),
-  onCreated: observe("onCreated", api.onCreated, (tab) => tab),
-  onUpdated: observe("onUpdated", api.onUpdated, (tabId, changeInfo, tab) => ({ tabId, changeInfo, tab })),
-  onRemoved: observe("onRemoved", api.onRemoved, (tabId, removeInfo) => ({ tabId, removeInfo })),
-  onActivated: observe("onActivated", api.onActivated, (info) => info)
+  onCreated: tabEvents("onCreated", () => api.onCreated, (tab) => tab),
+  onUpdated: tabEvents("onUpdated", () => api.onUpdated, (tabId, changeInfo, tab) => ({ tabId, changeInfo, tab })),
+  onRemoved: tabEvents("onRemoved", () => api.onRemoved, (tabId, removeInfo) => ({ tabId, removeInfo })),
+  onActivated: tabEvents("onActivated", () => api.onActivated, (info) => info)
 })
 
 export const layer = (api: ChromeTabsApi): Layer.Layer<ChromeTabs> => Layer.succeed(ChromeTabs, make(api))
 
 /** Chrome is accessed only when the layer is built, never when this module is imported. */
-export const layerLive: Layer.Layer<ChromeTabs, ChromeTabsError> = Layer.effect(ChromeTabs, Effect.try({
-  try: () => {
-    if (typeof chrome === "undefined" || chrome.tabs === undefined) {
-      throw new Error("chrome.tabs is unavailable in this context")
-    }
-
-    return make(chrome.tabs)
-  },
-  catch: (cause) => new ChromeTabsError({ operation: "initialize", cause })
-}))
+export const layerLive: Layer.Layer<ChromeTabs, ChromeTabsError> = liveLayer(
+  ChromeTabs, "tabs", (chrome) => chrome.tabs, make,
+  (cause) => new ChromeTabsError({ operation: "initialize", cause })
+)

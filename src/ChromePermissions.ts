@@ -1,4 +1,6 @@
-import { Context, Effect, Exit, Layer, Queue, Schema, Stream } from "effect"
+import { Context, Effect, Exit, Layer, Schema, Stream } from "effect"
+import { invoker, liveLayer } from "./internal/api.js"
+import { observe } from "./internal/event.js"
 
 export class ChromePermissionsError extends Schema.TaggedError<ChromePermissionsError>()("ChromePermissionsError", {
   operation: Schema.String,
@@ -29,11 +31,7 @@ export interface ChromePermissionsService {
 
 export class ChromePermissions extends Context.Service<ChromePermissions, ChromePermissionsService>()("effect-platform-chrome/ChromePermissions") {}
 
-const invoke = <A>(operation: string, run: () => Promise<A>): Effect.Effect<A, ChromePermissionsError> =>
-  Effect.tryPromise({
-    try: run,
-    catch: (cause) => new ChromePermissionsError({ operation, cause })
-  })
+const invoke = invoker((operation, cause) => new ChromePermissionsError({ operation, cause }))
 
 /** Attach both settlement handlers immediately, even if the returned Effect is never run. */
 const requestImmediately = (
@@ -52,36 +50,11 @@ const requestImmediately = (
   }
 }
 
-const observe = (
+const permissionEvents = (
   operation: "onAdded" | "onRemoved",
   getSource: () => ChromePermissionsApi["onAdded"]
-): Stream.Stream<chrome.permissions.Permissions, ChromePermissionsError> => Stream.callback((queue) => {
-  let active = true
-
-  const listener = (permissions: chrome.permissions.Permissions) => {
-    if (active) Queue.offerUnsafe(queue, permissions)
-  }
-
-  return Effect.gen(function*() {
-    const source = yield* Effect.try({
-      try: getSource,
-      catch: (cause) => new ChromePermissionsError({ operation, cause })
-    })
-
-    // Cleanup must already exist if registration inserts the listener then throws.
-    yield* Effect.acquireRelease(
-      Effect.succeed(listener),
-      () => Effect.sync(() => {
-        active = false
-        source.removeListener(listener)
-      })
-    )
-    yield* Effect.try({
-      try: () => source.addListener(listener),
-      catch: (cause) => new ChromePermissionsError({ operation, cause })
-    })
-  })
-}, { bufferSize: 64, strategy: "sliding" })
+): Stream.Stream<chrome.permissions.Permissions, ChromePermissionsError> =>
+  observe(getSource, (permissions) => permissions, (cause) => new ChromePermissionsError({ operation, cause }))
 
 /**
  * Each consumption owns a scoped listener. At most 64 pending events are retained;
@@ -94,22 +67,14 @@ export const make = (api: ChromePermissionsApi): ChromePermissionsService => Chr
   request: (permissions) => invoke("request", () => api.request(permissions)),
   requestFromUserGesture: (permissions) => requestImmediately(api, permissions),
   remove: (permissions) => invoke("remove", () => api.remove(permissions)),
-  onAdded: observe("onAdded", () => api.onAdded),
-  onRemoved: observe("onRemoved", () => api.onRemoved)
+  onAdded: permissionEvents("onAdded", () => api.onAdded),
+  onRemoved: permissionEvents("onRemoved", () => api.onRemoved)
 })
 
 export const layer = (api: ChromePermissionsApi): Layer.Layer<ChromePermissions> => Layer.succeed(ChromePermissions, make(api))
 
 /** The global is accessed only when this layer is built. */
-export const layerLive: Layer.Layer<ChromePermissions, ChromePermissionsError> = Layer.effect(ChromePermissions, Effect.try({
-  try: () => {
-    const api = typeof chrome === "undefined" ? undefined : chrome.permissions
-
-    if (api === undefined) {
-      throw new Error("chrome.permissions is unavailable in this context")
-    }
-
-    return make(api)
-  },
-  catch: (cause) => new ChromePermissionsError({ operation: "initialize", cause })
-}))
+export const layerLive: Layer.Layer<ChromePermissions, ChromePermissionsError> = liveLayer(
+  ChromePermissions, "permissions", (chrome) => chrome.permissions, make,
+  (cause) => new ChromePermissionsError({ operation: "initialize", cause })
+)

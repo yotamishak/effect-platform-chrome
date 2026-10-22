@@ -1,4 +1,5 @@
 import { Context, Effect, Layer, Option, Schema } from "effect"
+import { invoker, liveLayer } from "./internal/api.js"
 
 export class ChromeCookiesError extends Schema.TaggedError<ChromeCookiesError>()("ChromeCookiesError", {
   operation: Schema.String,
@@ -31,11 +32,7 @@ export interface ChromeCookiesService {
 
 export class ChromeCookies extends Context.Service<ChromeCookies, ChromeCookiesService>()("effect-platform-chrome/ChromeCookies") {}
 
-const invoke = <A>(operation: string, run: () => Promise<A>): Effect.Effect<A, ChromeCookiesError> =>
-  Effect.tryPromise({
-    try: run,
-    catch: (cause) => new ChromeCookiesError({ operation, cause })
-  })
+const invoke = invoker((operation, cause) => new ChromeCookiesError({ operation, cause }))
 
 /** The details that address exactly this cookie for `remove`. */
 export const detailsOf = (cookie: Cookie): chrome.cookies.CookieDetails => {
@@ -66,15 +63,7 @@ export const make = (api: ChromeCookiesApi): ChromeCookiesService => {
 export const layer = (api: ChromeCookiesApi): Layer.Layer<ChromeCookies> => Layer.succeed(ChromeCookies, make(api))
 
 /** The global is read only when the layer is built, never at import time. */
-export const layerLive: Layer.Layer<ChromeCookies, ChromeCookiesError> = Layer.effect(ChromeCookies, Effect.try({
-  try: () => {
-    const api = typeof chrome === "undefined" ? undefined : chrome.cookies
-
-    if (api === undefined) {
-      throw new Error("chrome.cookies is unavailable in this context")
-    }
-
-    return make(api)
-  },
-  catch: (cause) => new ChromeCookiesError({ operation: "initialize", cause })
-}))
+export const layerLive: Layer.Layer<ChromeCookies, ChromeCookiesError> = liveLayer(
+  ChromeCookies, "cookies", (chrome) => chrome.cookies, make,
+  (cause) => new ChromeCookiesError({ operation: "initialize", cause })
+)

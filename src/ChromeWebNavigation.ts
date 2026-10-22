@@ -1,4 +1,6 @@
-import { Context, Effect, Layer, Option, Queue, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { invoker, liveLayer } from "./internal/api.js"
+import { observe, type EventSource } from "./internal/event.js"
 
 export class ChromeWebNavigationError extends Schema.TaggedError<ChromeWebNavigationError>()("ChromeWebNavigationError", {
   operation: Schema.String,
@@ -11,10 +13,7 @@ export type FrameInfo = chrome.webNavigation.GetFrameResultDetails
 
 export type Navigation = chrome.webNavigation.WebNavigationTransitionCallbackDetails
 
-interface NavigationEvent {
-  addListener(listener: (details: Navigation) => void): void
-  removeListener(listener: (details: Navigation) => void): void
-}
+type NavigationEvent = EventSource<[details: Navigation]>
 
 /** The Promise-based MV3 subset this module needs. */
 export interface ChromeWebNavigationApi {
@@ -44,33 +43,10 @@ export class ChromeWebNavigation extends Context.Service<ChromeWebNavigation, Ch
   "effect-platform-chrome/ChromeWebNavigation"
 ) {}
 
-const invoke = <A>(operation: string, run: () => Promise<A>): Effect.Effect<A, ChromeWebNavigationError> =>
-  Effect.tryPromise({
-    try: run,
-    catch: (cause) => new ChromeWebNavigationError({ operation, cause })
-  })
+const invoke = invoker((operation, cause) => new ChromeWebNavigationError({ operation, cause }))
 
-const observe = (operation: string, getSource: () => NavigationEvent): Stream.Stream<Navigation, ChromeWebNavigationError> =>
-  Stream.callback<Navigation, ChromeWebNavigationError>((queue) => {
-    const listener = (details: Navigation) => { Queue.offerUnsafe(queue, details) }
-
-    return Effect.gen(function*() {
-      const source = yield* Effect.try({
-        try: getSource,
-        catch: (cause) => new ChromeWebNavigationError({ operation, cause })
-      })
-
-      // Install cleanup before registration, which may partially succeed then throw.
-      yield* Effect.acquireRelease(
-        Effect.succeed(listener),
-        () => Effect.sync(() => source.removeListener(listener))
-      )
-      yield* Effect.try({
-        try: () => source.addListener(listener),
-        catch: (cause) => new ChromeWebNavigationError({ operation, cause })
-      })
-    })
-  }, { bufferSize: 64, strategy: "sliding" })
+const navigations = (operation: string, getSource: () => NavigationEvent): Stream.Stream<Navigation, ChromeWebNavigationError> =>
+  observe(getSource, (details) => details, (cause) => new ChromeWebNavigationError({ operation, cause }))
 
 /** Creates the service without reading browser globals or registering listeners. */
 export const make = (api: ChromeWebNavigationApi): ChromeWebNavigationService => ChromeWebNavigation.of({
@@ -78,23 +54,15 @@ export const make = (api: ChromeWebNavigationApi): ChromeWebNavigationService =>
     Effect.map((frames) => frames ?? [])
   ),
   getFrame: (details) => invoke("getFrame", () => api.getFrame(details)).pipe(Effect.map(Option.fromNullishOr)),
-  onCommitted: observe("onCommitted", () => api.onCommitted),
-  onHistoryStateUpdated: observe("onHistoryStateUpdated", () => api.onHistoryStateUpdated)
+  onCommitted: navigations("onCommitted", () => api.onCommitted),
+  onHistoryStateUpdated: navigations("onHistoryStateUpdated", () => api.onHistoryStateUpdated)
 })
 
 export const layer = (api: ChromeWebNavigationApi): Layer.Layer<ChromeWebNavigation> =>
   Layer.succeed(ChromeWebNavigation, make(api))
 
 /** The global is read only when the layer is built, never at import time. */
-export const layerLive: Layer.Layer<ChromeWebNavigation, ChromeWebNavigationError> = Layer.effect(ChromeWebNavigation, Effect.try({
-  try: () => {
-    const api = typeof chrome === "undefined" ? undefined : chrome.webNavigation
-
-    if (api === undefined) {
-      throw new Error("chrome.webNavigation is unavailable in this context")
-    }
-
-    return make(api)
-  },
-  catch: (cause) => new ChromeWebNavigationError({ operation: "initialize", cause })
-}))
+export const layerLive: Layer.Layer<ChromeWebNavigation, ChromeWebNavigationError> = liveLayer(
+  ChromeWebNavigation, "webNavigation", (chrome) => chrome.webNavigation, make,
+  (cause) => new ChromeWebNavigationError({ operation: "initialize", cause })
+)

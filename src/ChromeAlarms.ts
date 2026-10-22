@@ -1,4 +1,6 @@
-import { Context, Effect, Layer, Queue, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Schema, Stream } from "effect"
+import { invoker, liveLayer } from "./internal/api.js"
+import { observe } from "./internal/event.js"
 
 export type Alarm = chrome.alarms.Alarm
 
@@ -52,11 +54,7 @@ export class ChromeAlarms extends Context.Service<ChromeAlarms, ChromeAlarmsServ
   "effect-platform-chrome/ChromeAlarms"
 ) {}
 
-const operation = <A>(name: string, run: () => Promise<A>): Effect.Effect<A, ChromeAlarmsError> =>
-  Effect.tryPromise({
-    try: run,
-    catch: (cause) => new ChromeAlarmsError({ operation: name, cause })
-  })
+const operation = invoker((name, cause) => new ChromeAlarmsError({ operation: name, cause }))
 
 /** Creates an injectable implementation without reading browser globals. */
 export const make = (api: ChromeAlarmsApi): ChromeAlarmsService => {
@@ -88,36 +86,15 @@ export const make = (api: ChromeAlarmsApi): ChromeAlarmsService => {
     getAll: operation("getAll", () => api.getAll()),
     clear: (name) => operation("clear", () => api.clear(name)),
     clearAll: operation("clearAll", () => api.clearAll()),
-    onAlarm: Stream.callback<Alarm, ChromeAlarmsError>((queue) => Effect.gen(function*() {
-      const listener = (alarm: Alarm): void => { Queue.offerUnsafe(queue, alarm) }
-
-      // Install cleanup before registration, which may partially succeed then throw.
-      yield* Effect.acquireRelease(
-        Effect.succeed(listener),
-        () => Effect.sync(() => api.onAlarm.removeListener(listener))
-      )
-      yield* Effect.try({
-        try: () => api.onAlarm.addListener(listener),
-        catch: (cause) => new ChromeAlarmsError({ operation: "onAlarm.addListener", cause })
-      })
-    }),
-    { bufferSize: 64, strategy: "sliding" })
+    onAlarm: observe(() => api.onAlarm, (alarm: Alarm) => alarm,
+      (cause) => new ChromeAlarmsError({ operation: "onAlarm.addListener", cause }))
   })
 }
 
 /** Resolves chrome.alarms only when the layer is built, never at import time. */
-export const layer: Layer.Layer<ChromeAlarms, ChromeAlarmsError> = Layer.effect(
-  ChromeAlarms,
-  Effect.try({
-    try: () => {
-      if (typeof chrome === "undefined" || chrome.alarms === undefined) {
-        throw new Error("chrome.alarms is unavailable")
-      }
-
-      return make(chrome.alarms)
-    },
-    catch: (cause) => new ChromeAlarmsError({ operation: "initialize", cause })
-  })
+export const layer: Layer.Layer<ChromeAlarms, ChromeAlarmsError> = liveLayer(
+  ChromeAlarms, "alarms", (chrome) => chrome.alarms, make,
+  (cause) => new ChromeAlarmsError({ operation: "initialize", cause })
 )
 
 /** The same live layer as `layer`, under the name the other modules use. */

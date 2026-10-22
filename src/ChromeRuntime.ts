@@ -1,4 +1,7 @@
-import { Context, Effect, Layer, Queue, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Schema, Stream } from "effect"
+import { decodeResponse, type ChromeMessageError } from "./ChromeMessage.js"
+import { attempter } from "./internal/api.js"
+import { observe } from "./internal/event.js"
 
 export class ChromeRuntimeError extends Schema.TaggedError<ChromeRuntimeError>()(
   "ChromeRuntimeError",
@@ -39,6 +42,21 @@ export interface ChromeRuntime {
     options?: SendMessageOptions
   ) => Effect.Effect<Response["Type"], ChromeRuntimeError, Request["EncodingServices"] | Response["DecodingServices"]>
   /**
+   * Like `sendMessageSchema`, for a receiver that answers with the ChromeMessage envelope,
+   * as `ChromeServiceWorker.start` does: the reply is unwrapped and its value decoded with
+   * `value`. A failure envelope fails with `ChromeMessageError`.
+   */
+  readonly request: <Request extends Schema.Constraint, Value extends Schema.Constraint>(
+    request: Request,
+    value: Value,
+    message: Request["Type"],
+    options?: SendMessageOptions
+  ) => Effect.Effect<
+    Value["Type"],
+    ChromeRuntimeError | ChromeMessageError,
+    Request["EncodingServices"] | Value["DecodingServices"]
+  >
+  /**
    * Observational subscriptions: listeners exist only while the stream runs.
    * These cannot reliably wake an MV3 service worker. Register wake listeners
    * synchronously through ChromeServiceWorker instead. Each subscriber has a
@@ -50,8 +68,7 @@ export interface ChromeRuntime {
 
 export const ChromeRuntime = Context.Service<ChromeRuntime>("effect-platform-chrome/ChromeRuntime")
 
-const attempt = <A>(operation: string, body: () => A): Effect.Effect<A, ChromeRuntimeError> =>
-  Effect.try({ try: body, catch: (cause) => new ChromeRuntimeError({ operation, cause }) })
+const attempt = attempter((operation, cause) => new ChromeRuntimeError({ operation, cause }))
 
 /** Creates a service without accessing browser globals or registering listeners. */
 export const make = (runtime: RuntimeApi): ChromeRuntime => {
@@ -75,24 +92,17 @@ export const make = (runtime: RuntimeApi): ChromeRuntime => {
     )
   })
 
-  const onInstalled = Stream.callback<chrome.runtime.InstalledDetails, ChromeRuntimeError>((queue) =>
-    Effect.gen(function*() {
-      const listener = (details: chrome.runtime.InstalledDetails) => { Queue.offerUnsafe(queue, details) }
+  const request: ChromeRuntime["request"] = (requestSchema, value, message, options) =>
+    sendMessageSchema(requestSchema, Schema.Unknown, message, options).pipe(
+      Effect.flatMap(decodeResponse(value)),
+      Effect.catchTag("SchemaError", (cause) => Effect.fail(new ChromeRuntimeError({ operation: "sendMessage.decodeResponse", cause })))
+    )
 
-      // Register cleanup first, including for APIs that throw after partially adding.
-      yield* Effect.addFinalizer(() => attempt("onInstalled.removeListener", () =>
-        runtime.onInstalled.removeListener(listener)).pipe(Effect.orDie))
-      yield* attempt("onInstalled.addListener", () => runtime.onInstalled.addListener(listener))
-    }), { bufferSize: 64, strategy: "sliding" })
+  const onInstalled = observe(() => runtime.onInstalled, (details: chrome.runtime.InstalledDetails) => details,
+    (cause) => new ChromeRuntimeError({ operation: "onInstalled.addListener", cause }))
 
-  const onStartup = Stream.callback<void, ChromeRuntimeError>((queue) =>
-    Effect.gen(function*() {
-      const listener = () => { Queue.offerUnsafe(queue, undefined) }
-
-      yield* Effect.addFinalizer(() => attempt("onStartup.removeListener", () =>
-        runtime.onStartup.removeListener(listener)).pipe(Effect.orDie))
-      yield* attempt("onStartup.addListener", () => runtime.onStartup.addListener(listener))
-    }), { bufferSize: 64, strategy: "sliding" })
+  const onStartup = observe(() => runtime.onStartup, () => undefined,
+    (cause) => new ChromeRuntimeError({ operation: "onStartup.addListener", cause }))
 
   return ChromeRuntime.of({
     id: attempt("id", () => runtime.id),
@@ -100,6 +110,7 @@ export const make = (runtime: RuntimeApi): ChromeRuntime => {
     getURL: (path) => attempt("getURL", () => runtime.getURL(path)),
     sendMessage,
     sendMessageSchema,
+    request,
     onInstalled,
     onStartup
   })

@@ -1,4 +1,6 @@
-import { Context, Effect, Layer, Queue, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { liveLayer } from "./internal/api.js"
+import { observeSome } from "./internal/event.js"
 
 export type AreaName = chrome.storage.AreaName
 
@@ -88,27 +90,14 @@ export const make = (api: StorageApi): Service => {
       catch: (cause) => new ChromeStorageError({ area, operation, cause })
     })
 
-  const changes = (area?: AreaName): Stream.Stream<Change, ChromeStorageError> =>
-    Stream.callback<Change, ChromeStorageError>((queue) => {
-      const listener = (changes: Record<string, chrome.storage.StorageChange>, changedArea: AreaName) => {
-        if (area === undefined || changedArea === area) {
-          Queue.offerUnsafe(queue, { area: changedArea, changes })
-        }
-      }
-
-      return Effect.acquireRelease(
-        Effect.try({
-          try: () => {
-            const event = api.onChanged
-            event.addListener(listener)
-
-            return event
-          },
-          catch: (cause) => new ChromeStorageError({ area: area ?? "all", operation: "onChanged.addListener", cause })
-        }),
-        (event) => Effect.sync(() => event.removeListener(listener))
-      )
-    }, { bufferSize: changeBufferSize, strategy: "sliding" })
+  const changes = (area?: AreaName): Stream.Stream<Change, ChromeStorageError> => observeSome(
+    () => api.onChanged,
+    (changes: Record<string, chrome.storage.StorageChange>, changedArea: AreaName) => area === undefined || changedArea === area
+      ? Option.some({ area: changedArea, changes })
+      : Option.none(),
+    (cause) => new ChromeStorageError({ area: area ?? "all", operation: "onChanged.addListener", cause }),
+    changeBufferSize
+  )
 
   const readOnly = (area: AreaName): ReadOnlyArea => ({
     area,
@@ -141,16 +130,10 @@ export const make = (api: StorageApi): Service => {
 }
 
 /** Resolves the global only when the layer is built, never during import. */
-export const layerLive = Layer.effect(ChromeStorage, Effect.try({
-  try: () => {
-    if (typeof chrome === "undefined" || chrome.storage === undefined) {
-      throw new Error("Chrome storage API is unavailable")
-    }
-
-    return make(chrome.storage)
-  },
-  catch: (cause) => new ChromeStorageError({ area: "all", operation: "initialize", cause })
-}))
+export const layerLive: Layer.Layer<ChromeStorage, ChromeStorageError> = liveLayer(
+  ChromeStorage, "storage", (chrome) => chrome.storage, make,
+  (cause) => new ChromeStorageError({ area: "all", operation: "initialize", cause })
+)
 
 /** The same live layer as `layerLive`, under this module's original name. */
 export const layer = layerLive

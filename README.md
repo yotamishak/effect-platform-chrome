@@ -3,7 +3,7 @@
 Standalone TypeScript ESM library for **Effect v4** and **Chrome
 Manifest V3**, modeled after `@effect/platform-browser`.
 
-**Status:** initial implementation with seventeen public modules and mocked behavior
+**Status:** initial implementation with eighteen public modules and mocked behavior
 tests. The library focuses on platform services rather than UI APIs.
 
 This is an independent community project, not an official Effect package.
@@ -139,11 +139,12 @@ CLI is not a library runtime dependency; use it only with trusted documentation.
 | --- | --- |
 | `ChromeStorage` | Typed access to Chrome storage areas and change events. |
 | `ChromeKeyValueStore` | Adapter for `effect/persistence/KeyValueStore`. |
-| `ChromeRuntime` | Runtime messaging, lifecycle events, and extension metadata. |
+| `ChromeRuntime` | Runtime messaging, lifecycle events, and extension metadata; `request` unwraps the worker's reply envelope. |
+| `ChromeMessage` | The `{ ok, value \| error }` reply envelope shared by `ChromeServiceWorker` and senders: its schema, `succeed`/`fail`, and `decodeResponse`. |
 | `ChromePort` | Scoped long-lived messaging ports and streams. |
 | `ChromeTabs` | Tab operations and event streams. |
 | `ChromeAlarms` | Alarm scheduling and event handling. |
-| `ChromeServiceWorker` | Manifest V3 service-worker lifecycle integration. |
+| `ChromeServiceWorker` | Manifest V3 service-worker lifecycle integration, with wake listeners for any event (optionally filtered) via `listen`. |
 | [`ChromeRpc`](docs/ChromeRpc.md) | Effect RPC client/server protocols over Chrome ports. |
 | [`ChromeSchemaStorage`](docs/ChromeSchemaStorage.md) | Schema validation, defaults, version migrations, and latest-state observation. |
 | [`ChromePermissions`](docs/ChromePermissions.md) | Permission checks, requests, revocation, and change events. |
@@ -153,13 +154,17 @@ CLI is not a library runtime dependency; use it only with trusted documentation.
 | `ChromeCookies` | Reading, setting and removing cookies, including removing a cookie read from `getAll`. |
 | `ChromeNotifications` | Creating and clearing notifications, and their click/close events. |
 | `ChromeWindows` | Reading and updating windows, including bringing one to the front. |
-| [`ChromeTesting`](docs/ChromeTesting.md) | Isolated storage and tab fixtures, event simulators, and paired ports. |
+| [`ChromeTesting`](docs/ChromeTesting.md) | Isolated storage and tab fixtures, event simulators, and paired ports; one module per adapter under `testing/`. |
 
 Modules use Effect v4 services, tagged errors, layers, and scoped streams.
 Manifest V3 wakeup listeners must
 be registered **synchronously at service-worker module evaluation**, before any
-asynchronous initialization. Use `ChromeServiceWorker.start` for this purpose;
-ordinary event streams subscribe when consumed and are observational. Worker
+asynchronous initialization. Use `ChromeServiceWorker.start` for this purpose:
+it has named options for runtime messages, ports, install, startup and alarms, and
+takes every other wake event (`action.onClicked`, `contextMenus.onClicked`,
+`commands.onCommand`, a webNavigation event with its URL filter, …) as
+`listeners: [ChromeServiceWorker.listen(event, handler, filter?)]`.
+Ordinary event streams subscribe when consumed and are observational. Worker
 initialization gates handlers, with bounded startup buffering. Chrome can terminate
 a worker without running finalizers; in-memory queues and fibers are not durable.
 

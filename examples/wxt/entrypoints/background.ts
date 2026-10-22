@@ -70,11 +70,14 @@ export default defineBackground(() => {
           handledAt: new Date().toISOString(), bootId }
       })
     }),
+    // Any other wake listener goes through the same init gate, registered with the
+    // named ones. A webNavigation event would take its URL filter as a third argument.
+    listeners: [
+      ChromeServiceWorker.listen(chrome.tabs.onActivated, (info) => recordLifecycle({ type: "tab-activated", ...info }))
+    ],
     onError: (error) => console.error("Demo worker:", error)
   })
 
-  // Additional synchronous registration goes through the same init gate.
-  worker.register(chrome.tabs.onActivated, (info) => recordLifecycle({ type: "tab-activated", ...info }))
   void worker.ready.then((exit) => console.info("Demo worker initialization", bootId, exit))
   // Chrome termination is not a graceful shutdown event. Only explicitly dispose
   // when a host really tears down a runtime; never dispose after each message.

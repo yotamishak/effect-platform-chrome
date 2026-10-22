@@ -69,8 +69,8 @@ Ordinary lazy calls similarly cannot cancel native permission operations.
 ## MV3 worker wakeups
 
 Scoped streams are runtime observations, **not worker wakeup registration**.
-Install wakeup listeners synchronously at worker startup via
-`ChromeServiceWorker.register`, before awaiting `worker.ready`:
+Install wakeup listeners synchronously at worker startup through
+`ChromeServiceWorker.start`'s `listeners`, before awaiting `worker.ready`:
 
 ```ts
 import { Effect } from "effect"
@@ -80,12 +80,11 @@ import * as ChromeServiceWorker from "effect-platform-chrome/ChromeServiceWorker
 const worker = ChromeServiceWorker.start({
   chrome,
   layer: ChromePermissions.layerLive,
-  selectMessage: () => false,
-  onMessage: () => Effect.void
+  listeners: [
+    ChromeServiceWorker.listen(chrome.permissions.onAdded, (added) => Effect.log("Permissions added", added)),
+    ChromeServiceWorker.listen(chrome.permissions.onRemoved, (removed) => Effect.log("Permissions revoked", removed))
+  ]
 })
-
-worker.register(chrome.permissions.onAdded, (added) => Effect.log("Permissions added", added))
-worker.register(chrome.permissions.onRemoved, (removed) => Effect.log("Permissions revoked", removed))
 ```
 
 Worker startup buffering follows `ChromeServiceWorker`'s bounded startup queue,

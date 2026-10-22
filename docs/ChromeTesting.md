@@ -1,6 +1,10 @@
 # ChromeTesting
 
-Import `effect-platform-chrome/ChromeTesting`. These injected fixtures have no
+Import `effect-platform-chrome/ChromeTesting` for every fixture, or one adapter's
+module: `effect-platform-chrome/testing/Event` (`makeEvent`), `testing/Storage`
+(`makeStorage`), `testing/Port` (`makePortPair`) or `testing/Tabs` (`makeTabs`).
+A fixture for a new adapter goes in its own `testing/` module and is re-exported
+from `ChromeTesting`. These injected fixtures have no
 Vitest runtime dependency and never access Chrome globals. They cover the
 `ChromeStorage`, `ChromeTabs` and `ChromePort` adapters, not every Chrome service;
 the other services take a plain object through `make(api)` or `layer(api)`.

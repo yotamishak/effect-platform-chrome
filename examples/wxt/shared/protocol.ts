@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import * as ChromeMessage from "effect-platform-chrome/ChromeMessage"
 
 export const channel = "effect-wxt-demo"
 export const alarmName = "effect-wxt-demo/wakeup"
@@ -13,15 +14,7 @@ export const Request = Schema.Struct({
   text: Schema.String
 })
 
-// ChromeServiceWorker.start wraps successful handler values itself. Do not
-// wrap a handler's return value again, or expect a bare value on the client.
-export const Response = Schema.Union([
-  Schema.Struct({ ok: Schema.Literal(true), value: Schema.Unknown }),
-  Schema.Struct({
-    ok: Schema.Literal(false),
-    error: Schema.Struct({
-      code: Schema.Literals(["InitializationFailed", "HandlerFailed", "Overflow", "Disposed"]),
-      message: Schema.String
-    })
-  })
-])
+// ChromeServiceWorker.start wraps every handler value in the ChromeMessage envelope.
+// The popup decodes the whole envelope to display failures as ordinary replies;
+// ChromeRuntime.request unwraps it instead, failing with ChromeMessageError.
+export const Response = ChromeMessage.Response(Schema.Unknown)

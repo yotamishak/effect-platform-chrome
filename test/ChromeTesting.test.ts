@@ -2,7 +2,12 @@
 /* oxlint-disable effecttsgo/unstable-api-usage */
 import { Effect, Exit, Fiber, Schema, Stream } from "effect"
 import { describe, expect, it } from "@effect/vitest"
+import * as ChromeTesting from "../src/ChromeTesting.js"
 import { makeEvent, makePortPair, makeStorage, makeTabs } from "../src/ChromeTesting.js"
+import * as TestEvent from "../src/testing/Event.js"
+import * as TestPort from "../src/testing/Port.js"
+import * as TestStorage from "../src/testing/Storage.js"
+import * as TestTabs from "../src/testing/Tabs.js"
 import * as ChromeTabs from "../src/ChromeTabs.js"
 import * as ChromeStorage from "../src/ChromeStorage.js"
 import * as ChromePort from "../src/ChromePort.js"
@@ -12,6 +17,13 @@ interface CyclicMessage {
 }
 
 describe("ChromeTesting events", () => {
+  it("re-exports each per-adapter fixture module unchanged", () => {
+    expect(ChromeTesting.makeEvent).toBe(TestEvent.makeEvent)
+    expect(ChromeTesting.makeStorage).toBe(TestStorage.makeStorage)
+    expect(ChromeTesting.makePortPair).toBe(TestPort.makePortPair)
+    expect(ChromeTesting.makeTabs).toBe(TestTabs.makeTabs)
+  })
+
   it.effect("keeps 4096-listener snapshots intact across reentrant removal and thrown callbacks", () => Effect.sync(() => {
     const event = makeEvent<[number]>()
     const seen: Array<[number, number]> = []

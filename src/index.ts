@@ -8,6 +8,8 @@ export * as ChromeKeyValueStore from "./ChromeKeyValueStore.js"
 
 export * as ChromeRuntime from "./ChromeRuntime.js"
 
+export * as ChromeMessage from "./ChromeMessage.js"
+
 export * as ChromePort from "./ChromePort.js"
 
 export * as ChromeTabs from "./ChromeTabs.js"
