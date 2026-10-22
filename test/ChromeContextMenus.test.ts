@@ -268,6 +268,37 @@ describe("ChromeContextMenus", () => {
       expect(() => held.confirm()).not.toThrow()
       expect(held.remove).not.toHaveBeenCalled()
     }))
+
+    it.effect("still reads lastError in a callback that arrives after interruption, so Chrome logs no unchecked error", () =>
+      Effect.gen(function*() {
+        const callbacks: Array<() => void> = []
+        const called = gate()
+        let lastError: chrome.runtime.LastError | undefined
+        let reads = 0
+
+        const api: ChromeContextMenusApi = {
+          ...mockApi().api,
+          create: (_properties, callback) => {
+            callbacks.push(callback)
+            called.open()
+
+            return "a"
+          },
+          get lastError() {
+            reads++
+
+            return lastError
+          }
+        }
+
+        const fiber = yield* Effect.forkChild(make(api).create({ id: "a", title: "A" }))
+        yield* called.opened
+        yield* Fiber.interrupt(fiber)
+        lastError = { message: "Cannot create item with duplicate id a" }
+        callbacks[0]?.()
+        lastError = undefined
+        expect(reads).toBe(1)
+      }))
   })
 
   describe("update, remove and removeAll", () => {
@@ -497,6 +528,19 @@ describe("ChromeContextMenus", () => {
       const error = yield* Effect.flip(Stream.runDrain(make(fake.api).onClicked))
       expect(error).toBeInstanceOf(ChromeContextMenusError)
       expect(error).toMatchObject({ operation: "onClicked", cause })
+      expect(fake.controls.onClicked.listenerCount).toBe(0)
+    }))
+
+    it.effect("subscribes afresh when the same stream runs again after a failed registration", () => Effect.gen(function*() {
+      const fake = makeContextMenus()
+      const menus = make(fake.api)
+      yield* menus.create({ id: "a", title: "A" })
+      fake.controls.onClicked.failNext("addListener", new Error("listener rejected"))
+      expect(yield* Effect.flip(Stream.runDrain(menus.onClicked))).toMatchObject({ operation: "onClicked" })
+      const click = yield* Effect.forkChild(Stream.runHead(menus.onClicked))
+      yield* Effect.promise(() => fake.controls.onClicked.waitForListener())
+      fake.controls.click("a")
+      expect(yield* Fiber.join(click)).toEqual(Option.some({ info: { menuItemId: "a", editable: false }, tab: Option.none() }))
       expect(fake.controls.onClicked.listenerCount).toBe(0)
     }))
 
@@ -876,6 +920,92 @@ describe("makeContextMenus", () => {
     expect(fake.controls.children()).toEqual([])
     expect(yield* menus.create({ title: "After" })).toBe(2)
   }))
+
+  it.effect("accepts the URL patterns Chrome's URLPattern parser accepts", () => Effect.gen(function*() {
+    const fake = makeContextMenus()
+    const menus = run(fake)
+
+    const patterns = [
+      "<all_urls>", "*://*/*", "https://*.example.com/docs/*", "http://127.0.0.1:8080/*", "https://example.com:*/*",
+      "http://[::1]:3000/*", "file:///*", "file://*", "chrome-extension://abc/*", "data:text/*", "urn:*", "ftp://host/"
+    ]
+
+    for (const [index, pattern] of patterns.entries()) {
+      expect(yield* menus.create({ id: `ok-${index}`, title: pattern, documentUrlPatterns: [pattern], targetUrlPatterns: [pattern] })).toBe(`ok-${index}`)
+    }
+  }))
+
+  it.effect.each([
+    "example.com/*", "https://example.com", "https:///*", "https://*./*", "https://exa*mple.com/*", "https://www.*.com/*",
+    "https://example.com:port/*", "http://[::1/*", "https:example.com/*", "data:", "https://:80/*", "chrome://settings:80/*"
+  ])("reports the invalid URL pattern %s through lastError, after the title and before the parent", (pattern) => Effect.gen(function*() {
+    const fake = makeContextMenus()
+    const menus = run(fake)
+    const message = `Invalid url pattern '${pattern}'`
+
+    for (const field of ["documentUrlPatterns", "targetUrlPatterns"] as const) {
+      expect(yield* Effect.flip(menus.create({ id: "a", title: "A", parentId: "missing", [field]: ["https://fine.example/*", pattern] }))).toMatchObject({
+        operation: "create", cause: { message }
+      })
+      expect(yield* Effect.flip(menus.create({ id: "a", title: "", [field]: [pattern] }))).toMatchObject({
+        cause: { message: "All menu items except for separators must have a title" }
+      })
+    }
+
+    expect(fake.controls.items()).toEqual([])
+  }))
+
+  it.effect("fails an update with an invalid URL pattern after moving the item, keeping the valid patterns before it", () => Effect.gen(function*() {
+    const fake = makeContextMenus()
+    const menus = run(fake)
+    yield* menus.create({ id: "parent", title: "Parent" })
+    yield* menus.create({ id: "a", title: "A", documentUrlPatterns: ["https://old.example/*"], targetUrlPatterns: ["https://old.example/*"] })
+    expect(yield* Effect.flip(menus.update("a", {
+      title: "A2", parentId: "parent", documentUrlPatterns: ["https://new.example/*"], targetUrlPatterns: ["https://ok.example/*", "bad"]
+    }))).toMatchObject({ operation: "update", cause: new Error("Invalid url pattern 'bad'") })
+    expect(fake.controls.item("a")).toEqual({
+      id: "a", parentId: "parent",
+      properties: { title: "A2", documentUrlPatterns: ["https://new.example/*"], targetUrlPatterns: ["https://ok.example/*"] }
+    })
+    expect(yield* Effect.flip(menus.update("a", { documentUrlPatterns: ["https://x.example"], targetUrlPatterns: ["<all_urls>"] }))).toMatchObject({
+      cause: new Error("Invalid url pattern 'https://x.example'")
+    })
+    expect(fake.controls.item("a")?.properties).toEqual({ title: "A2", documentUrlPatterns: [], targetUrlPatterns: ["https://ok.example/*"] })
+  }))
+
+  it.effect("refuses to click what Chrome never offers as a command: separators and disabled or hidden items or ancestors", () =>
+    Effect.gen(function*() {
+      const fake = makeContextMenus()
+      const menus = run(fake)
+      yield* menus.create({ id: "line", type: "separator" })
+      yield* menus.create({ id: "parent", title: "Parent" })
+      yield* menus.create({ id: "child", parentId: "parent", title: "Child", visible: false })
+      yield* menus.create({ id: "off", title: "Off", enabled: false })
+      yield* menus.create({ id: "closed", title: "Closed", enabled: false })
+      yield* menus.create({ id: "inside", parentId: "closed", title: "Inside" })
+      yield* menus.create({ id: "veiled", title: "Veiled", visible: false })
+      yield* menus.create({ id: "middle", parentId: "veiled", title: "Middle" })
+      yield* menus.create({ id: "deep", parentId: "middle", type: "checkbox", title: "Deep" })
+      const events = fake.controls.onClicked
+      const clicks = yield* Effect.forkChild(Stream.runCollect(Stream.take(Stream.map(menus.onClicked, (click) => click.info), 3)))
+      yield* Effect.promise(() => events.waitForListener())
+
+      for (const id of ["line", "child", "off", "inside", "deep"]) {
+        expect(() => fake.controls.click(id)).toThrow(`Chrome cannot click menu item ${id}`)
+      }
+
+      expect(fake.controls.item("deep")?.properties.checked).toBeUndefined()
+      yield* menus.update("off", { enabled: true })
+      yield* menus.update("veiled", { visible: true })
+      fake.controls.click("parent")
+      fake.controls.click("off")
+      fake.controls.click("deep")
+      expect(yield* Fiber.join(clicks)).toEqual([
+        { menuItemId: "parent", editable: false },
+        { menuItemId: "off", editable: false },
+        { menuItemId: "deep", parentMenuItemId: "middle", editable: false, wasChecked: false, checked: true }
+      ])
+    }))
 
   it.effect("lets overrides replace any member", () => Effect.gen(function*() {
     const removeAll = vi.fn(async () => {})

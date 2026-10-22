@@ -62,7 +62,8 @@ export interface ChromeContextMenusService {
    * Adds a menu item and resolves to its id once Chrome confirms it: the `id` given, or a
    * number Chrome generated. Fails with what Chrome reports, synchronously or through
    * `lastError`: a duplicate id, an unknown or non-`"normal"` parent, a missing title on a
-   * non-separator, a `"launcher"` context, an extension that already has 1000 top-level items
+   * non-separator, a `"launcher"` context, an invalid URL pattern (`Invalid url pattern '…'`, such
+   * as `"https://example.com"` without a path), an extension that already has 1000 top-level items
    * (which blocks child items too), and, in an extension with a service worker or event page,
    * a missing `id` or any `onclick` (listen to `onClicked` instead). Interrupting the wait does
    * not undo a creation Chrome has already started.
@@ -71,8 +72,9 @@ export interface ChromeContextMenusService {
   /**
    * Changes the given fields of an item; fails for an unknown id, an empty title on a
    * non-separator, `checked: true` on an item that is not a checkbox or radio, a `"launcher"`
-   * context, or an unknown or non-`"normal"` parent. Chrome applies fields one at a time, so a
-   * failure can leave earlier fields changed, and it ignores, without failing, a `parentId`
+   * context, an unknown or non-`"normal"` parent, or an invalid URL pattern. Chrome applies fields
+   * one at a time, so a failure can leave earlier fields changed (an invalid pattern leaves the
+   * patterns before it), and it ignores, without failing, a `parentId`
    * that is the item itself or one of its descendants. A moved item becomes its new parent's
    * last child; `parentId` cannot move an item back to the top level.
    */

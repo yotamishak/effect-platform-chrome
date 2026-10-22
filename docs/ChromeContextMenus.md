@@ -3,8 +3,9 @@
 Import from `effect-platform-chrome/ChromeContextMenus`. `ChromeContextMenus` is an
 Effect v4 service over `chrome.contextMenus`; `make(api)` and `layer(api)` accept an
 injected API, and `layerLive` reads `chrome.contextMenus` and `chrome.runtime` only when
-built. The manifest needs the `"contextMenus"` permission; `update`, `remove` and
-`removeAll` use the Promise forms Chrome 123 added.
+built. The manifest needs the `"contextMenus"` permission. `layerLive` calls `update`,
+`remove` and `removeAll` through Chrome's callback forms, which every MV3 Chrome has (the
+Promise forms need Chrome 123), and fails with the `lastError` their callbacks see.
 
 - `create(properties)` resolves to the item's id: the `id` you gave, or a number Chrome
   generated. Chrome keeps string and numeric ids apart, so `"1"` and `1` are different items.
@@ -43,6 +44,7 @@ What Chrome reports through `lastError`, in the order it checks:
 | `onclick`, in an extension with a service worker or event page | `Extensions using event pages or Service Workers cannot pass an onclick parameter …` |
 | A `"launcher"` context (packaged apps only) | `Only packaged apps are allowed to use 'launcher' context` |
 | No title on an item that is not a separator | `All menu items except for separators must have a title` |
+| A `documentUrlPatterns` or `targetUrlPatterns` entry Chrome cannot parse, such as `https://example.com` (no path) or `example.com/*` (no scheme) | `Invalid url pattern '<pattern>'` |
 | An unknown `parentId` | `Cannot find menu item with id <parentId>` |
 | A parent that is not a `"normal"` item | `Parent items must have type "normal"` |
 
@@ -58,8 +60,9 @@ When Chrome confirms, the waiting fiber resumes inside Chrome's callback.
 `update` applies the given fields in Chrome's order (type, title, checked, visible, enabled,
 contexts, parent, URL patterns) and stops at the first problem, so a failed update can leave
 earlier fields changed. It fails for an empty title on a non-separator, `checked: true` on an
-item that is neither a checkbox nor a radio, a `"launcher"` context, or an unknown or
-non-`"normal"` parent. Chrome refuses a `parentId` that is the item itself or one of its
+item that is neither a checkbox nor a radio, a `"launcher"` context, an unknown or
+non-`"normal"` parent, or an invalid URL pattern; Chrome keeps the patterns listed before the
+invalid one. Chrome refuses a `parentId` that is the item itself or one of its
 descendants without reporting an error: the update resolves and the item stays where it
 was. A moved item becomes the last child of its new parent, and `parentId` cannot move an
 item back to the top level.
@@ -125,6 +128,7 @@ an in-memory menu tree that follows Chrome's rules above:
 - `create` returns the id at once (generated ids are increasing numbers) and runs the
   callback in a microtask with `lastError` set for every condition in the table;
   `options.serviceWorker: true` adds the service-worker rules (`id` required, no `onclick`).
+  URL patterns are parsed like Chrome's `URLPattern` (host canonicalization is approximated).
   Malformed `contexts` or `type` values throw synchronously, for `create` and `update`.
 - `update` applies fields in Chrome's order, keeps fields applied before a failure, and
   resolves without moving an item for a parent cycle; `remove` drops descendants.
@@ -134,6 +138,8 @@ an in-memory menu tree that follows Chrome's rules above:
 - `controls.click(id, info?, tab?)` emits `onClicked` for an existing item, filling
   `menuItemId`, `parentMenuItemId`, `editable: false`, `pageUrl` from the tab, and for
   checkbox and radio items `wasChecked` and `checked`, updating their state. `info`
-  overrides any field. It returns the exceptions listeners threw. Stored `onclick`
-  handlers are not called.
+  overrides any field. It returns the exceptions listeners threw. It throws for a click
+  Chrome's menu cannot produce: a separator, or an item that is, or sits under, a disabled or
+  hidden item; `controls.onClicked.emit` sends any raw event. Stored `onclick` handlers are
+  not called.
 - `overrides` replaces any API member.

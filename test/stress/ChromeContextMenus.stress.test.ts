@@ -690,6 +690,22 @@ describe("ChromeContextMenus stress", () => {
       expect(checked).toEqual([previous])
     }))
 
+    it.effect("refuses clicks under a disabled or hidden ancestor 2048 levels up, and allows them once it is restored", () => Effect.gen(function*() {
+      const fake = makeContextMenus()
+      const menus = make(fake.api)
+      yield* menus.create({ id: "level-0", title: "Level 0" })
+
+      for (const depth of range(2047)) yield* menus.create({ id: `level-${depth + 1}`, parentId: `level-${depth}`, title: "Level" })
+
+      for (const blocked of [{ enabled: false }, { visible: false }]) {
+        yield* menus.update("level-0", blocked)
+        expect(() => fake.controls.click("level-2047")).toThrow("Chrome cannot click menu item level-2047")
+      }
+
+      yield* menus.update("level-0", { enabled: true, visible: true })
+      expect(fake.controls.click("level-2047")).toEqual([])
+    }))
+
     it.effect("removes a 2048-deep chain and re-parents within it without recursion limits", () => Effect.gen(function*() {
       const fake = makeContextMenus()
       const menus = make(fake.api)

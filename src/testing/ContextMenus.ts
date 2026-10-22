@@ -44,7 +44,10 @@ const messages = {
   parentsMustBeNormal: "Parent items must have type \"normal\"",
   checked: "Only items with type \"radio\" or \"checkbox\" can be checked",
   cannotFind: (id: MenuItemId) => `Cannot find menu item with id ${id}`,
-  duplicateId: (id: MenuItemId) => `Cannot create item with duplicate id ${id}`
+  duplicateId: (id: MenuItemId) => `Cannot create item with duplicate id ${id}`,
+  invalidUrlPattern: (pattern: string) => `Invalid url pattern '${pattern}'`,
+  cannotClick: (id: MenuItemId) =>
+    `Chrome cannot click menu item ${id}: it is a separator, or it or an ancestor is disabled or hidden`
 }
 
 /** Chrome rejects malformed arguments synchronously, before any callback or Promise. */
@@ -67,6 +70,108 @@ const validateArguments = (method: "create" | "update", properties: UpdateProper
   }
 }
 
+/** Schemes `url::IsStandard` reports in Chrome (`*` counts as one); they need `://` and a host. */
+const standardSchemes: ReadonlySet<string> = new Set([
+  "*", "http", "https", "ws", "wss", "ftp", "file", "chrome", "chrome-extension", "chrome-untrusted", "chrome-search",
+  "devtools", "isolated-app"
+])
+
+/** Schemes with a default port; only these accept a numeric port. */
+const schemesWithPorts: ReadonlySet<string> = new Set(["http", "https", "ws", "wss", "ftp"])
+
+/** The forbidden host code points of the URL standard, which Chrome's host canonicalizer refuses. */
+const forbiddenHostCharacter = /[\0-\x20#/:<>?@[\\\]^|\x7f]/
+
+const isValidPort = (scheme: string, port: string) => {
+  if (port === "*") return true
+
+  return schemesWithPorts.has(scheme) && /^\d+$/.test(port) && Number(port) < 65536
+}
+
+/**
+ * Chrome's `URLPattern::Parse` with every scheme allowed, as `MenuItem::PopulateURLPatterns`
+ * uses it. Host canonicalization is approximated by refusing forbidden host code points.
+ */
+const isValidUrlPattern = (pattern: string): boolean => {
+  if (pattern === "<all_urls>") return true
+
+  const standardSeparator = pattern.indexOf("://")
+  const separator = standardSeparator === -1 ? pattern.indexOf(":") : standardSeparator
+
+  if (separator === -1) return false
+
+  const scheme = pattern.slice(0, separator)
+  const standard = standardSchemes.has(scheme)
+
+  if (standard !== (standardSeparator !== -1)) return false
+
+  const hostStart = separator + (standard ? 3 : 1)
+
+  if (hostStart >= pattern.length) return false
+
+  if (!standard || scheme === "file") return true
+
+  const hostEnd = pattern.indexOf("/", hostStart)
+
+  if (hostEnd === hostStart || hostEnd === -1) return false
+
+  const hostAndPort = pattern.slice(hostStart, hostEnd)
+  let host = hostAndPort
+  let port: string | undefined
+
+  if (hostAndPort.startsWith("[")) {
+    const close = hostAndPort.indexOf("]")
+
+    if (close === -1) return false
+
+    if (close === 1) return false
+
+    host = hostAndPort.slice(0, close + 1)
+
+    if (close < hostAndPort.length - 1) {
+      if (hostAndPort[close + 1] !== ":") return false
+
+      port = hostAndPort.slice(close + 2)
+    }
+
+    if (!/^\[[0-9a-fA-F:.]+\]$/.test(host)) return false
+  } else {
+    const colon = hostAndPort.indexOf(":")
+
+    if (colon !== -1) {
+      host = hostAndPort.slice(0, colon)
+      port = hostAndPort.slice(colon + 1)
+    }
+  }
+
+  if (port !== undefined && !isValidPort(scheme, port)) return false
+
+  if (host === "" || host === "*.") return false
+
+  const named = host === "*" ? "" : host.startsWith("*.") ? host.slice(2) : host
+
+  if (named.includes("*")) return false
+
+  return named.startsWith("[") || !forbiddenHostCharacter.test(named)
+}
+
+/**
+ * `URLPatternSet::Populate`: clears the set, then adds patterns until one fails to parse. Returns
+ * the patterns kept and the error for the first invalid one.
+ */
+interface PopulatedPatterns {
+  readonly kept: Array<string>
+  readonly error: string | undefined
+}
+
+const populatePatterns = (patterns: ReadonlyArray<string>): PopulatedPatterns => {
+  const invalid = patterns.findIndex((pattern) => !isValidUrlPattern(pattern))
+
+  if (invalid === -1) return { kept: [...patterns], error: undefined }
+
+  return { kept: patterns.slice(0, invalid), error: messages.invalidUrlPattern(patterns[invalid] ?? "") }
+}
+
 const typeOf = (item: MenuItem): ChromeContextMenus.ItemType => item.properties.type ?? "normal"
 
 const isCheckable = (item: MenuItem) => typeOf(item) === "checkbox" || typeOf(item) === "radio"
@@ -77,19 +182,26 @@ const isCheckable = (item: MenuItem) => typeOf(item) === "checkbox" || typeOf(it
  * - `create` returns the id at once (the given `id`, or the next of increasing generated
  *   numbers) and runs its callback in a microtask, with `lastError` set for what Chrome
  *   reports there: a duplicate id, an unknown or non-`"normal"` parent, a missing title on a
- *   non-separator, a `"launcher"` context, 1000 existing top-level items, and, with
+ *   non-separator, a `"launcher"` context, an invalid URL pattern, 1000 existing top-level
+ *   items, and, with
  *   `options.serviceWorker`, a missing `id` or an `onclick`. An empty or unknown `contexts`
  *   entry or `type` throws synchronously, for `create` and `update` alike.
  * - `update` and `remove` reject an unknown id. `update` applies fields in Chrome's order and
  *   keeps the ones applied before a failure (an empty title on a non-separator, `checked: true`
  *   on an item that is not a checkbox or radio, a launcher context, an unknown or
- *   non-`"normal"` parent); a `parentId` that is the item or its descendant resolves without
+ *   non-`"normal"` parent, an invalid URL pattern, which keeps the patterns before it); a
+ *   `parentId` that is the item or its descendant resolves without
  *   moving it, as Chrome does. A moved item goes last among its new siblings.
  * - `remove` also removes descendants; `removeAll` removes everything.
  * - Radio items behave as in Chrome: each run of adjacent radio siblings keeps exactly one
  *   checked item, re-established after every create, move and removal.
+ * - URL patterns follow Chrome's `URLPattern` parser: `<all_urls>`, or a scheme, `://` and a
+ *   host (`*`, `*.` plus a domain, or a name, with an optional port) and a path for standard
+ *   schemes; `file:` needs no host and non-standard schemes such as `data:` take `:` and a path.
  * - `controls.click` emits `onClicked` for an existing item, toggling a checkbox or selecting a
- *   radio as Chrome does. Stored `onclick` handlers are not called.
+ *   radio as Chrome does. It throws for a click Chrome's menu cannot produce: a separator, or an
+ *   item that is, or sits under, a disabled or hidden item. Stored `onclick` handlers are not
+ *   called.
  *
  * Pass `overrides` to replace any member.
  */
@@ -207,6 +319,20 @@ export const makeContextMenus = (
     return false
   }
 
+  /**
+   * Chrome's menu never offers a separator as a command, greys out a disabled item, and shows
+   * neither a hidden item nor anything under a hidden or disabled submenu.
+   */
+  const isClickable = (item: MenuItem) => {
+    if (typeOf(item) === "separator") return false
+
+    for (let at: MenuItem | undefined = item; at !== undefined; at = at.parentId === undefined ? undefined : items.get(at.parentId)) {
+      if (at.properties.enabled === false || at.properties.visible === false) return false
+    }
+
+    return true
+  }
+
   const detach = (id: MenuItemId) => {
     const list = siblings(find(id).parentId)
     list.splice(list.indexOf(id), 1)
@@ -239,6 +365,11 @@ export const makeContextMenus = (
     if (properties.contexts?.includes("launcher") === true) return messages.launcher
 
     if ((properties.title ?? "") === "" && properties.type !== "separator") return messages.titleNeeded
+
+    const patternError = populatePatterns(properties.documentUrlPatterns ?? []).error ??
+      populatePatterns(properties.targetUrlPatterns ?? []).error
+
+    if (patternError !== undefined) return patternError
 
     return parentId === undefined ? undefined : parentError(parentId)
   }
@@ -324,9 +455,17 @@ export const makeContextMenus = (
       sanitize(siblings(parentId))
     }
 
-    if (updateProperties.documentUrlPatterns !== undefined) patch(id, { documentUrlPatterns: updateProperties.documentUrlPatterns })
+    for (const field of ["documentUrlPatterns", "targetUrlPatterns"] as const) {
+      const patterns = updateProperties[field]
 
-    if (updateProperties.targetUrlPatterns !== undefined) patch(id, { targetUrlPatterns: updateProperties.targetUrlPatterns })
+      if (patterns === undefined) continue
+
+      // Chrome clears the set, then keeps the patterns parsed before an invalid one.
+      const { kept, error } = populatePatterns(patterns)
+      patch(id, { [field]: kept })
+
+      if (error !== undefined) throw new Error(error)
+    }
 
     const updated = find(id)
 
@@ -383,13 +522,16 @@ export const makeContextMenus = (
       /** The ids of a parent's children in menu order, or the top-level ids without a parent. */
       children: (parentId?: MenuItemId): Array<MenuItemId> => [...(parentId === undefined ? topLevel : childLists.get(parentId) ?? [])],
       /**
-       * Emits `onClicked` for an existing item, filling `menuItemId`, `parentMenuItemId`,
+       * Emits `onClicked` for an existing item Chrome would show as a command (not a separator,
+       * and neither it nor an ancestor disabled or hidden), filling `menuItemId`, `parentMenuItemId`,
        * `editable: false` and the tab's URL as `pageUrl`. A checkbox toggles and a radio is
        * selected (unchecking its adjacent radios), with `wasChecked` and `checked` filled as
        * Chrome does. `info` overrides any field. Returns the exceptions listeners threw.
        */
       click: (menuItemId: MenuItemId, info: Partial<ChromeContextMenus.OnClickData> = {}, tab?: chrome.tabs.Tab) => {
         const item = find(menuItemId)
+
+        if (!isClickable(item)) throw new Error(messages.cannotClick(menuItemId))
         const data: ChromeContextMenus.OnClickData = { menuItemId, editable: false }
 
         if (item.parentId !== undefined) data.parentMenuItemId = item.parentId
