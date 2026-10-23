@@ -39,7 +39,14 @@ export const observeSome = <Args extends ReadonlyArray<unknown>, A, E>(
         source.removeListener(listener)
       })
     )
-    yield* Effect.try({ try: () => source.addListener(listener), catch: onError })
+    // The stream's own interrupt finalizer can run the release above while this fiber is
+    // suspended here; adding afterwards would leave a listener nobody removes.
+    yield* Effect.try({
+      try: () => {
+        if (active) source.addListener(listener)
+      },
+      catch: onError
+    })
   })
 }, { bufferSize: capacity, strategy: "sliding" })
 
