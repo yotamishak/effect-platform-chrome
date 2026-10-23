@@ -7,13 +7,17 @@ export class ChromeCommandsError extends Schema.TaggedError<ChromeCommandsError>
   cause: Schema.Defect()
 }) {}
 
-/** A command invocation: its manifest name and the active tab, when Chrome supplies one. */
+/**
+ * A command invocation: its manifest name and the tab that was active when the shortcut was
+ * pressed. `tab` is None when Chrome supplies none, as for a global shortcut pressed while no
+ * Chrome window is focused.
+ */
 export interface CommandEvent {
   readonly command: string
   readonly tab: Option.Option<chrome.tabs.Tab>
 }
 
-/** The Promise-based MV3 subset this module needs. */
+/** The Promise-based MV3 surface of `chrome.commands`: `getAll` and `onCommand` are all of it. */
 export interface ChromeCommandsApi {
   getAll(): Promise<Array<chrome.commands.Command>>
   readonly onCommand: EventSource<[command: string, tab?: chrome.tabs.Tab]>
@@ -21,14 +25,20 @@ export interface ChromeCommandsApi {
 
 export interface ChromeCommandsService {
   /**
-   * The manifest's commands with their current shortcuts. A `shortcut` is empty when the
-   * user removed it or Chrome could not assign it; each run queries afresh.
+   * The manifest's commands with their current shortcuts, in Chrome's order; each run queries
+   * afresh, so a shortcut the user changed at `chrome://extensions/shortcuts` shows up on the
+   * next run. A `shortcut` is empty when the command has none: it declared no
+   * `suggested_key`, the user removed it, or Chrome could not assign it. Every field of a
+   * `Command` is optional in Chrome's schema. Since Chrome 110 the list includes
+   * `_execute_action` when the manifest declares it.
    */
   readonly getAll: Effect.Effect<Array<chrome.commands.Command>, ChromeCommandsError>
   /**
-   * Observational subscription that cannot wake an MV3 service worker; register wake
-   * listeners through `ChromeServiceWorker.listen`. Buffers at most 64 events, dropping
-   * the oldest. `_execute_action` opens the popup instead of firing here.
+   * Activations of the extension's commands through their keyboard shortcuts. Observational:
+   * each run adds its own listener and removes it when the stream ends, so it cannot wake an
+   * MV3 service worker; register wake listeners through `ChromeServiceWorker.listen`. Buffers
+   * at most 64 events, dropping the oldest. The reserved `_execute_action` command never
+   * fires here: Chrome triggers the action instead (its popup, or `action.onClicked`).
    */
   readonly onCommand: Stream.Stream<CommandEvent, ChromeCommandsError>
 }
