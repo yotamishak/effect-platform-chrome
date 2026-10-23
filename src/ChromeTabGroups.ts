@@ -46,15 +46,19 @@ export interface ChromeTabGroupsService {
   readonly get: (groupId: number) => Effect.Effect<TabGroup, ChromeTabGroupsError>
   /**
    * Groups in every window the extension can see (incognito ones only when allowed), the most
-   * recently active window first and each window's groups in tab-strip order, keeping those
-   * that match every given field; `{}` matches all. `title` is a pattern where `*` matches any
-   * run of characters, `?` matches zero or one character and `\` makes the next character
-   * literal. `windowId` may be -2 (`WINDOW_ID_CURRENT`); `shared` needs Chrome 137+.
+   * recently active window first, keeping those that match every given field; `{}` matches all.
+   * Within a window Chrome lists groups in the order they joined it (created there or moved in
+   * from another window), not in tab-strip order; sort by their tabs' indices when that order
+   * matters. `title` is a pattern where `*` matches any run of characters, `?` matches zero or
+   * one character and `\` makes the next character literal. `windowId` may be -2
+   * (`WINDOW_ID_CURRENT`); `shared` needs Chrome 137+. Fails with `No current window`, whatever
+   * the `windowId`, while no browser window is open (a service worker can outlive them).
    */
   readonly query: (queryInfo: chrome.tabGroups.QueryInfo) => Effect.Effect<Array<TabGroup>, ChromeTabGroupsError>
   /**
    * Changes a group's title, color or collapsed state; properties left out keep their values.
-   * Chrome declares the resulting group optional, so a missing one is None.
+   * Chrome declares the resulting group optional, so a missing one is None. Like `move`, fails
+   * with `Tabs cannot be edited right now (user may be dragging a tab).` during a tab drag.
    */
   readonly update: (
     groupId: number,
@@ -76,7 +80,7 @@ export interface ChromeTabGroupsService {
    * A group moved into another window is reported as created there.
    */
   readonly onCreated: Stream.Stream<TabGroup, ChromeTabGroupsError>
-  /** Groups whose title, color or collapsed state was set. */
+  /** Groups whose title, color or collapsed state was set, and groups moved in from another window. */
   readonly onUpdated: Stream.Stream<TabGroup, ChromeTabGroupsError>
   /** Groups closed directly by the user, emptied of tabs, or moved out to another window. */
   readonly onRemoved: Stream.Stream<TabGroup, ChromeTabGroupsError>

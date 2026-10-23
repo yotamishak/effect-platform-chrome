@@ -13,6 +13,8 @@ interface Strip {
   /** Leading ungrouped tabs that are pinned. */
   readonly pinned: number
   slots: Array<number>
+  /** The window's group ids in the order they joined it, which is the order Chrome lists them in. */
+  order: Array<number>
 }
 
 /** A window opened through `controls.openWindow`. */
@@ -164,11 +166,13 @@ const checkIndex = (strip: Strip, index: number) => {
  * `onCreated`), and `controls.remove`, `controls.ungroup` and `controls.closeWindow` close
  * groups (emitting `onRemoved`). `get`, `query`, `update` and `move` follow Chrome: missing
  * groups and windows fail with Chrome's messages, out-of-range integers and unknown colors
- * throw synchronously, `query` walks windows from the most recently focused and matches titles
- * with `matchesGroupTitle`, `update` always emits `onUpdated`, and `move` applies Chrome's index
- * rules, emitting `onMoved` within a window (nothing when the group stays put) or `onRemoved`
- * then `onCreated` and `onUpdated` across windows. Events fire before the call settles. Pass
- * `overrides` to replace any member.
+ * throw synchronously, `query` walks windows from the most recently focused, lists each
+ * window's groups in the order they joined it (created there or moved in, not tab-strip order)
+ * and matches titles with `matchesGroupTitle`, `update` always emits `onUpdated`, and `move`
+ * applies Chrome's index rules, emitting `onMoved` within a window (nothing when the group
+ * stays put) or `onRemoved` then `onCreated` and `onUpdated` across windows. Events fire before
+ * the call settles, but results and events carry the group as that call left it, whatever a
+ * listener changes meanwhile. Pass `overrides` to replace any member.
  */
 export const makeTabGroups = (overrides: Partial<ChromeTabGroups.ChromeTabGroupsApi> = {}) => {
   const windows = new Map<number, Strip>()
@@ -208,12 +212,12 @@ export const makeTabGroups = (overrides: Partial<ChromeTabGroups.ChromeTabGroups
     return group
   }
 
-  const groupsIn = (strip: Strip): Array<ChromeTabGroups.TabGroup> => Array.from(new Set(strip.slots))
-    .flatMap((groupId) => {
-      const group = groups.get(groupId)
+  /** A window's groups as Chrome's TabGroupModel lists them: in the order they joined it. */
+  const groupsIn = (strip: Strip): Array<ChromeTabGroups.TabGroup> => strip.order.flatMap((groupId) => {
+    const group = groups.get(groupId)
 
-      return group === undefined ? [] : [group]
-    })
+    return group === undefined ? [] : [group]
+  })
 
   const openWindow = (options: TabGroupWindowOptions = {}): number => {
     const pinned = options.pinnedTabs ?? 0
@@ -227,7 +231,8 @@ export const makeTabGroups = (overrides: Partial<ChromeTabGroups.ChromeTabGroups
     windows.set(windowId, {
       type: options.type ?? "normal",
       pinned,
-      slots: Array.from({ length: pinned + ungrouped }, () => ChromeTabGroups.TAB_GROUP_ID_NONE)
+      slots: Array.from({ length: pinned + ungrouped }, () => ChromeTabGroups.TAB_GROUP_ID_NONE),
+      order: []
     })
     activation.push(windowId)
 
@@ -241,35 +246,55 @@ export const makeTabGroups = (overrides: Partial<ChromeTabGroups.ChromeTabGroups
     strip.slots = keepTabs
       ? strip.slots.map((slot) => slot === groupId ? ChromeTabGroups.TAB_GROUP_ID_NONE : slot)
       : strip.slots.filter((slot) => slot !== groupId)
+    strip.order = strip.order.filter((id) => id !== groupId)
     groups.delete(groupId)
     removed.controls.emit(snapshot(group))
   }
 
-  const moveWithin = (group: ChromeTabGroups.TabGroup, strip: Strip, requested: number) => {
+  /** Moves within a window and returns the group as moved, before any listener reacts. */
+  const moveWithin = (group: ChromeTabGroups.TabGroup, strip: Strip, requested: number): ChromeTabGroups.TabGroup => {
     const { start, length } = span(strip, group.id)
     checkIndex(strip, requested > start ? requested + length : requested)
     const remaining = strip.slots.length - length
     const index = requested >= remaining || requested < 0 ? remaining : requested
+    const result = snapshot(group)
 
-    if (index === start) return
+    if (index === start) return result
 
     const slots = strip.slots.filter((slot) => slot !== group.id)
     slots.splice(index, 0, ...Array.from({ length }, () => group.id))
     strip.slots = slots
-    moved.controls.emit(snapshot(group))
+    moved.controls.emit(snapshot(result))
+
+    return result
   }
 
-  const moveAcross = (group: ChromeTabGroups.TabGroup, source: Strip, targetId: number, target: Strip, requested: number) => {
+  /**
+   * Moves into another window, where the group joins last, and returns it as moved. Every
+   * event carries the group as the move left it, whatever an earlier listener changes.
+   */
+  const moveAcross = (
+    group: ChromeTabGroups.TabGroup,
+    source: Strip,
+    targetId: number,
+    target: Strip,
+    requested: number
+  ): ChromeTabGroups.TabGroup => {
     const index = requested > target.slots.length || requested < 0 ? target.slots.length : requested
     checkIndex(target, index)
     const { length } = span(source, group.id)
     const before = snapshot(group)
     source.slots = source.slots.filter((slot) => slot !== group.id)
+    source.order = source.order.filter((id) => id !== group.id)
     target.slots.splice(index, 0, ...Array.from({ length }, () => group.id))
+    target.order.push(group.id)
     group.windowId = targetId
+    const result = snapshot(group)
     removed.controls.emit(before)
-    created.controls.emit(snapshot(group))
-    updated.controls.emit(snapshot(group))
+    created.controls.emit(snapshot(result))
+    updated.controls.emit(snapshot(result))
+
+    return result
   }
 
   openWindow()
@@ -321,9 +346,10 @@ export const makeTabGroups = (overrides: Partial<ChromeTabGroups.ChromeTabGroups
 
         if (updateProperties.title !== undefined) group.title = wellFormed(updateProperties.title)
 
-        updated.controls.emit(snapshot(group))
+        const result = snapshot(group)
+        updated.controls.emit(snapshot(result))
 
-        return snapshot(group)
+        return result
       })
     },
     move: (groupId, moveProperties) => {
@@ -345,16 +371,10 @@ export const makeTabGroups = (overrides: Partial<ChromeTabGroups.ChromeTabGroups
 
           if (target.type !== "normal") throw new Error("Tabs can only be moved to and from normal windows.")
 
-          if (target !== source) {
-            moveAcross(group, source, targetId, target, moveProperties.index)
-
-            return snapshot(group)
-          }
+          if (target !== source) return moveAcross(group, source, targetId, target, moveProperties.index)
         }
 
-        moveWithin(group, source, moveProperties.index)
-
-        return snapshot(group)
+        return moveWithin(group, source, moveProperties.index)
       })
     },
     onCreated: created.api,
@@ -376,11 +396,19 @@ export const makeTabGroups = (overrides: Partial<ChromeTabGroups.ChromeTabGroups
         activation.splice(activation.indexOf(windowId), 1)
         activation.unshift(windowId)
       },
-      /** Closes a window, emitting `onRemoved` for each of its groups in strip order. */
+      /**
+       * Closes a window, emitting `onRemoved` for each of its groups in strip order. The strip is
+       * read again after each removal, so a group a listener moves out survives, a group a
+       * listener adds is closed too, and a listener closing the same window again ends both calls.
+       */
       closeWindow: (windowId: number) => {
         const strip = findWindow(windowId)
+        const first = () => strip.slots.find((slot) => groups.has(slot))
 
-        for (const group of groupsIn(strip)) close(group.id, false)
+        for (let next = first(); next !== undefined; next = first()) close(next, false)
+
+        // A listener already closed it: splicing at -1 would drop another window's activation.
+        if (windows.get(windowId) !== strip) return
 
         windows.delete(windowId)
         activation.splice(activation.indexOf(windowId), 1)
@@ -418,9 +446,11 @@ export const makeTabGroups = (overrides: Partial<ChromeTabGroups.ChromeTabGroups
 
         groups.set(group.id, group)
         strip.slots.splice(index, 0, ...Array.from({ length: tabCount }, () => group.id))
-        created.controls.emit(snapshot(group))
+        strip.order.push(group.id)
+        const result = snapshot(group)
+        created.controls.emit(snapshot(result))
 
-        return snapshot(group)
+        return result
       },
       /** Closes a group and its tabs, emitting `onRemoved`. */
       remove: (groupId: number) => close(groupId, false),

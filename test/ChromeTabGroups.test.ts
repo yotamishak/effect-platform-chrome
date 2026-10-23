@@ -1,6 +1,6 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Deferred, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Stream } from "effect"
 import { describe, expect, expectTypeOf, it, vi } from "@effect/vitest"
 import { ChromeTabGroups, ChromeTabGroupsError, TAB_GROUP_ID_NONE, layer, layerLive, make } from "../src/ChromeTabGroups.js"
 import type { ChromeTabGroupsApi, ChromeTabGroupsService, TabGroup } from "../src/ChromeTabGroups.js"
@@ -636,5 +636,148 @@ describe("makeTabGroups", () => {
     expect(yield* service.get(g.id)).toEqual(g)
     expect(yield* Effect.flip(service.update(g.id, { title: "x" }))).toMatchObject({ operation: "update", cause })
     expect(fixture.controls.group(g.id)?.title).toBe("")
+  }))
+
+  it.effect("queries each window's groups in the order they joined it, not tab-strip order, as Chrome does", () =>
+    Effect.gen(function*() {
+      const fixture = makeTabGroups()
+      const groups = make(fixture.api)
+      const other = fixture.controls.openWindow()
+      const ids = (values: ReadonlyArray<TabGroup>) => values.map((value) => value.id)
+      const a = fixture.controls.create({ tabCount: 2 })
+      const b = fixture.controls.create({ index: 0 })
+      const c = fixture.controls.create({ windowId: other })
+      expect(fixture.controls.strip(1)).toEqual([b.id, a.id, a.id])
+      // Chrome's TabGroupModel lists groups in the order they were added to the window.
+      expect(ids(yield* groups.query({ windowId: 1 }))).toEqual([a.id, b.id])
+      yield* groups.move(b.id, { index: -1 })
+      expect(fixture.controls.strip(1)).toEqual([a.id, a.id, b.id])
+      expect(ids(yield* groups.query({ windowId: 1 }))).toEqual([a.id, b.id])
+      yield* groups.move(a.id, { index: -1 })
+      expect(ids(yield* groups.query({ windowId: 1 }))).toEqual([a.id, b.id])
+      // A group moved in from another window is added last there, whatever its index.
+      yield* groups.move(c.id, { index: 0, windowId: 1 })
+      expect(fixture.controls.strip(1)).toEqual([c.id, b.id, a.id, a.id])
+      expect(ids(yield* groups.query({ windowId: 1 }))).toEqual([a.id, b.id, c.id])
+      yield* groups.move(a.id, { index: 0, windowId: other })
+      expect(ids(yield* groups.query({}))).toEqual([b.id, c.id, a.id])
+      fixture.controls.ungroup(b.id)
+      expect(ids(yield* groups.query({ windowId: 1 }))).toEqual([c.id])
+    }))
+
+  it.effect("returns each call's own result and event payloads whatever a listener changes meanwhile", () =>
+    Effect.gen(function*() {
+      const fixture = makeTabGroups()
+      const groups = make(fixture.api)
+      const target = fixture.controls.openWindow()
+      const g = fixture.controls.create({ title: "Before" })
+      const h = fixture.controls.create()
+      const log: Array<[string, string | undefined, number]> = []
+      let reacting = true
+
+      // Each listener changes the group again from inside the event, as a re-entrant handler would.
+      fixture.api.onUpdated.addListener((value) => {
+        log.push(["onUpdated", value.title, value.windowId])
+
+        if (reacting && value.title === "Called") void fixture.api.update(value.id, { title: "Listener" })
+      })
+      fixture.api.onMoved.addListener((value) => {
+        log.push(["onMoved", value.title, value.windowId])
+
+        if (reacting) void fixture.api.update(value.id, { title: "Moved by listener" })
+      })
+      fixture.api.onRemoved.addListener((value) => {
+        log.push(["onRemoved", value.title, value.windowId])
+
+        if (reacting) {
+          reacting = false
+          void fixture.api.update(value.id, { title: "Renamed while crossing" })
+        }
+      })
+      fixture.api.onCreated.addListener((value) => { log.push(["onCreated", value.title, value.windowId]) })
+
+      const updated = yield* groups.update(g.id, { title: "Called" })
+      expect(Option.map(updated, (value) => value.title)).toEqual(Option.some("Called"))
+      expect(fixture.controls.group(g.id)?.title).toBe("Listener")
+
+      const moved = yield* groups.move(g.id, { index: -1 })
+      expect(Option.map(moved, (value) => value.title)).toEqual(Option.some("Listener"))
+      expect(fixture.controls.group(g.id)?.title).toBe("Moved by listener")
+
+      log.length = 0
+      const crossed = yield* groups.move(h.id, { index: -1, windowId: target })
+      expect(Option.map(crossed, (value) => [value.title, value.windowId])).toEqual(Option.some(["", target]))
+      expect(log).toEqual([
+        ["onRemoved", "", 1],
+        ["onUpdated", "Renamed while crossing", target],
+        ["onCreated", "", target],
+        ["onUpdated", "", target]
+      ])
+      expect(fixture.controls.group(h.id)?.title).toBe("Renamed while crossing")
+    }))
+
+  it.effect("closes a window by its groups at each step, whatever its onRemoved listeners do", () => Effect.gen(function*() {
+    const fixture = makeTabGroups()
+    const doomed = fixture.controls.openWindow()
+    const keep = fixture.controls.openWindow()
+    const a = fixture.controls.create({ windowId: doomed })
+    const b = fixture.controls.create({ windowId: doomed })
+    const c = fixture.controls.create({ windowId: doomed })
+    const removed: Array<number> = []
+
+    fixture.api.onRemoved.addListener((value) => {
+      removed.push(value.id)
+
+      // Closing the first group also closes the second and adds a fourth to the closing window.
+      if (value.id === a.id) {
+        fixture.controls.remove(b.id)
+        fixture.controls.create({ windowId: doomed })
+      }
+    })
+
+    expect(() => fixture.controls.closeWindow(doomed)).not.toThrow()
+    expect(removed).toEqual([a.id, b.id, c.id, c.id + 1])
+    expect(() => fixture.controls.strip(doomed)).toThrow(`No window with id: ${doomed}.`)
+    expect(yield* make(fixture.api).query({})).toEqual([])
+    expect(fixture.controls.strip(keep)).toEqual([])
+  }))
+
+  it.effect("leaves other windows open and focused when an onRemoved listener closes the closing window again", () =>
+    Effect.gen(function*() {
+      const fixture = makeTabGroups()
+      const doomed = fixture.controls.openWindow()
+      const last = fixture.controls.openWindow()
+      const kept = fixture.controls.create({ windowId: last, title: "Kept" })
+      const a = fixture.controls.create({ windowId: doomed })
+      fixture.controls.create({ windowId: doomed })
+      let nested = 0
+
+      fixture.api.onRemoved.addListener((value) => {
+        if (value.id === a.id) {
+          nested++
+          fixture.controls.closeWindow(doomed)
+        }
+      })
+
+      expect(() => fixture.controls.closeWindow(doomed)).not.toThrow()
+      expect(nested).toBe(1)
+      expect(fixture.controls.currentWindowId).toBe(1)
+      fixture.controls.focusWindow(last)
+      expect(yield* make(fixture.api).query({ windowId: -2 })).toEqual([kept])
+      expect(() => fixture.controls.closeWindow(doomed)).toThrow(`No window with id: ${doomed}.`)
+    }))
+
+  it.effect("re-subscribes after a failed registration with exactly one live listener", () => Effect.gen(function*() {
+    const fixture = makeTabGroups()
+    fixture.controls.onUpdated.failNext("addListener", new Error("busy"))
+    fixture.controls.onUpdated.failNext("addListener", new Error("still busy"))
+    const stream = make(fixture.api).onUpdated.pipe(Stream.retry(Schedule.recurs(2)), Stream.take(1))
+    const fiber = yield* Effect.forkScoped(Stream.runCollect(stream))
+    yield* Effect.promise(() => fixture.controls.onUpdated.waitForListener())
+    expect(fixture.controls.onUpdated.listenerCount).toBe(1)
+    const g = fixture.controls.create()
+    yield* make(fixture.api).update(g.id, { title: "Once" })
+    expect((yield* Fiber.join(fiber)).map((value) => value.title)).toEqual(["Once"])
+    expect(fixture.controls.onUpdated.listenerCount).toBe(0)
   }))
 })
