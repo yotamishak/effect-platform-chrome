@@ -32,3 +32,29 @@ export * from "./testing/DeclarativeNetRequest.js"
 export * from "./testing/Bookmarks.js"
 
 export * from "./testing/Windows.js"
+
+export * from "./testing/Alarms.js"
+
+export * from "./testing/Commands.js"
+
+export * from "./testing/Debugger.js"
+
+export * from "./testing/History.js"
+
+export * from "./testing/I18n.js"
+
+export * from "./testing/Idle.js"
+
+export * from "./testing/Management.js"
+
+export * from "./testing/Scripting.js"
+
+export * from "./testing/Sessions.js"
+
+export * from "./testing/TabCapture.js"
+
+export * from "./testing/TabGroups.js"
+
+export * from "./testing/UserScripts.js"
+
+export * from "./testing/WebRequest.js"

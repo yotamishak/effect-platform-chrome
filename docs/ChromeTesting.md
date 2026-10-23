@@ -183,4 +183,17 @@ Every adapter fixture returns `{ api, layer, controls }`: `api` fits the module'
 | `testing/Notifications` | `makeNotifications` | Showing notifications, the permission level, and simulated clicks, button clicks and closes. |
 | `testing/DeclarativeNetRequest` | `makeDeclarativeNetRequest` | Dynamic and session rule sets with Chrome's atomic updates and id collisions; requests are never matched. |
 | `testing/Bookmarks` | `makeBookmarks` | A bookmark tree with the permanent folders, Chrome's errors and events. |
+| `testing/Alarms` | `makeAlarms` | Alarms on a virtual clock with Chrome's validation messages, the 500-alarm cap and once-a-second polls; `controls.advance(ms)` fires due alarms as one Chrome poll does, `controls.restart()` drops non-persistent ones. |
+| `testing/Commands` | `makeCommands` | Manifest commands; `controls.setShortcut` edits a shortcut and `controls.press` fires `onCommand` only for bound, non-reserved commands. |
+| `testing/Debugger` | `makeDebugger` | Targets, one attachment per target, protocol versions, scripted command handlers (`controls.respond`), recorded commands, detach and target events. |
+| `testing/History` | `makeHistory` | Pages and visits keyed by canonical URL, Chrome's search window and text matching, the deletion policy, visit and removal events. |
+| `testing/I18n` | `makeI18n`, `replacePlaceholders` | Validated message catalogs with Chrome's placeholder substitution, case folding, `@@` predefined messages and language detection post-processing. |
+| `testing/Idle` | `makeIdle` | Idle time and lock state, Chrome's interval validation, and `onStateChanged` sampled the way Chrome samples it (`controls.poll`). |
+| `testing/Management` | `makeManagement` | The calling extension and other items, Chrome's refusal messages, and gesture-only calls modelled exactly (`controls.withUserGesture`), with confirmation dialogs. |
+| `testing/Scripting` | `makeScripting` | Tabs, frames and packaged files; Chrome's target validation, per-frame results, CSS insertion and dynamic content-script registration. |
+| `testing/Sessions` | `makeSessions` | Recently closed tabs and windows (newest 25), synced devices, and `restore` as Chrome does it. |
+| `testing/TabCapture` | `makeTabCapture`, `makeCaptureStream` | Capture stream ids, captured tabs and status events, plus simulated media streams with live tracks. |
+| `testing/TabGroups` | `makeTabGroups` | Groups across simulated windows with Chrome's query order, index rules for `move`, and created/updated/moved/removed events. |
+| `testing/UserScripts` | `makeUserScripts` | Registration, update and unregistration with Chrome's validation and defaults, world configurations, and `execute` through a scripted responder. |
+| `testing/WebRequest` | `makeWebRequest`, `matchesRequestFilter`, `matchesUrlPattern` | Listener registrations matched like Chrome's (URL patterns, types, tabs, windows), per-listener detail copies by `extraInfoSpec`, and simulated requests. |
 

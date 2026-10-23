@@ -59,7 +59,7 @@ export function installLimits(log: (label: string, data: unknown) => void) {
     const target = yield* tabs.create({ url: `${targetOrigin}?${roleParam}=top&children=4`, active: false })
     const nav = yield* tabs.create({ url: `${targetOrigin}?${roleParam}=plain&n=start`, active: false })
     const all = yield* poll(navigation.getAllFrames(target.id ?? -1).pipe(
-      Effect.map((frames) => frames.length === 7 ? Option.some(frames) : Option.none())
+      Effect.map(Option.filter((frames) => frames.length === 7))
     ), 400)
     const roleOf = (url: string) => new URL(url).searchParams.get(roleParam)
     const find = (role: string) => all.filter((frame) => roleOf(frame.url) === role).map((frame) => frame.frameId)
@@ -100,7 +100,7 @@ export function installLimits(log: (label: string, data: unknown) => void) {
     ["webNavigation.getAllFrames x2000 (64 concurrent)", 2000, Effect.gen(function*() {
       const navigation = yield* ChromeWebNavigation.ChromeWebNavigation
       const counts = yield* Effect.forEach(Array.from({ length: 2000 }), () =>
-        navigation.getAllFrames(frames.target).pipe(Effect.map((all) => all.length)), { concurrency: 64 })
+        navigation.getAllFrames(frames.target).pipe(Effect.map((all) => Option.match(all, { onNone: () => 0, onSome: (list) => list.length }))), { concurrency: 64 })
       const exact = counts.filter((count) => count === 7).length
       return { completed: exact, ok: exact === 2000, details: { framesPerCall: 7 } }
     })],
@@ -155,7 +155,7 @@ export function installLimits(log: (label: string, data: unknown) => void) {
     })],
     ["onHistoryStateUpdated: 100 paced pushStates", 100, Effect.gen(function*() {
       const navigation = yield* ChromeWebNavigation.ChromeWebNavigation
-      const queue = yield* subscribe(navigation.onHistoryStateUpdated, frames.target)
+      const queue = yield* subscribe(navigation.onHistoryStateUpdated(), frames.target)
       const client = yield* frameClient(frames.target, 0)
       // The first push also proves the subscription is registered.
       yield* poll(Effect.gen(function*() {
@@ -173,7 +173,7 @@ export function installLimits(log: (label: string, data: unknown) => void) {
     })],
     ["onHistoryStateUpdated: one burst of 500 pushStates (Chrome caps history updates)", 500, Effect.gen(function*() {
       const navigation = yield* ChromeWebNavigation.ChromeWebNavigation
-      const queue = yield* subscribe(navigation.onHistoryStateUpdated, frames.target)
+      const queue = yield* subscribe(navigation.onHistoryStateUpdated(), frames.target)
       const client = yield* frameClient(frames.target, 0)
       yield* poll(Effect.gen(function*() {
         yield* client.PushStates({ from: -2, count: 1 })
@@ -204,7 +204,7 @@ export function installLimits(log: (label: string, data: unknown) => void) {
     ["onCommitted: 50 sequential navigations", 50, Effect.gen(function*() {
       const navigation = yield* ChromeWebNavigation.ChromeWebNavigation
       const tabs = yield* ChromeTabs.ChromeTabs
-      const queue = yield* subscribe(navigation.onCommitted, frames.nav)
+      const queue = yield* subscribe(navigation.onCommitted(), frames.nav)
       let completed = 0
       for (let index = 0; index < 50; index++) {
         yield* tabs.update(frames.nav, { url: `${targetOrigin}?${roleParam}=plain&n=${index}` })

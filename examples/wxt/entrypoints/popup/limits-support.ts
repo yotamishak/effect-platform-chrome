@@ -58,7 +58,7 @@ export interface Frames {
 const storage = ChromeStorage.layerLive
 export const layer = Layer.mergeAll(
   ChromeAlarms.layerLive, ChromeCookies.layerLive, ChromeIdentity.layerLive,
-  ChromeKeyValueStore.layerLocal({ namespace: "wxt-limits" }), ChromeNotifications.layerLive,
+  ChromeKeyValueStore.layerLive({ namespace: "wxt-limits" }), ChromeNotifications.layerLive,
   ChromePermissions.layerLive, ChromePort.layerLive, ChromeRuntime.layerLive,
   ChromeSchemaStorage.layer.pipe(Layer.provide(storage)),
   ChromeScripting.layerLive, storage, ChromeTabs.layerLive, ChromeWebNavigation.layerLive,

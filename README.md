@@ -153,7 +153,7 @@ CLI is not a library runtime dependency; use it only with trusted documentation.
 | [`ChromePermissions`](docs/ChromePermissions.md) | Permission checks, requests, revocation, host access requests (Chrome 133+), and change events. |
 | [`ChromeScripting`](docs/ChromeScripting.md) | Typed script injection, CSS, and dynamic content-script registration. |
 | `ChromeIdentity` | Web auth flows (`launchWebAuthFlow`), the OAuth redirect URL, Google account tokens (`getAuthToken`, cache removal), profile user info and sign-in change events. |
-| `ChromeWebNavigation` | A tab's frames (`getAllFrames`, `getFrame`) and every navigation event (before-navigate, committed, DOMContentLoaded, completed, errors, created targets, fragment/history updates, tab replacement), each filterable by URL through `filtered(filter)`. |
+| `ChromeWebNavigation` | A tab's frames (`getAllFrames`, `getFrame`) and every navigation event (before-navigate, committed, DOMContentLoaded, completed, errors, created targets, fragment/history updates, tab replacement), each a stream method taking an optional URL filter (`onCommitted(filter?)`). |
 | `ChromeCookies` | Reading, setting and removing cookies (including removing a cookie read from `getAll`), listing cookie stores, and cookie change events. |
 | `ChromeNotifications` | Creating, updating, clearing and listing notifications, the permission level, and click, button, close and permission-change events. |
 | `ChromeWindows` | Listing, creating, updating, focusing and closing windows, with window-type-filterable event streams. |
@@ -208,8 +208,8 @@ Every module with a Chrome global behind it exposes `layerLive`, which reads the
 global when the layer is built and fails with operation `"initialize"` where it is
 missing. Each also takes an injected API through `make(api)` and `layer(api)`; see
 [docs/CONVENTIONS.md](docs/CONVENTIONS.md). `ChromeSchemaStorage.layer` builds on the
-`ChromeStorage` service in context. KeyValueStore provides `layerLocal()`, `layerSync()`, and `layerSession()` with
-isolated namespaces. Importing modules does not access Chrome globals.
+`ChromeStorage` service in context. `ChromeKeyValueStore.layerLive({ area, namespace })` picks the storage area
+(`"local"` by default) and isolates its keys by namespace. Importing modules does not access Chrome globals.
 
 `effect-platform-chrome/internal` and all `internal/*`
 subpaths are explicitly excluded from public exports.

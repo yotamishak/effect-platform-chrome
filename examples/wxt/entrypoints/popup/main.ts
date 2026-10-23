@@ -14,7 +14,7 @@ import { installLimits } from "./limits.js"
 const runtime = ManagedRuntime.make(Layer.mergeAll(
   ChromeStorage.layerLive, ChromeRuntime.layerLive, ChromePort.layerLive,
   ChromeTabs.layerLive, ChromeAlarms.layerLive,
-  ChromeKeyValueStore.layerLocal({ namespace: "wxt-seven-modules-demo" })
+  ChromeKeyValueStore.layerLive({ namespace: "wxt-seven-modules-demo" })
 ))
 const output = document.querySelector<HTMLPreElement>("#output")!
 const value = () => document.querySelector<HTMLInputElement>("#value")!.value

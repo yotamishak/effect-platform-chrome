@@ -5,6 +5,19 @@ import { describe, expect, it } from "@effect/vitest"
 import * as ChromeTesting from "../src/ChromeTesting.js"
 import { makeEvent, makePortPair, makeStorage, makeTabs } from "../src/ChromeTesting.js"
 import * as TestAction from "../src/testing/Action.js"
+import * as TestAlarms from "../src/testing/Alarms.js"
+import * as TestCommands from "../src/testing/Commands.js"
+import * as TestDebugger from "../src/testing/Debugger.js"
+import * as TestHistory from "../src/testing/History.js"
+import * as TestI18n from "../src/testing/I18n.js"
+import * as TestIdle from "../src/testing/Idle.js"
+import * as TestManagement from "../src/testing/Management.js"
+import * as TestScripting from "../src/testing/Scripting.js"
+import * as TestSessions from "../src/testing/Sessions.js"
+import * as TestTabCapture from "../src/testing/TabCapture.js"
+import * as TestTabGroups from "../src/testing/TabGroups.js"
+import * as TestUserScripts from "../src/testing/UserScripts.js"
+import * as TestWebRequest from "../src/testing/WebRequest.js"
 import * as TestBookmarks from "../src/testing/Bookmarks.js"
 import * as TestContextMenus from "../src/testing/ContextMenus.js"
 import * as TestCookies from "../src/testing/Cookies.js"
@@ -30,8 +43,10 @@ interface CyclicMessage {
 
 describe("ChromeTesting events", () => {
   it.each([
-    TestAction, TestBookmarks, TestContextMenus, TestCookies, TestDeclarativeNetRequest, TestEvent, TestIdentity,
-    TestNotifications, TestOffscreen, TestOmnibox, TestPort, TestStorage, TestTabs, TestWebNavigation, TestWindows
+    TestAction, TestAlarms, TestBookmarks, TestCommands, TestContextMenus, TestCookies, TestDebugger,
+    TestDeclarativeNetRequest, TestEvent, TestHistory, TestI18n, TestIdentity, TestIdle, TestManagement,
+    TestNotifications, TestOffscreen, TestOmnibox, TestPort, TestScripting, TestSessions, TestStorage,
+    TestTabCapture, TestTabGroups, TestTabs, TestUserScripts, TestWebNavigation, TestWebRequest, TestWindows
   ])("re-exports every value of each per-adapter fixture module unchanged", (fixture) => {
     const barrel = new Map(Object.entries(ChromeTesting))
     const entries = Object.entries(fixture)
