@@ -17,7 +17,11 @@ export interface ChromeAlarmsApi {
   get(name?: string): Promise<Alarm | undefined>
   getAll(): Promise<Array<Alarm>>
   clear(name?: string): Promise<boolean>
-  clearAll(): Promise<boolean>
+  /**
+   * Resolves to `true`, or to nothing where Chrome's `ApiAlarmsClearAllReturnUndefined`
+   * feature is on; it carries no information either way.
+   */
+  clearAll(): Promise<boolean | undefined>
   readonly onAlarm: EventSource<[alarm: Alarm]>
 }
 
@@ -27,6 +31,20 @@ export class ChromeAlarmsError extends Schema.TaggedError<ChromeAlarmsError>()("
 }) {}
 
 export interface ChromeAlarmsService {
+  /**
+   * Schedules an alarm, replacing any alarm of the same name (the empty string when no name
+   * is given). The name goes either in the first argument or, from Chrome 152, in
+   * `info.name`; Chrome rejects both at once. `persistAcrossSessions` is Chrome 150+ and
+   * defaults to true. The first firing comes from exactly one of `when` or `delayInMinutes`,
+   * or from `periodInMinutes` when neither is set. Chrome fails the call when the extension
+   * already has 500 alarms (even when this one would replace one of them) or the name exceeds
+   * 1,024 bytes. An extension's alarms fire at most once a second; before Chrome 153 a packed
+   * MV3 extension's fire at most every 30 seconds. Shorter delays only warn. From Chrome 157,
+   * re-creating an identical alarm (same name, scheduled time, period and persistence) leaves
+   * it in place; earlier versions replace it. Any present `periodInMinutes` repeats, and `0`
+   * keeps the alarm due so it fires on every poll: omit the field for a one-shot alarm.
+   * Interrupting the Effect does not cancel a create Chrome has already started.
+   */
   create(info: AlarmCreateInfo): Effect.Effect<void, ChromeAlarmsError>
   create(name: undefined, info: AlarmCreateInfo): Effect.Effect<void, ChromeAlarmsError>
   create<T extends AlarmCreateInfo>(
@@ -35,9 +53,12 @@ export interface ChromeAlarmsService {
   ): Effect.Effect<void, ChromeAlarmsError>
   /** The named alarm, or the unnamed one when `name` is omitted; None when no such alarm exists. */
   get(name?: string): Effect.Effect<Option.Option<Alarm>, ChromeAlarmsError>
+  /** Every alarm of this extension; empty when there are none. */
   readonly getAll: Effect.Effect<Array<Alarm>, ChromeAlarmsError>
+  /** Whether the named alarm (the unnamed one when `name` is omitted) existed and is now cleared. */
   clear(name?: string): Effect.Effect<boolean, ChromeAlarmsError>
-  readonly clearAll: Effect.Effect<boolean, ChromeAlarmsError>
+  /** Clears every alarm of this extension. */
+  readonly clearAll: Effect.Effect<void, ChromeAlarmsError>
   /**
    * Observational only: each running subscription owns a listener, removed when
    * its scope closes. A bounded sliding buffer retains the newest 64 events,
@@ -63,18 +84,16 @@ export const make = (api: ChromeAlarmsApi): ChromeAlarmsService => {
     info: T & (T extends { name: string } ? never : unknown)
   ): Effect.Effect<void, ChromeAlarmsError>
   function create(
-    nameOrInfo: string | undefined | AlarmCreateInfo,
-    info?: AlarmCreateInfo
+    ...args: [info: AlarmCreateInfo] | [name: string | undefined, info: AlarmCreateInfo]
   ): Effect.Effect<void, ChromeAlarmsError> {
+    // Forward exactly the arity the caller used: Chrome distinguishes `create(info)` from
+    // `create(undefined, info)` only by its own argument matching.
     return invoke("create", () => {
-      // Already typed by the public overloads; this dispatches Chrome's object/name overloads.
-      // oxlint-disable-next-line anti-slop/no-runtime-typeof
-      if (typeof nameOrInfo === "object") return api.create(nameOrInfo)
+      if (args.length === 1) return api.create(args[0])
 
-      // The public overloads guarantee that the second argument is present.
-      if (nameOrInfo === undefined) return api.create(undefined, info!)
+      const [name, info] = args
 
-      return api.create(nameOrInfo, info!)
+      return name === undefined ? api.create(undefined, info) : api.create(name, info)
     })
   }
 
@@ -85,7 +104,7 @@ export const make = (api: ChromeAlarmsApi): ChromeAlarmsService => {
     ),
     getAll: invoke("getAll", () => api.getAll()),
     clear: (name) => invoke("clear", () => name === undefined ? api.clear() : api.clear(name)),
-    clearAll: invoke("clearAll", () => api.clearAll()),
+    clearAll: Effect.asVoid(invoke("clearAll", () => api.clearAll())),
     onAlarm: observe(() => api.onAlarm, (alarm) => alarm,
       (cause) => new ChromeAlarmsError({ operation: "onAlarm", cause }))
   })
