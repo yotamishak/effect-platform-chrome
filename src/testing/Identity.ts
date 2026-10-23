@@ -6,13 +6,18 @@ import * as TestEvent from "./Event.js"
 
 export type IdentityOperation =
   | "getRedirectURL" | "launchWebAuthFlow" | "getAuthToken" | "removeCachedAuthToken"
-  | "clearAllCachedAuthTokens" | "getProfileUserInfo"
+  | "clearAllCachedAuthTokens" | "getProfileUserInfo" | "getAccounts"
 
 export interface IdentityOptions {
   /** The extension's redirect URL; paths passed to `getRedirectURL` are appended to it. */
   readonly redirectURL?: string
   /** Replaces any member of the simulated API. */
   readonly overrides?: Partial<ChromeIdentity.ChromeIdentityApi>
+}
+
+export interface SignInOptions {
+  /** Whether Sync is enabled for the account; `getProfileUserInfo` without `accountStatus: "ANY"` needs it. Defaults to true. */
+  readonly syncing?: boolean
 }
 
 /** What the next `launchWebAuthFlow` does: resolve to a URL, or reject with a cause. */
@@ -25,19 +30,50 @@ interface CachedToken {
   readonly grantedScopes: Array<string>
 }
 
-const scopesKey = (scopes: ReadonlyArray<string> | undefined): string => JSON.stringify(Array.from(scopes ?? []).sort())
+interface Profile {
+  readonly user: chrome.identity.ProfileUserInfo
+  readonly syncing: boolean
+}
 
-const signedOut: chrome.identity.ProfileUserInfo = { email: "", id: "" }
+/** A scope set as Chrome keys it: unordered and without duplicates. */
+const scopeSet = (scopes: ReadonlyArray<string> | undefined): Array<string> => Array.from(new Set(scopes ?? [])).sort()
+
+const scopesKey = (scopes: ReadonlyArray<string> | undefined): string => JSON.stringify(scopeSet(scopes))
+
+const signedOut = (): chrome.identity.ProfileUserInfo => ({ email: "", id: "" })
+
+/** Chrome accepts only http and https auth URLs, comparing the scheme case-insensitively. */
+const isHttpURL = (url: string): boolean => {
+  try {
+    const { protocol } = new URL(url)
+
+    return protocol === "http:" || protocol === "https:"
+  } catch {
+    return false
+  }
+}
+
+type Change = readonly [account: chrome.identity.AccountInfo, signedIn: boolean]
 
 /**
- * An in-memory identity API. `launchWebAuthFlow` plays scripted outcomes in order; an
- * unscripted flow rejects as Chrome does when the user closes the window (interactive) or
- * interaction would be needed (non-interactive). `getAuthToken` serves its token cache,
- * keyed by the requested scope set: a miss rejects when non-interactive, and otherwise
- * consumes the next token queued with `controls.grantNext`, as a consent screen would,
- * rejecting when none is queued. A signed-out profile rejects every token request.
- * `signIn` / `signOut` change the profile and emit `onSignInChanged`; signing out empties
- * the cache. Every call can be failed once with `controls.failNext`.
+ * An in-memory identity API. `getRedirectURL` appends the path to `redirectURL` without
+ * doubling its slash. `launchWebAuthFlow` plays scripted outcomes in order; an unscripted
+ * flow rejects as Chrome does when the user closes the window (interactive) or interaction
+ * would be needed (non-interactive), and a URL that is not http or https rejects before
+ * anything is played. `getAuthToken` rejects an explicitly empty `scopes` list as Chrome
+ * does, then serves its token cache, keyed by the requested scope set (order and duplicates
+ * ignored; omitted scopes stand for the manifest's): a miss rejects when non-interactive,
+ * and otherwise consumes the next token queued with `controls.grantNext`, as a consent
+ * screen would, rejecting when none is queued. A signed-out profile, or an `account` other
+ * than the signed-in one, rejects every token request. `getProfileUserInfo` returns empty
+ * fields when signed out, or when the account does not sync and `accountStatus` is not
+ * `"ANY"`. `getAccounts` lists the signed-in account. `signIn` / `signOut` change the
+ * profile and emit `onSignInChanged` when the signed-in account changes; signing in as a
+ * different account first signs the current one out, and signing out empties the cache.
+ * The profile changes before any listener runs, and changes a listener makes (signing
+ * another account in) are delivered after the ones being delivered, so the events always
+ * replay to the current profile. Every call can be failed once per queued cause with
+ * `controls.failNext`.
  */
 export const makeIdentity = (options: IdentityOptions = {}) => {
   const redirectURL = options.redirectURL ?? "https://test-extension-id.chromiumapp.org/"
@@ -47,7 +83,22 @@ export const makeIdentity = (options: IdentityOptions = {}) => {
   const flows: Array<chrome.identity.WebAuthFlowDetails> = []
   const grants: Array<string> = []
   const cache = new Map<string, CachedToken>()
-  let profile: chrome.identity.ProfileUserInfo = signedOut
+  let profile: Profile | undefined
+  const undelivered: Array<Change> = []
+  let delivering = false
+
+  /** Queues sign-in changes and, unless listeners are already running, delivers them in order. */
+  const notify = (...changes: ReadonlyArray<Change>) => {
+    undelivered.push(...changes)
+
+    if (delivering) return
+
+    delivering = true
+
+    for (let next = undelivered.shift(); next !== undefined; next = undelivered.shift()) signInChanged.controls.emit(...next)
+
+    delivering = false
+  }
 
   const check = (operation: IdentityOperation) => {
     const queue = failures.get(operation)
@@ -55,14 +106,26 @@ export const makeIdentity = (options: IdentityOptions = {}) => {
     if (queue !== undefined && queue.length > 0) throw queue.shift()
   }
 
+  const signOut = () => {
+    if (profile === undefined) return
+
+    const { id } = profile.user
+    profile = undefined
+    cache.clear()
+    notify([{ id }, false])
+  }
+
   const api: ChromeIdentity.ChromeIdentityApi = {
     getRedirectURL: (path) => {
       check("getRedirectURL")
 
-      return `${redirectURL}${(path ?? "").replace(/^\//, "")}`
+      return `${redirectURL.replace(/\/$/, "")}/${(path ?? "").replace(/^\//, "")}`
     },
     launchWebAuthFlow: async (details) => {
       check("launchWebAuthFlow")
+
+      if (!isHttpURL(details.url)) throw new Error("The auth url has an invalid scheme. Only http:// and https:// schemes are allowed.")
+
       flows.push(structuredClone(details))
       const outcome = outcomes.shift()
 
@@ -77,7 +140,11 @@ export const makeIdentity = (options: IdentityOptions = {}) => {
     getAuthToken: async (details = {}) => {
       check("getAuthToken")
 
-      if (profile.id === "") throw new Error("The user is not signed in.")
+      if (details.scopes?.length === 0) throw new Error("Invalid OAuth2 scopes.")
+
+      if (profile === undefined || (details.account !== undefined && details.account.id !== profile.user.id)) {
+        throw new Error("The user is not signed in.")
+      }
 
       const key = scopesKey(details.scopes)
       const cached = cache.get(key)
@@ -90,7 +157,7 @@ export const makeIdentity = (options: IdentityOptions = {}) => {
 
       if (token === undefined) throw new Error("The user did not approve access.")
 
-      const granted: CachedToken = { token, grantedScopes: Array.from(details.scopes ?? []) }
+      const granted: CachedToken = { token, grantedScopes: scopeSet(details.scopes) }
       cache.set(key, granted)
 
       return { token, grantedScopes: Array.from(granted.grantedScopes) }
@@ -106,10 +173,17 @@ export const makeIdentity = (options: IdentityOptions = {}) => {
       check("clearAllCachedAuthTokens")
       cache.clear()
     },
-    getProfileUserInfo: async () => {
+    getProfileUserInfo: async (details = {}) => {
       check("getProfileUserInfo")
 
-      return { ...profile }
+      if (profile === undefined || (!profile.syncing && details.accountStatus !== "ANY")) return signedOut()
+
+      return { ...profile.user }
+    },
+    getAccounts: async () => {
+      check("getAccounts")
+
+      return profile === undefined ? [] : [{ id: profile.user.id }]
     },
     onSignInChanged: signInChanged.api,
     ...options.overrides
@@ -130,22 +204,39 @@ export const makeIdentity = (options: IdentityOptions = {}) => {
       rejectNextFlow: (cause: unknown) => { outcomes.push({ reject: cause }) },
       /** Queues a token the next interactive cache miss grants. */
       grantNext: (token: string) => { grants.push(token) },
-      /** Caches a token for a scope set, as if consent had been given earlier. */
+      /** Caches a token for a scope set (none: the manifest's), as if consent had been given earlier. */
       cacheToken: (token: string, scopes: ReadonlyArray<string> = []) => {
-        cache.set(scopesKey(scopes), { token, grantedScopes: Array.from(scopes) })
+        cache.set(scopesKey(scopes), { token, grantedScopes: scopeSet(scopes) })
       },
       /** The cached tokens, in caching order. */
       cachedTokens: (): Array<string> => Array.from(cache.values(), (cached) => cached.token),
-      signIn: (user: chrome.identity.ProfileUserInfo) => {
-        profile = { ...user }
-        signInChanged.controls.emit({ id: user.id }, true)
-      },
-      signOut: () => {
-        const { id } = profile
-        profile = signedOut
+      /**
+       * Signs an account in. Emits `onSignInChanged` unless that account is already signed
+       * in, in which case only its details and sync state change.
+       */
+      signIn: (user: chrome.identity.ProfileUserInfo, signInOptions: SignInOptions = {}) => {
+        const syncing = signInOptions.syncing ?? true
+
+        if (profile !== undefined && profile.user.id === user.id) {
+          profile = { user: { ...user }, syncing }
+
+          return
+        }
+
+        const previous = profile
+        profile = { user: { ...user }, syncing }
+
+        if (previous === undefined) {
+          notify([{ id: user.id }, true])
+
+          return
+        }
+
         cache.clear()
-        signInChanged.controls.emit({ id }, false)
+        notify([{ id: previous.user.id }, false], [{ id: user.id }, true])
       },
+      /** Signs the current account out, emptying the token cache; does nothing when signed out. */
+      signOut,
       failNext: (operation: IdentityOperation, cause: unknown) => {
         const queue = failures.get(operation) ?? []
         queue.push(cause)
