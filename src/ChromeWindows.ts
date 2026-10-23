@@ -9,12 +9,21 @@ export class ChromeWindowsError extends Schema.TaggedError<ChromeWindowsError>()
 
 export type WindowType = `${chrome.windows.WindowType}`
 
+export type WindowState = `${chrome.windows.WindowState}`
+
+/** `chrome.windows.WINDOW_ID_NONE`: no Chrome window, as reported when Chrome loses focus. */
+export const WINDOW_ID_NONE = -1
+
+/** `chrome.windows.WINDOW_ID_CURRENT`: addresses the current window wherever a window id is taken. */
+export const WINDOW_ID_CURRENT = -2
+
 /**
- * Restricts window events to these window types. Without one, Chrome reports normal, popup,
- * app and panel windows, the last two only when the extension owns them.
+ * Restricts window events to these window types; an empty list matches no window. Without a
+ * filter Chrome reports normal and popup windows, plus app and panel windows the extension
+ * owns, but never devtools windows.
  */
 export interface WindowEventFilter {
-  windowTypes: Array<WindowType>
+  readonly windowTypes: ReadonlyArray<WindowType>
 }
 
 /** A windows event whose `addListener` accepts an optional window-type filter. */
@@ -23,7 +32,7 @@ export interface FilteredWindowEvent<Args extends ReadonlyArray<unknown>> {
   removeListener(listener: (...args: Args) => void): void
 }
 
-/** The Promise-based MV3 subset this module needs. */
+/** The Promise-based MV3 subset this module needs: every `chrome.windows` method and event. */
 export interface ChromeWindowsApi {
   get(windowId: number, queryOptions?: chrome.windows.QueryOptions): Promise<chrome.windows.Window>
   getCurrent(queryOptions?: chrome.windows.QueryOptions): Promise<chrome.windows.Window>
@@ -38,18 +47,39 @@ export interface ChromeWindowsApi {
   readonly onBoundsChanged: EventSource<[window: chrome.windows.Window]>
 }
 
+/**
+ * The Effect API over `chrome.windows`. Every window id accepts `WINDOW_ID_CURRENT`. Queries
+ * without `windowTypes` see normal and popup windows only, and windows of incognito profiles
+ * only when the extension may run in incognito.
+ */
 export interface ChromeWindowsService {
+  /** The window with this id; fails when it does not exist or `windowTypes` excludes it. */
   readonly get: (windowId: number, queryOptions?: chrome.windows.QueryOptions) => Effect.Effect<chrome.windows.Window, ChromeWindowsError>
-  /** The window of the calling context; in a service worker, the last focused window. */
+  /**
+   * The window containing the calling code, which need not be the focused one; a service
+   * worker has none and gets the last active window instead.
+   */
   readonly getCurrent: (queryOptions?: chrome.windows.QueryOptions) => Effect.Effect<chrome.windows.Window, ChromeWindowsError>
-  /** The most recently focused window, normal or popup unless `windowTypes` says otherwise. */
+  /** The most recently focused window; fails when no window matches. */
   readonly getLastFocused: (queryOptions?: chrome.windows.QueryOptions) => Effect.Effect<chrome.windows.Window, ChromeWindowsError>
-  /** Every window, normal or popup unless `windowTypes` says otherwise. */
+  /** Every matching window; an empty list when none does. */
   readonly getAll: (queryOptions?: chrome.windows.QueryOptions) => Effect.Effect<Array<chrome.windows.Window>, ChromeWindowsError>
-  /** Opens a window; None when Chrome reports no window, as when incognito is not allowed. */
+  /**
+   * Opens a window, focused unless `focused: false`. None when Chrome hides the result: an
+   * incognito window opened by an extension not allowed in incognito. The `minimized`,
+   * `maximized` and `fullscreen` states cannot be combined with bounds, `minimized` not with
+   * `focused: true`, and the other two not with `focused: false`; `setSelfAsOpener` fails in
+   * a service worker.
+   */
   readonly create: (createData?: chrome.windows.CreateData) => Effect.Effect<Option.Option<chrome.windows.Window>, ChromeWindowsError>
+  /**
+   * Changes only the given properties. A non-normal `state` cannot be combined with bounds,
+   * `focused: true` not with `minimized`, and `focused: false` not with `maximized` or
+   * `fullscreen`. `focused: false` brings the next window to the front; `drawAttention`
+   * flashes the window without focusing it.
+   */
   readonly update: (windowId: number, updateInfo: chrome.windows.UpdateInfo) => Effect.Effect<chrome.windows.Window, ChromeWindowsError>
-  /** Brings a window to the front. */
+  /** Brings a window to the front: `update(windowId, { focused: true })`, failing as `"update"`. */
   readonly focus: (windowId: number) => Effect.Effect<chrome.windows.Window, ChromeWindowsError>
   /** Closes a window and its tabs. */
   readonly remove: (windowId: number) => Effect.Effect<void, ChromeWindowsError>
@@ -61,20 +91,23 @@ export interface ChromeWindowsService {
   readonly onCreated: (filter?: WindowEventFilter) => Stream.Stream<chrome.windows.Window, ChromeWindowsError>
   /** Ids of closed windows. */
   readonly onRemoved: (filter?: WindowEventFilter) => Stream.Stream<number, ChromeWindowsError>
-  /** Ids of newly focused windows; -1 (`WINDOW_ID_NONE`) when Chrome loses focus. */
+  /**
+   * Ids of newly focused windows. Every focus change is reported: `WINDOW_ID_NONE` (-1) when
+   * Chrome loses focus, and also when the focused window is one this subscription cannot see
+   * (excluded by `filter` or the default types, or an inaccessible incognito window). On some
+   * Linux window managers -1 precedes every switch between Chrome windows.
+   */
   readonly onFocusChanged: (filter?: WindowEventFilter) => Stream.Stream<number, ChromeWindowsError>
-  /** Windows whose position or size finished changing. */
+  /**
+   * Windows whose new bounds were committed, not in-progress drags. Not filterable: it covers
+   * the windows an unfiltered listener sees, never devtools windows.
+   */
   readonly onBoundsChanged: Stream.Stream<chrome.windows.Window, ChromeWindowsError>
 }
 
 export class ChromeWindows extends Context.Service<ChromeWindows, ChromeWindowsService>()("effect-platform-chrome/ChromeWindows") {}
 
 const invoke = invoker((operation, cause) => new ChromeWindowsError({ operation, cause }))
-
-/** Calls a Chrome method whose only argument is optional, omitting it when absent. */
-const withOptional = <I, A>(operation: string, call: (...input: [] | [I]) => Promise<A>) =>
-  (input?: I): Effect.Effect<A, ChromeWindowsError> =>
-    invoke(operation, () => input === undefined ? call() : call(input))
 
 /** Binds an optional filter, so Chrome never receives an explicit undefined. */
 const filtered = <Args extends ReadonlyArray<unknown>>(
@@ -100,12 +133,18 @@ export const make = (api: ChromeWindowsApi): ChromeWindowsService => {
     get: (windowId, queryOptions) => invoke("get", () => queryOptions === undefined
       ? api.get(windowId)
       : api.get(windowId, queryOptions)),
-    getCurrent: withOptional("getCurrent", (...args) => api.getCurrent(...args)),
-    getLastFocused: withOptional("getLastFocused", (...args) => api.getLastFocused(...args)),
-    getAll: withOptional("getAll", (...args) => api.getAll(...args)),
-    create: (createData) => withOptional("create", (...args: [] | [chrome.windows.CreateData]) => api.create(...args))(createData).pipe(
-      Effect.map(Option.fromNullishOr)
-    ),
+    getCurrent: (queryOptions) => invoke("getCurrent", () => queryOptions === undefined
+      ? api.getCurrent()
+      : api.getCurrent(queryOptions)),
+    getLastFocused: (queryOptions) => invoke("getLastFocused", () => queryOptions === undefined
+      ? api.getLastFocused()
+      : api.getLastFocused(queryOptions)),
+    getAll: (queryOptions) => invoke("getAll", () => queryOptions === undefined
+      ? api.getAll()
+      : api.getAll(queryOptions)),
+    create: (createData) => invoke("create", () => createData === undefined
+      ? api.create()
+      : api.create(createData)).pipe(Effect.map(Option.fromNullishOr)),
     update,
     focus: (windowId) => update(windowId, { focused: true }),
     remove: (windowId) => invoke("remove", () => api.remove(windowId)),
