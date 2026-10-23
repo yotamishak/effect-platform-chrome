@@ -107,7 +107,7 @@ const makeFilterableEvent = <Details extends { readonly url: string }>() => {
   }
 }
 
-/** Options for a simulated cross-document navigation. */
+/** Options for a simulated navigation or same-document update. */
 export interface NavigateOptions {
   readonly frameId?: number
   readonly transitionType?: ChromeWebNavigation.Navigation["transitionType"]
@@ -117,9 +117,12 @@ export interface NavigateOptions {
 /**
  * In-memory frames per tab and filter-aware webNavigation events. Seed frames with
  * `controls.addFrame`, then drive `navigate` (onBeforeNavigate, onCommitted,
- * onDOMContentLoaded, onCompleted) or `failNavigation` (onBeforeNavigate, onErrorOccurred).
+ * onDOMContentLoaded, onCompleted), `failNavigation` (onBeforeNavigate, onErrorOccurred),
+ * `updateHistoryState` and `updateReferenceFragment` (same-document updates),
+ * `openNavigationTarget` (onCreatedNavigationTarget) or `replaceTab` (onTabReplaced).
  * Each listener receives only events matching its filter; see `matchesNavigationFilter` for
- * the honoured UrlFilter keys. Timestamps come from a counter, not the wall clock, and
+ * the honoured UrlFilter keys. Unknown tabs read as Chrome reports them: `getAllFrames` and
+ * `getFrame` resolve to null. Timestamps come from a counter, not the wall clock, and
  * document ids are `document-<n>`. Pass `overrides` to replace any API member.
  */
 export const makeWebNavigation = (overrides: Partial<ChromeWebNavigation.ChromeWebNavigationApi> = {}) => {
@@ -194,6 +197,26 @@ export const makeWebNavigation = (overrides: Partial<ChromeWebNavigation.ChromeW
     return details
   }
 
+  const sameDocument = (
+    emit: (details: ChromeWebNavigation.Navigation) => void,
+    tabId: number,
+    url: string,
+    options: NavigateOptions
+  ): ChromeWebNavigation.Navigation => {
+    const current = frameOf(tabId, options.frameId ?? 0)
+    current.url = url
+
+    const navigation: ChromeWebNavigation.Navigation = {
+      ...document(tabId, current),
+      transitionType: options.transitionType ?? "link",
+      transitionQualifiers: options.transitionQualifiers ?? []
+    }
+
+    emit(navigation)
+
+    return navigation
+  }
+
   const api: ChromeWebNavigation.ChromeWebNavigationApi = {
     getAllFrames: async ({ tabId }) => {
       const frames = tabs.get(tabId)
@@ -233,7 +256,12 @@ export const makeWebNavigation = (overrides: Partial<ChromeWebNavigation.ChromeW
     controls: {
       /** Adds or replaces a frame (top frame by default) and returns it. */
       addFrame,
-      frame: (tabId: number, frameId = 0): ChromeWebNavigation.Frame | undefined => tabs.get(tabId)?.get(frameId),
+      /** A copy of a frame's current state, or undefined when the fixture has no such frame. */
+      frame: (tabId: number, frameId = 0): ChromeWebNavigation.Frame | undefined => {
+        const frame = tabs.get(tabId)?.get(frameId)
+
+        return frame === undefined ? undefined : structuredClone(frame)
+      },
       /** Forgets a closed tab's frames; `getAllFrames` then resolves to null, as Chrome does. */
       removeTab: (tabId: number) => { tabs.delete(tabId) },
       /**
@@ -273,10 +301,39 @@ export const makeWebNavigation = (overrides: Partial<ChromeWebNavigation.ChromeW
         start(tabId, current, url)
         current.errorOccurred = true
 
-        const failure: ChromeWebNavigation.NavigationFailure = { ...document(tabId, current), url, error }
+        // Chrome reports the deprecated processId of a failed navigation as -1.
+        const failure: ChromeWebNavigation.NavigationFailure = { ...document(tabId, current), url, processId: -1, error }
         errorOccurred.controls.emit(failure)
 
         return failure
+      },
+      /**
+       * A same-document `history.pushState` (or `replaceState`) in a frame: the frame's URL
+       * changes, its document stays, and onHistoryStateUpdated fires. Returns the details.
+       */
+      updateHistoryState: (tabId: number, url: string, options: NavigateOptions = {}): ChromeWebNavigation.Navigation =>
+        sameDocument((details) => { historyStateUpdated.controls.emit(details) }, tabId, url, options),
+      /**
+       * A same-document fragment change in a frame: the frame's URL changes, its document
+       * stays, and onReferenceFragmentUpdated fires. Returns the details.
+       */
+      updateReferenceFragment: (tabId: number, url: string, options: NavigateOptions = {}): ChromeWebNavigation.Navigation =>
+        sameDocument((details) => { referenceFragmentUpdated.controls.emit(details) }, tabId, url, options),
+      /**
+       * A frame of `sourceTabId` opening `url` in the new tab `tabId`: emits
+       * onCreatedNavigationTarget, matched against `url`. Navigate the new tab afterwards to
+       * load it, as Chrome does.
+       */
+      openNavigationTarget: (sourceTabId: number, tabId: number, url: string, sourceFrameId = 0): ChromeWebNavigation.NavigationTarget => {
+        const source = frameOf(sourceTabId, sourceFrameId)
+
+        const target: ChromeWebNavigation.NavigationTarget = {
+          sourceTabId, sourceFrameId, sourceProcessId: source.processId, tabId, url, timeStamp: ++clock
+        }
+
+        createdNavigationTarget.controls.emit(target)
+
+        return target
       },
       /** Moves the replaced tab's frames to `tabId` and emits onTabReplaced. */
       replaceTab: (replacedTabId: number, tabId: number): ChromeWebNavigation.TabReplacement => {
