@@ -88,21 +88,36 @@ const install = (tabId: number) => Effect.gen(function*() {
 
 `insertCSS` / `removeCSS` accept Chrome's `CSSInjection` union (exactly one of `css` or `files`) and preserve target/origin. To remove CSS, its content/files and origin must exactly match the insertion. Removing absent CSS is a Chrome no-op.
 
-Registration accepts `RegisteredContentScript[]`, preserving matches, exclusions, files, world, run timing, frame options, and persistence. Supply `matches` when registering even though the pinned Chrome types make it optional. `ContentScriptUpdate` requires `id` and allows partial property updates, including id-only updates; this corrects the pinned typings' overly restrictive reuse of the registration shape. Chrome validates IDs/files and rejects invalid registration/update batches; this adapter does not retry, roll back, or unregister on failure.
+Registration accepts `ContentScriptRegistration[]`: Chrome's `RegisteredContentScript` with `matches` required (Chrome rejects a registration without it even though its typings make it optional) and at least one of `js` or `css`. Matches, exclusions, files, world, run timing, frame options and persistence are forwarded unchanged. `ContentScriptUpdate` requires `id` and allows partial property updates, including id-only updates. It has no `world` field: Chrome never changes a registered script's world on update, so unregister and register again to move a script. Chrome validates IDs/files and rejects invalid registration/update batches as a whole; this adapter does not retry, roll back, or unregister on failure.
 
-`getRegisteredContentScripts(filter?)` and `unregisterContentScripts(filter?)` are functions. Omitted/undefined filters call Chrome with no argument; `{}`, `{ ids: [] }`, and explicit ID lists are forwarded unchanged. **An omitted unregister filter removes all this extension's dynamic content scripts.** Check Chrome's filter semantics before passing an empty filter. Registration persists according to Chrome's options, not Effect scope. There is deliberately no automatic unregister finalizer: it could remove scripts owned elsewhere, and Chrome can stop a worker without running finalizers. Unregistering does not remove code or styles already injected into a document.
+`getRegisteredContentScripts(filter?)` and `unregisterContentScripts(filter?)` are functions. Omitted/undefined filters call Chrome with no argument; `{}`, `{ ids: [] }`, and explicit ID lists are forwarded unchanged. **An omitted unregister filter, `{}`, and `{ ids: [] }` all remove every dynamic content script of this extension**: Chrome treats an empty `ids` list like no filter. Guard computed ID lists before unregistering them:
+
+```typescript
+const unregisterOwned = (ids: Array<string>) => Effect.gen(function*() {
+  const scripting = yield* ChromeScripting
+  if (ids.length > 0) yield* scripting.unregisterContentScripts({ ids })
+})
+```
+
+Unregistering an unknown ID fails without removing anything. Registration persists according to Chrome's options, not Effect scope. There is deliberately no automatic unregister finalizer: it could remove scripts owned elsewhere, and Chrome can stop a worker without running finalizers. Unregistering does not remove code or styles already injected into a document.
 
 ## Errors and execution
 
 Every method returns a lazy `Effect<..., ChromeScriptingError>`. Synchronous API throws and rejected Promises retain `operation` and the original `cause`; unavailable live contexts use operation `"initialize"`. Re-running the same Effect calls Chrome again. Effects are not memoized and do not clone options; avoid mutating options before or during execution. Interruption cannot cancel or undo browser work already dispatched. This module uses only native Chrome scripting APIs, not remote code evaluation, permission changes, or managed script ownership.
 
-The seven public operations are `executeScript`, `insertCSS`, `removeCSS`, `registerContentScripts`, `getRegisteredContentScripts`, `updateContentScripts`, and `unregisterContentScripts`. Callback overloads are intentionally represented by Effects rather than exposed; Promise options and result metadata are preserved.
+The seven public operations are `executeScript`, `insertCSS`, `removeCSS`, `registerContentScripts`, `getRegisteredContentScripts`, `updateContentScripts`, and `unregisterContentScripts`, Chrome's whole `chrome.scripting` namespace (it has no events). Callback overloads are intentionally represented by Effects rather than exposed; Promise options and result metadata are preserved. The module re-exports Chrome's types under short names: `InjectionTarget`, `InjectionResult`, `CSSInjection`, `StyleOrigin`, `ExecutionWorld`, `RegisteredContentScript`, `ContentScriptFilter`, plus its own `ContentScriptRegistration`, `ContentScriptUpdate`, `FunctionInjection` and `FileInjection`.
+
+## Testing
+
+`makeScripting(overrides?)` from `effect-platform-chrome/testing/Scripting` returns `{ api, layer, controls }`: an in-memory `chrome.scripting` modelled on Chromium. `controls.setTab(tabId, frames?)`, `navigate` and `removeTab` describe tabs and frames (a frame may carry a `url` such as `chrome://…` or an `error` to make it unreachable), `addFile(path, evaluate?)` packages files, and `styles()`, `scripts()` and `pending()` snapshot the state. Targets, files, IDs and batches are validated the way Chrome does, with Chrome-like messages; a lone unreachable frame rejects while a wider target leaves it out. Functions run locally, once per frame, with JSON-cloned arguments and results (closures are not stripped). `failNext`, `throwNext` and `holdNext` inject one rejection, one synchronous throw, or a pause where Chrome goes asynchronous; `restart()` drops tabs, styles and non-persistent scripts.
 
 ## Stress coverage
 
-Injected tests replay 4096 executions, preserving option/result identity, empty
-arrays, missing frame results and frame ordering. Mocked native rejections cover
-revoked grants, disappearing tabs/frames and serialization failures; a later
-execution remains fresh. Optional/rest tuples are typechecked. Nonserializable
-arguments are forwarded unchanged and never executed by the adapter; these tests
-do not emulate Chrome serialization or inject code into a browser.
+`test/stress/ChromeScripting.stress.test.ts` settles 2,048 concurrent calls across all seven
+operations with seeded, interleaved rejections and synchronous throws (each mapped to the
+right `operation` and `cause`); interrupts 512 calls before, while and after Chrome holds them;
+replays one Effect 4,096 times; and drives the fixture with 4,096 registrations, racing
+duplicate registrations/updates/unregistrations, an empty-`ids` unregister racing targeted
+ones, scoped registrations interrupted mid-acquire and mid-release, 100 injections into a
+64-frame tab, and 4,096 balanced CSS insertions and removals across navigations. These tests
+do not emulate Chrome serialization exactly or inject code into a browser.

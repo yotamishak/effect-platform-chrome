@@ -6,6 +6,8 @@ Effect services/layers, and scoped listener cleanup. Never access Chrome globals
 at import time. Wakeup listeners must register synchronously at worker startup;
 Chrome may stop workers without executing finalizers.
 
+New and changed Chrome modules follow `docs/CONVENTIONS.md`.
+
 ## Effect guidance and local reference
 
 Before changing Effect patterns, run `npm run effect-solutions -- list` and

@@ -1,8 +1,8 @@
-# WXT example: all twelve Chrome integrations
+# WXT example: Chrome integrations and isolated module stress
 
 Vanilla TypeScript, WXT **0.21.4**, Effect **4.0.4**, Chrome Manifest V3.
-The popup is example UI, not a library UI abstraction. No Action, SidePanel,
-or other UI-focused library modules are introduced.
+The popup is example UI, not a library UI abstraction. The opt-in module runner also
+exercises Action, SidePanel, and the additional Chrome integrations.
 
 ## Build and load
 
@@ -14,6 +14,7 @@ npm install
 npm run build
 cd examples/wxt
 npm ci
+npm run lint
 npm run typecheck
 npm run build
 ```
@@ -42,12 +43,12 @@ bootstrap deliberately keeps the worker alive.
 | **ChromePort** | **Connect** logs the background greeting and an automatic echo, then **Send value** produces another echo. **Disconnect / close scope** interrupts the popup fiber and releases its owned native port. Reconnect works; closing the popup also ends the background's scoped adopted connection. Initial sends wait for a greeting because adoption is gated by worker initialization. |
 | **ChromeTabs** | **Query tabs** lists current-window tabs. **Open example.com** explicitly creates a tab; reopening the popup and clicking **Message example.com content script** returns the page title/URL. Refresh an existing example.com tab after installing/reloading the extension so its script is present. Create/update/remove/activate events are observed while the popup is open. Nothing navigates or closes existing tabs automatically. |
 | **ChromeAlarms** | **Schedule one-shot (~1 min)** creates only the demo alarm. **Query demo alarm** reads it and lists current alarms. **Clear demo alarm** clears only that name. Leaving the popup open shows an observational alarm event; the independent synchronous background wake handler saves the handled alarm in local storage. |
-| **ChromeServiceWorker** | **Worker / lifecycle / last alarm** shows initialization time, boot ID, last lifecycle event and last handled alarm. **Intentional handler error** produces a clean `{ok:false,error:{code:"HandlerFailed",...}}` response, not a hung response channel. Installation/startup and alarms use synchronous wake listeners; an extra synchronous tab-activation registration uses `worker.register`. |
+| **ChromeServiceWorker** | **Worker / lifecycle / last alarm** shows initialization time, boot ID, last lifecycle event and last handled alarm. **Intentional handler error** produces a clean `{ok:false,error:{code:"HandlerFailed",...}}` response, not a hung response channel. Installation/startup and alarms use synchronous wake listeners; an extra synchronous tab-activation listener is passed as `listeners: [ChromeServiceWorker.listen(...)]`. |
 | **ChromeRpc** | **Typed ping / fail / stream cancellation** opens a dedicated scoped port, waits for the adapter's Ping/Pong handshake, round-trips the input, decodes `DemoRejected`, and takes five streamed numbers (cancelling the remainder). The caller scope releases its connection; the worker's synchronous `onConnect` dispatch selects the RPC port name and serves until disconnect. |
 | **ChromeSchemaStorage** | **Validated local entry** writes a schema-validated version-1 envelope. **Seed v0 / migrate to v1** deliberately replaces only the demo entry with a legacy envelope, validates/migrates it, and writes back version 1. **Subscribe** observes the initial value and updates; **Stop subscription** interrupts its fiber and removes the listener. Closing the popup also releases it. |
 | **ChromePermissions** | **Contains / getAll** reads permission state. **Request example.com access** alone requests optional host access; its click handler calls `requestFromUserGesture` synchronously using an already-resolved service, before any asynchronous Effect execution. No scripted revocation. |
 | **ChromeScripting** | First request example.com access, activate an example.com tab, then click **Read active example.com title via injection**. A self-contained function returns title/URL from only that active target. It does not modify the page or inject into arbitrary tabs. Chrome remains authoritative if a target navigates between query and injection. |
-| **ChromeTesting** | `development/fixtures.ts` exports `fixtureExample()` with fresh storage/event/port fixtures, a migration, scoped subscription cleanup, and manually flushed port delivery. It is typechecked but not imported by any browser entrypoint. Run it in a development test host with `Effect.runPromise(fixtureExample())`; expected `received:7`, `frames:1`, `listeners:0`, `pendingFrames:0`. |
+| **ChromeTesting** | `development/fixtures.ts` exports `fixtureExample()` with fresh storage/event/port fixtures, a migration, scoped subscription cleanup, and manually flushed port delivery. The isolated module runner invokes 100 fresh examples in the browser; these are fixture checks, not native Chrome tests. Expected `received:7`, `frames:1`, `listeners:0`, `pendingFrames:0`. |
 
 ### Bounded browser stress
 
@@ -74,14 +75,131 @@ and **do not prove absence or presence of leaks**. Existing raw storage-change
 logging remains active and its display is capped at 24,000 characters. Browser
 stress is explicitly opt-in, not a build-time test or a benchmark guarantee.
 
+### Limits runner
+
+**Run limits** (or `await window.effectChromeLimits.run({ notifications, only })`) drives
+every module to the Chrome limit it meets in practice and reports, per stage, what it
+observed: counts, timings and Chrome's own refusal text. Stages are independent; a failing
+stage does not stop the rest. Open the popup from the toolbar button (or
+`chrome-extension://<id>/popup.html` in a tab) and keep it in front: Chrome throttles a
+hidden page's timers, and the timing checks only bound them loosely.
+
+It opens two background tabs on `https://example.com/?effect-limits=…`, where
+`entrypoints/limits.content.ts` builds a frame tree (four serving frames, one that listens
+on `onConnect` but never serves, one with no listener), and closes them at the end. Web
+pages are needed because `webNavigation` does not report extension pages. Everything it
+writes (storage keys, cookies on the reserved `limits.effect-platform-chrome.test` host,
+alarms, KV keys) uses its own names and is removed when the stage ends.
+
+| Stage | Limit it meets |
+| --- | --- |
+| `webNavigation.getAllFrames` ×2000 | 7 frames per call, 64 concurrent |
+| `tabs.connect` RPC fan-out, port churn | 2000 echoes over five frames; 300 connect/disconnect cycles |
+| `readyTimeout` | a port only another listener received: fails after the timeout, never sooner |
+| No listener | a port to a frame without `onConnect` fails at once |
+| `onHistoryStateUpdated` paced and burst | every update Chrome applied arrives, in order. Chrome caps history updates at about 200 per 10 s per frame and ignores the rest |
+| `onCommitted` | 50 sequential navigations |
+| Cookies | 120 set/read/removed; 400 on one host, where Chrome evicts the oldest past its per-domain cap |
+| Identity | 10,000 redirect URLs; failed non-interactive flows as typed errors |
+| Windows | 4000 reads |
+| `captureVisibleTab` | Chrome's per-second capture quota (needs `activeTab`: toolbar button only) |
+| Storage access levels | 800 alternations, then Chrome's defaults restored |
+| `finishAccepted` | 40 callers disconnect mid-call: the wrapped handler finishes, the plain one is interrupted |
+| Notifications (opt-in) | 50 create/clear and 200 updates of one id; shows real OS notifications |
+| Storage quotas | `local` and `session` refuse writes past 10 MB; `sync` refuses an item over 8 KB without writing |
+| Key-value store | 2000 keys, then a 4 MB binary value |
+| Alarms | Chrome keeps at most 500 per extension and refuses the rest |
+| Runtime messaging | 10,000 concurrent `sendMessage` round trips through `ChromeServiceWorker` |
+| Ports | 50 ports × 200 echoes in windows of 20; a 2000-message blast that overruns the 64-message sliding buffers |
+| RPC | 2048 concurrent calls on one port; a frame just under 1 MiB round-trips, one over is refused before sending |
+| Schema storage | 256 subscribers follow 100 writes to one entry |
+| Permissions, scripting | 5000 `contains`; 100 injections into all 7 frames (needs the example.com grant) |
+
+Two stages skip rather than fail where Chrome withholds what they need: capture without an
+`activeTab` grant, and scripting without the optional example.com access.
+
+`npm run build && npm run limits` runs it headlessly (add `-- --stress` for the original
+stress runner too) and exits non-zero on a failed stage. That run serves example.com
+locally, and Playwright's `--disable-ipc-flooding-protection` lifts Chrome's history cap,
+so a real profile is still the reference for the history stages.
+
+### Isolated module runner in your existing Chrome
+
+Build and reload this unpacked example after changing the harness. The expanded
+manifest grants the test host access to bookmarks, history, downloads, tab groups,
+sessions, management, context menus, idle, side panels, tab capture, debugger,
+offscreen documents, DNR, web requests, and user scripts. Host access stays limited
+to the reserved cookie host and optional example.com access.
+
+The playground has one card for each of the 37 modules. Use **Find a module** to
+filter the cards, then **Run stress test** on a card. Its status and expandable
+**Last test result** show counts, skips, errors, and cleanup results. Modules with
+targeted regressions also have a **Probe edge cases** button. The automation hook
+is unchanged:
+
+```js
+window.effectChromeModules.names
+await window.effectChromeModules.run("ChromeBookmarks")
+```
+
+Each call runs one module. New harnesses create uniquely named test resources and
+release only resources they own. Management and Sessions use read-only probes.
+Downloads writes a tiny test file and removes its file and download record.
+Gesture-dependent capture/panel operations, native keyboard/omnibox input, and
+unavailable platform APIs are reported explicitly rather than simulated as live
+successes. `ChromeTesting` runs fresh in-browser fixtures, not native Chrome APIs.
+The `-edgecases` runners intentionally report failed invariants when they reproduce
+an adapter defect; they do not hide those outcomes as successful stress tests.
+
+The CLI reuses one named `agent-browser` connection and saves its endpoint and
+extension ID in gitignored `.browser-stress/connection.json`:
+
+```sh
+npm run stress:live -- --port 62939 --extension YOUR_EXTENSION_ID
+# Subsequent runs reuse the saved connection:
+npm run stress:live -- ChromeBookmarks ChromeHistory
+```
+
+Reports are saved in `.browser-stress/report-*.json`. The daemon stays connected
+for subsequent calls. Chrome controls its own approval prompts; saved endpoint
+configuration does not grant or bypass browser permissions. Run this serially,
+with the runner tab open, so another task cannot replace its page mid-run.
+
+### Side-panel playground
+
+Click **Open side panel** in the playground header to keep the same module cards
+beside your active tab. The popup, full-tab view, and `sidepanel.html` share their
+rendering and controllers, with separate runtimes and scoped listeners per view.
+The panel uses a single-column layout at narrow widths.
+
+The **ChromeSidePanel** card provides **Inspect options / layout** and **Close
+side panel**. Opening uses `openFromUserGesture` synchronously from the click
+handler, after the service and current window have been resolved. The manifest
+sets `side_panel.default_path` to `sidepanel.html`; the toolbar action continues
+to open the popup. **Open in a tab** opens a full-size playground.
+
+### Linting the example
+
+`npm run lint` in this directory checks entrypoints, shared code, development
+fixtures, scripts, and WXT configuration with zero tolerated warnings.
+`.oxlintrc.json` extends the root configuration, including the recommended Effect
+preset and both vendored anti-slop plugins. It does not weaken or duplicate those
+rules. Generated output and local browser reports are ignored. The root lint
+command retains its library/test scope, so run both commands when editing both.
+
+Reports have named contracts; native messages are schema-decoded at boundaries.
+Narrow suppressions document actual untyped browser/logging boundaries and the
+pinned Effect 4.0.4 RPC/persistence APIs.
+
 ### Popup ↔ background ↔ content
 
 - Popup → background: `ChromeRuntime.sendMessageSchema`, decoded by the
   worker handler; `ChromeServiceWorker` wraps its result exactly once.
 - Content → background: the limited `https://example.com/*` content script
-  sends the same schema ping and logs its response in the **page** console.
+  sends the same schema ping through `ChromeRuntime.request`, which unwraps the
+  `ChromeMessage` envelope, and logs the value in the **page** console.
 - Popup → content: `ChromeTabs.sendMessage` addresses an example.com tab;
-  the content listener answers synchronously with a compatible success envelope.
+  the content listener answers synchronously with `ChromeMessage.succeed`.
 - Popup ↔ background port: both endpoints acquire owned, scoped wrappers;
   port stream completion or interruption releases their listeners/connections.
 
@@ -96,8 +214,8 @@ WXT 0.21.4's generated background entrypoint calls `definition.main()`
 synchronously. `entrypoints/background.ts` calls `ChromeServiceWorker.start`
 directly inside that callback, without awaiting anything. This installs message,
 port, install, startup and alarm listeners before layer construction and the
-deliberate 250 ms initialization delay. `worker.register` is also called before
-returning. Up to 32 events/messages can wait for initialization. The queue is
+deliberate 250 ms initialization delay, along with the tab-activation listener
+from `listeners`. Up to 32 events/messages can wait for initialization. The queue is
 in-memory, not durable; Chrome's message channel is not a permanent worker lease.
 
 To manually investigate wakeup:
@@ -128,6 +246,11 @@ ports. Observational stream buffers are bounded and sliding, not durable logs.
 - `alarms`: one-shot demo alarm and wake event.
 - `tabs`: tab title/URL queries and selecting an example.com message target.
 - `scripting`: explicit function injection into the active example.com tab.
+- `identity`, `webNavigation`, `cookies`, `notifications`, `activeTab`: the limits runner's
+  modules. Cookies are set only on the reserved `limits.effect-platform-chrome.test` host,
+  the one required host permission.
+- `web_accessible_resources`: the popup page and its chunks, for example.com only, so
+  automation that cannot type `chrome-extension://` URLs can open the runners from there.
 - Optional host permission: **only** `https://example.com/*`, requested only
   through the user button. Inspect **Contains / getAll** before/after the request.
 - Content script injection matches **only** `https://example.com/*`; no
@@ -139,11 +262,16 @@ named alarm. Sync storage writes remain subject to Chrome's sync quotas.
 
 ## Verification / limitations
 
-`npm run typecheck` and `npm run build` were run successfully. The generated
-manifest contains MV3, its popup, its limited content-script match,
-`storage`, `alarms`, `tabs`, `scripting` permissions and the optional example.com
-host permission. No real-browser automation or
-manual browser run was performed. In particular, actual worker suspension,
+Root validation and WXT typecheck/build passed. The expanded example was exercised
+module-by-module in real Chrome 155; results and confirmed regression failures are
+recorded in `../../docs/STRESS_AUDIT_2026-10-24.md`. Actual worker suspension,
 alarm wake timing, browser-restart startup events, managed enterprise policy,
-and cross-device sync remain **unverified in a real browser**; the steps above
-are a manual checklist, not claimed test results.
+and cross-device sync remain unverified by that run.
+
+After enabling inherited lint rules and adding the shared card/side-panel UI,
+both lint commands passed with zero warnings and the root suite passed all 2,962
+tests. Live verification covered all 41 module/regression runners (the same three
+known regression groups failed; UserScripts correctly skipped with its toggle
+off), the original six-stage stress run, port connect/send/disconnect, card
+filtering/results, and real side-panel open/inspect/close/reopen. Both the tab view
+and the 360px-wide native panel rendered all 37 cards without horizontal overflow.

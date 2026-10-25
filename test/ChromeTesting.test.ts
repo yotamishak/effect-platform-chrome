@@ -1,8 +1,39 @@
 // The pinned Effect v4 test integration is intentionally unstable and test-only.
 /* oxlint-disable effecttsgo/unstable-api-usage */
-import { Effect, Fiber, Schema, Stream } from "effect"
+import { Effect, Exit, Fiber, Option, Schema, Stream } from "effect"
 import { describe, expect, it } from "@effect/vitest"
-import { makeEvent, makePortPair, makeStorage } from "../src/ChromeTesting.js"
+import * as ChromeTesting from "../src/ChromeTesting.js"
+import { makeEvent, makePortPair, makeStorage, makeTabs } from "../src/ChromeTesting.js"
+import * as TestAction from "../src/testing/Action.js"
+import * as TestAlarms from "../src/testing/Alarms.js"
+import * as TestCommands from "../src/testing/Commands.js"
+import * as TestDebugger from "../src/testing/Debugger.js"
+import * as TestHistory from "../src/testing/History.js"
+import * as TestI18n from "../src/testing/I18n.js"
+import * as TestIdle from "../src/testing/Idle.js"
+import * as TestManagement from "../src/testing/Management.js"
+import * as TestScripting from "../src/testing/Scripting.js"
+import * as TestSessions from "../src/testing/Sessions.js"
+import * as TestTabCapture from "../src/testing/TabCapture.js"
+import * as TestTabGroups from "../src/testing/TabGroups.js"
+import * as TestUserScripts from "../src/testing/UserScripts.js"
+import * as TestWebRequest from "../src/testing/WebRequest.js"
+import * as TestBookmarks from "../src/testing/Bookmarks.js"
+import * as TestContextMenus from "../src/testing/ContextMenus.js"
+import * as TestCookies from "../src/testing/Cookies.js"
+import * as TestDeclarativeNetRequest from "../src/testing/DeclarativeNetRequest.js"
+import * as TestEvent from "../src/testing/Event.js"
+import * as TestIdentity from "../src/testing/Identity.js"
+import * as TestNotifications from "../src/testing/Notifications.js"
+import * as TestOffscreen from "../src/testing/Offscreen.js"
+import * as TestOmnibox from "../src/testing/Omnibox.js"
+import * as TestPort from "../src/testing/Port.js"
+import * as TestStorage from "../src/testing/Storage.js"
+import * as TestTabs from "../src/testing/Tabs.js"
+import * as TestWebNavigation from "../src/testing/WebNavigation.js"
+import * as TestWindows from "../src/testing/Windows.js"
+import * as ChromeTabs from "../src/ChromeTabs.js"
+import * as ChromeWindows from "../src/ChromeWindows.js"
 import * as ChromeStorage from "../src/ChromeStorage.js"
 import * as ChromePort from "../src/ChromePort.js"
 
@@ -11,6 +42,20 @@ interface CyclicMessage {
 }
 
 describe("ChromeTesting events", () => {
+  it.each([
+    TestAction, TestAlarms, TestBookmarks, TestCommands, TestContextMenus, TestCookies, TestDebugger,
+    TestDeclarativeNetRequest, TestEvent, TestHistory, TestI18n, TestIdentity, TestIdle, TestManagement,
+    TestNotifications, TestOffscreen, TestOmnibox, TestPort, TestScripting, TestSessions, TestStorage,
+    TestTabCapture, TestTabGroups, TestTabs, TestUserScripts, TestWebNavigation, TestWebRequest, TestWindows
+  ])("re-exports every value of each per-adapter fixture module unchanged", (fixture) => {
+    const barrel = new Map(Object.entries(ChromeTesting))
+    const entries = Object.entries(fixture)
+
+    expect(entries.length).toBeGreaterThan(0)
+
+    for (const [name, value] of entries) expect(barrel.get(name)).toBe(value)
+  })
+
   it.effect("keeps 4096-listener snapshots intact across reentrant removal and thrown callbacks", () => Effect.sync(() => {
     const event = makeEvent<[number]>()
     const seen: Array<[number, number]> = []
@@ -381,5 +426,219 @@ describe("ChromeTesting port pair", () => {
     expect(fixture.controls.right.disconnect.listenerCount).toBe(0)
     expect(fixture.controls.connected).toBe(false)
     fixture.controls.flush()
+  }))
+
+  it.effect("records storage access levels from Chrome's defaults", () => Effect.gen(function*() {
+    const fixture = makeStorage()
+    expect(fixture.controls.accessLevel("local")).toBe("TRUSTED_AND_UNTRUSTED_CONTEXTS")
+    expect(fixture.controls.accessLevel("session")).toBe("TRUSTED_CONTEXTS")
+    const storage = yield* ChromeStorage.ChromeStorage.pipe(Effect.provide(fixture.layer))
+    yield* storage.local.setAccessLevel("TRUSTED_CONTEXTS")
+    expect(fixture.controls.accessLevel("local")).toBe("TRUSTED_CONTEXTS")
+    fixture.controls.failNext("session", "setAccessLevel", new Error("denied"))
+    expect(yield* Effect.flip(storage.session.setAccessLevel("TRUSTED_CONTEXTS"))).toMatchObject({ operation: "setAccessLevel" })
+  }))
+})
+
+describe("ChromeTesting tabs", () => {
+  it.effect("keeps tabs in memory and emits their events", () => Effect.gen(function*() {
+    const fixture = makeTabs()
+    const tabs = yield* ChromeTabs.ChromeTabs.pipe(Effect.provide(fixture.layer))
+    const removed = yield* Effect.forkScoped(Stream.runCollect(Stream.take(tabs.onRemoved, 1)))
+    yield* Effect.promise(() => fixture.controls.onRemoved.waitForListener())
+    const created = yield* tabs.create({ url: "https://app.example/", active: false })
+    const seeded = fixture.controls.seed({ url: "https://other.example/", windowId: 2 })
+    expect(created.id).not.toBe(seeded.id)
+    expect((yield* tabs.query({ windowId: 2 })).map((tab) => tab.id)).toEqual([seeded.id])
+    expect((yield* tabs.query({ url: "https://app.example/" })).map((tab) => tab.id)).toEqual([created.id])
+    yield* tabs.update(created.id, { url: "https://app.example/next", active: true })
+    expect(yield* tabs.get(created.id ?? -1)).toMatchObject({ url: "https://app.example/next", active: true })
+    yield* tabs.remove(created.id ?? -1)
+    expect((yield* Fiber.join(removed))[0]?.tabId).toBe(created.id)
+    expect(yield* Effect.flip(tabs.get(created.id ?? -1))).toMatchObject({ operation: "get" })
+    expect(Exit.isFailure(yield* Effect.exit(tabs.sendMessage(seeded.id ?? -1, "hello")))).toBe(true)
+  }))
+
+  it.effect("hands out port pairs and accepts member overrides", () => Effect.gen(function*() {
+    let gets = 0
+
+    const fixture = makeTabs({
+      get: async (tabId) => {
+        gets++
+
+        return { ...fixture.controls.tab(tabId), id: tabId, index: 0, windowId: 1, highlighted: false, active: true, pinned: false, incognito: false, discarded: false, autoDiscardable: true, groupId: -1, frozen: false, selected: true, lastAccessed: 0, url: "about:blank" }
+      }
+    })
+
+    const tabs = yield* ChromeTabs.ChromeTabs.pipe(Effect.provide(fixture.layer))
+    expect((yield* tabs.get(4)).url).toBe("about:blank")
+    expect(gets).toBe(1)
+    const port = yield* tabs.connect(4, { name: "example-frame", frameId: 1 })
+    expect(port.name).toBe("example-frame")
+    expect(fixture.controls.connections).toHaveLength(1)
+    expect(fixture.controls.connections[0]).toMatchObject({ tabId: 4, connectInfo: { name: "example-frame", frameId: 1 } })
+    expect(yield* tabs.captureVisibleTab(1)).toBe("data:image/jpeg;base64,")
+  }))
+})
+
+describe("ChromeTesting tab strip", () => {
+  it.effect("orders tabs per window and emits move, detach and attach events", () => Effect.gen(function*() {
+    const fixture = makeTabs()
+    const tabs = yield* ChromeTabs.ChromeTabs.pipe(Effect.provide(fixture.layer))
+    const first = fixture.controls.seed().id ?? -1
+    const second = fixture.controls.seed().id ?? -1
+    const third = fixture.controls.seed().id ?? -1
+    const other = fixture.controls.seed({ windowId: 2 }).id ?? -1
+    const inserted = (yield* tabs.create({ windowId: 2, index: 0 })).id ?? -1
+    expect((yield* tabs.query({ windowId: 2 })).map((tab) => [tab.id, tab.index])).toEqual([[inserted, 0], [other, 1]])
+    const moved = yield* Effect.forkScoped(Stream.runCollect(Stream.take(tabs.onMoved, 1)))
+    const detached = yield* Effect.forkScoped(Stream.runCollect(Stream.take(tabs.onDetached, 1)))
+    const attached = yield* Effect.forkScoped(Stream.runCollect(Stream.take(tabs.onAttached, 1)))
+    yield* Effect.promise(() => Promise.all([
+      fixture.controls.onMoved.waitForListener(), fixture.controls.onDetached.waitForListener(), fixture.controls.onAttached.waitForListener()
+    ]))
+    expect((yield* tabs.move(first, { index: -1 })).map((tab) => tab.index)).toEqual([2])
+    expect((yield* tabs.move([second], { index: 1, windowId: 2 })).map((tab) => [tab.windowId, tab.index])).toEqual([[2, 1]])
+    expect(yield* Effect.all([Fiber.join(moved), Fiber.join(detached), Fiber.join(attached)])).toEqual([
+      [{ tabId: first, moveInfo: { windowId: 1, fromIndex: 0, toIndex: 2 } }],
+      [{ tabId: second, detachInfo: { oldWindowId: 1, oldPosition: 0 } }],
+      [{ tabId: second, attachInfo: { newWindowId: 2, newPosition: 1 } }]
+    ])
+    expect((yield* tabs.query({ windowId: 1 })).map((tab) => [tab.id, tab.index])).toEqual([[third, 0], [first, 1]])
+    expect((yield* tabs.query({ windowId: 2 })).map((tab) => tab.id)).toEqual([inserted, second, other])
+    yield* tabs.remove(inserted)
+    expect((yield* tabs.query({ windowId: 2 })).map((tab) => tab.index)).toEqual([0, 1])
+    expect(fixture.controls.onMoved.listenerCount + fixture.controls.onAttached.listenerCount).toBe(0)
+  }))
+
+  it.effect("duplicates, reloads, discards and groups tabs, emitting their updates", () => Effect.gen(function*() {
+    const fixture = makeTabs()
+    const tabs = yield* ChromeTabs.ChromeTabs.pipe(Effect.provide(fixture.layer))
+    const original = fixture.controls.seed({ url: "https://app.example/", pinned: true }).id ?? -1
+    const updates = yield* Effect.forkScoped(Stream.runCollect(Stream.take(tabs.onUpdated, 6)))
+    yield* Effect.promise(() => fixture.controls.onUpdated.waitForListener())
+    const copy = Option.getOrThrow(yield* tabs.duplicate(original))
+    const copyId = copy.id ?? -1
+    expect(copy).toMatchObject({ url: "https://app.example/", pinned: true, index: 1, active: true })
+    expect(copyId).not.toBe(original)
+    yield* tabs.reload(original, { bypassCache: true })
+    expect(yield* tabs.discard(original)).toEqual(Option.some(expect.objectContaining({ id: original, discarded: true })))
+    expect(yield* tabs.discard(original)).toEqual(Option.some(expect.objectContaining({ discarded: true })))
+    const groupId = yield* tabs.group({ tabIds: [original, copyId] })
+    expect(yield* tabs.group({ tabIds: original, groupId })).toBe(groupId)
+    expect((yield* tabs.query({ groupId })).map((tab) => tab.id)).toEqual([original, copyId])
+    yield* tabs.ungroup(original)
+    expect((yield* Fiber.join(updates)).map((update) => update.changeInfo)).toEqual([
+      { status: "loading" }, { status: "complete" }, { discarded: true }, { groupId }, { groupId }, { groupId: -1 }
+    ])
+    expect(fixture.controls.tab(original)).toMatchObject({ groupId: -1, status: "complete", discarded: true })
+    expect(yield* Effect.flip(tabs.group({ tabIds: original, groupId: 99 }))).toMatchObject({ operation: "group" })
+    yield* tabs.ungroup(copyId)
+    expect(yield* Effect.flip(tabs.group({ tabIds: original, groupId }))).toMatchObject({ operation: "group" })
+    expect(yield* Effect.flip(tabs.discard())).toMatchObject({ operation: "discard" })
+  }))
+
+  it.effect("keeps zoom per tab and rejects history navigation", () => Effect.gen(function*() {
+    const fixture = makeTabs()
+    const tabs = yield* ChromeTabs.ChromeTabs.pipe(Effect.provide(fixture.layer))
+    const background = fixture.controls.seed({ active: false }).id ?? -1
+    const active = fixture.controls.seed().id ?? -1
+    const zoomed = yield* Effect.forkScoped(Stream.runCollect(Stream.take(tabs.onZoomChange, 2)))
+    yield* Effect.promise(() => fixture.controls.onZoomChange.waitForListener())
+    yield* tabs.setZoom(background, 2)
+    yield* tabs.setZoom(background, 2)
+    yield* tabs.setZoom(undefined, 1.5)
+    expect([yield* tabs.getZoom(background), yield* tabs.getZoom()]).toEqual([2, 1.5])
+    expect((yield* Fiber.join(zoomed)).map((change) => [change.tabId, change.oldZoomFactor, change.newZoomFactor])).toEqual([
+      [background, 1, 2], [active, 1, 1.5]
+    ])
+    yield* tabs.setZoom(background, 0)
+    expect(yield* tabs.getZoom(background)).toBe(1)
+    yield* tabs.setZoomSettings(background, { mode: "manual" })
+    expect(yield* tabs.getZoomSettings(background)).toEqual({ mode: "manual", scope: "per-origin", defaultZoomFactor: 1 })
+    expect(yield* tabs.getZoomSettings()).toEqual({ mode: "automatic", scope: "per-origin", defaultZoomFactor: 1 })
+    expect(yield* tabs.detectLanguage(background)).toBe("und")
+    expect(yield* Effect.flip(tabs.goBack(background))).toMatchObject({ operation: "goBack" })
+    expect(yield* Effect.flip(tabs.goForward())).toMatchObject({ operation: "goForward" })
+    expect(yield* Effect.flip(tabs.getZoom(99))).toMatchObject({ operation: "getZoom" })
+  }))
+})
+
+describe("ChromeTesting windows", () => {
+  it.effect("tracks focus across create, update and remove", () => Effect.gen(function*() {
+    const fixture = TestWindows.makeWindows()
+    const windows = yield* ChromeWindows.ChromeWindows.pipe(Effect.provide(fixture.layer))
+    const focusChanges = yield* Effect.forkScoped(Stream.runCollect(Stream.take(windows.onFocusChanged(), 5)))
+    yield* Effect.promise(() => fixture.controls.onFocusChanged.waitForListener())
+    const first = Option.getOrThrow(yield* windows.create()).id ?? -1
+    const popup = Option.getOrThrow(yield* windows.create({ type: "popup", width: 400 }))
+    const second = popup.id ?? -1
+    const background = Option.getOrThrow(yield* windows.create({ focused: false })).id ?? -1
+    expect(popup).toMatchObject({ type: "popup", width: 400, focused: true })
+    expect((yield* windows.get(first)).focused).toBe(false)
+    expect(fixture.controls.focused).toBe(second)
+    yield* windows.focus(first)
+    yield* windows.remove(first)
+    expect(fixture.controls.focused).toBe(second)
+    expect((yield* windows.getLastFocused()).id).toBe(second)
+    expect((yield* windows.getCurrent()).id).toBe(second)
+    yield* windows.update(second, { focused: false })
+    expect(yield* Fiber.join(focusChanges)).toEqual([first, second, first, second, -1])
+    expect(fixture.controls.focused).toBe(-1)
+    expect((yield* windows.getLastFocused()).id).toBe(second)
+    expect((yield* windows.getAll()).map((window) => window.id)).toEqual([second, background])
+    expect((yield* windows.getAll({ windowTypes: ["normal"] })).map((window) => window.id)).toEqual([background])
+    expect(yield* Effect.flip(windows.get(first))).toMatchObject({ operation: "get" })
+    expect(yield* Effect.flip(windows.remove(first))).toMatchObject({ operation: "remove" })
+  }))
+
+  it.effect("honours window-type filters on events and queries", () => Effect.gen(function*() {
+    const fixture = TestWindows.makeWindows()
+    const unfiltered: Array<number> = []
+    const devtools: Array<number> = []
+    const popupsRemoved: Array<number> = []
+    const recordUnfiltered = (window: chrome.windows.Window) => { unfiltered.push(window.id ?? -1) }
+
+    fixture.api.onCreated.addListener(recordUnfiltered)
+    fixture.api.onCreated.addListener((window) => { devtools.push(window.id ?? -1) }, { windowTypes: ["devtools"] })
+    fixture.api.onRemoved.addListener((windowId) => { popupsRemoved.push(windowId) }, { windowTypes: ["popup"] })
+    const normal = fixture.controls.seed().id ?? -1
+    const tools = fixture.controls.seed({ type: "devtools", focused: true }).id ?? -1
+    const popup = (yield* Effect.promise(() => fixture.api.create({ type: "popup", focused: false })))?.id ?? -1
+    yield* Effect.promise(() => fixture.api.remove(normal))
+    yield* Effect.promise(() => fixture.api.remove(popup))
+    expect(unfiltered).toEqual([normal, popup])
+    expect(devtools).toEqual([tools])
+    expect(popupsRemoved).toEqual([popup])
+    fixture.api.onCreated.removeListener(recordUnfiltered)
+    expect(fixture.controls.onCreated.listenerCount).toBe(1)
+    const windows = yield* ChromeWindows.ChromeWindows.pipe(Effect.provide(fixture.layer))
+    expect(yield* Effect.flip(windows.get(tools))).toMatchObject({ operation: "get" })
+    expect((yield* windows.get(tools, { windowTypes: ["devtools"] })).id).toBe(tools)
+    expect(yield* Effect.flip(windows.getLastFocused())).toMatchObject({ operation: "getLastFocused" })
+    expect((yield* windows.getLastFocused({ windowTypes: ["devtools"] })).id).toBe(tools)
+  }))
+
+  it.effect("streams filtered creations and bounds changes through the service", () => Effect.gen(function*() {
+    const fixture = TestWindows.makeWindows()
+    const windows = yield* ChromeWindows.ChromeWindows.pipe(Effect.provide(fixture.layer))
+    const popups = yield* Effect.forkScoped(Stream.runCollect(Stream.take(windows.onCreated({ windowTypes: ["popup"] }), 1)))
+    yield* Effect.promise(() => fixture.controls.onCreated.waitForListener())
+    const bounds = yield* Effect.forkScoped(Stream.runCollect(Stream.take(windows.onBoundsChanged, 1)))
+    yield* Effect.promise(() => fixture.controls.onBoundsChanged.waitForListener())
+    const normal = Option.getOrThrow(yield* windows.create()).id ?? -1
+    const popup = Option.getOrThrow(yield* windows.create({ type: "popup" })).id ?? -1
+    yield* windows.update(normal, { state: "maximized" })
+    yield* windows.update(normal, { width: 1280, left: 10 })
+    expect((yield* Fiber.join(popups)).map((window) => window.id)).toEqual([popup])
+    expect(yield* Fiber.join(bounds)).toEqual([expect.objectContaining({ id: normal, left: 10, width: 1280, state: "maximized" })])
+    expect(fixture.controls.onCreated.listenerCount + fixture.controls.onBoundsChanged.listenerCount).toBe(0)
+  }))
+
+  it.effect("accepts member overrides", () => Effect.gen(function*() {
+    const fixture = TestWindows.makeWindows({ create: async () => undefined })
+    const windows = yield* ChromeWindows.ChromeWindows.pipe(Effect.provide(fixture.layer))
+    expect(yield* windows.create({ incognito: true })).toEqual(Option.none())
+    expect(yield* windows.getAll()).toEqual([])
   }))
 })

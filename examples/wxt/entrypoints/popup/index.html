@@ -1,55 +1,12 @@
 <!doctype html>
 <html lang="en">
-  <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Effect Chrome demo</title></head>
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Effect Chrome playground</title>
+  </head>
   <body>
-    <h1>Effect Chrome integrations</h1>
-    <p>Each section exercises a library module. Output is newest first.</p>
-    <section><h2>ChromeStorage</h2>
-      <label>Value <input id="value" value="Hello Effect"></label>
-      <button id="storage-write">Write local / sync / session</button>
-      <button id="storage-read">Read demo keys</button>
-      <button id="managed">Read managed policy (optional)</button>
-      <p>Live storage changes are observed while this popup is open.</p>
-    </section>
-    <section><h2>ChromeKeyValueStore</h2>
-      <button id="kv">Round-trip namespaced string + binary</button>
-      <button id="kv-clear">Clear only demo namespace</button>
-    </section>
-    <section><h2>ChromeRuntime + ChromeServiceWorker</h2>
-      <button id="metadata">Metadata</button><button id="ping">Schema ping</button>
-      <button id="status">Worker / lifecycle / last alarm</button><button id="fail">Intentional handler error</button>
-      <p>Worker listeners register synchronously; handlers wait for a 250 ms initialization gate.</p>
-    </section>
-    <section><h2>ChromePort</h2>
-      <button id="connect">Connect</button><button id="port-send">Send value</button><button id="disconnect">Disconnect / close scope</button>
-      <p>Close the popup to release its owned port and observational listeners.</p>
-    </section>
-    <section><h2>ChromeTabs + content messaging</h2>
-      <button id="tabs">Query tabs</button><button id="open">Open example.com</button>
-      <button id="content">Message example.com content script</button>
-      <p>No tabs are changed until Open is clicked. Created/updated/removed/activated events are observed here.</p>
-    </section>
-    <section><h2>ChromeAlarms</h2>
-      <button id="alarm-create">Schedule one-shot (~1 min)</button><button id="alarm-query">Query demo alarm</button><button id="alarm-clear">Clear demo alarm</button>
-      <p>Background wake handler saves its result in local storage. Popup stream is observational only.</p>
-    </section>
-    <section><h2>ChromeRpc</h2>
-      <button id="rpc-demo">Typed ping / fail / stream cancellation</button>
-    </section>
-    <section><h2>ChromeSchemaStorage</h2>
-      <button id="schema-write">Validated local entry</button><button id="schema-migrate">Seed v0 / migrate to v1</button>
-      <button id="schema-subscribe">Subscribe</button><button id="schema-stop">Stop subscription</button>
-    </section>
-    <section><h2>ChromePermissions + ChromeScripting</h2>
-      <button id="permissions">Contains / getAll</button><button id="permission-request">Request example.com access</button>
-      <button id="scripting">Read active example.com title via injection</button>
-      <p>Requests and injection happen only on explicit clicks. No permission removal.</p>
-    </section>
-    <section><h2>Bounded browser stress</h2>
-      <button id="stress">Run 100 / 1000 / 5000 RPC + local churn</button><button id="stress-cancel">Cancel stress</button>
-      <p>Keep popup open. Local-only isolated keys; five-minute deadline. Heap readings are approximate, not leak proof. ChromeTesting fixtures are development-only; see README.</p>
-    </section>
-    <pre id="output" aria-live="polite"></pre><button id="clear-output">Clear output</button>
+    <div id="app"></div>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

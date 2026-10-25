@@ -2,8 +2,9 @@
 /* oxlint-disable effecttsgo/unstable-api-usage */
 import { Effect, Exit, Layer, ManagedRuntime } from "effect"
 import { describe, expect, it, vi } from "@effect/vitest"
-import { start } from "../src/ChromeServiceWorker.js"
-import type { ChromeEvent, MessageListener, Response } from "../src/ChromeServiceWorker.js"
+import type { Mock } from "vitest"
+import { listen, listenPort, listenReply, start } from "../src/ChromeServiceWorker.js"
+import type { ChromeEvent, FilteredChromeEvent, MessageListener, Response } from "../src/ChromeServiceWorker.js"
 
 const event = <Listener>(): ChromeEvent<Listener> & { listeners: Set<Listener> } => {
   const listeners = new Set<Listener>()
@@ -31,6 +32,49 @@ const setup = () => {
   }
 
   return { chrome: { runtime: { onMessage, onStartup, onInstalled, onConnect }, alarms: { onAlarm } }, sender, send }
+}
+
+interface UrlFilter { readonly url: ReadonlyArray<{ readonly hostEquals: string }> }
+
+/** Like Chrome's webNavigation events, the filter is optional; every addListener call is recorded. */
+interface RecordedEvent<Listener> {
+  addListener(listener: Listener, filter?: UrlFilter): void
+  removeListener(listener: Listener): void
+  readonly listeners: Set<Listener>
+  readonly calls: Array<ReadonlyArray<Listener | UrlFilter | undefined>>
+}
+
+const filteredEvent = <Listener>(): RecordedEvent<Listener> => {
+  const calls: Array<ReadonlyArray<Listener | UrlFilter | undefined>> = []
+  const listeners = new Set<Listener>()
+
+  return {
+    listeners,
+    calls,
+    addListener: (...args) => {
+      calls.push(args)
+      listeners.add(args[0])
+    },
+    removeListener: (listener) => { listeners.delete(listener) }
+  }
+}
+
+interface RequestFilter { readonly urls: ReadonlyArray<string> }
+
+/** Like Chrome's webRequest events, addListener takes extra arguments; every call is recorded in full. */
+const recordingEvent = <Listener, Options extends ReadonlyArray<unknown>>() => {
+  const calls: Array<ReadonlyArray<Listener | Options[number]>> = []
+  const listeners = new Set<Listener>()
+
+  return {
+    listeners,
+    calls,
+    addListener: (listener: Listener, ...options: Options) => {
+      calls.push([listener, ...options])
+      listeners.add(listener)
+    },
+    removeListener: (listener: Listener) => { listeners.delete(listener) }
+  }
 }
 
 const gate = () => {
@@ -190,11 +234,55 @@ describe("ChromeServiceWorker", () => {
 
     expect(api.send("throw").claimed).toBe(false)
     await worker.ready
-    api.send("ours", vi.fn(() => { throw new Error("closed channel") }))
+    const closed = api.send("ours", vi.fn(() => { throw new Error("closed channel") }))
 
     for (const listener of api.chrome.runtime.onStartup.listeners) listener()
-    await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(3))
+    // The selector, both delivery attempts on the closed channel, and the event.
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(4))
+    expect(closed.response.mock.calls).toEqual([
+      [{ ok: true, value: "answer" }],
+      [{ ok: false, error: { code: "HandlerFailed", message: "Error: closed channel" } }]
+    ])
     await worker.dispose()
+  })
+
+  it("answers a value Chrome cannot deliver with a HandlerFailed envelope, exactly once", async () => {
+    const api = setup()
+    const onError = vi.fn()
+    const worker = start({ ...defaults, ...api, layer: Layer.empty, onError, onMessage: () => Effect.succeed(1n) })
+    await worker.ready
+    let calls = 0
+
+    const response = vi.fn((value: Response) => {
+      calls++
+
+      if (calls === 1) throw new TypeError(`Could not serialize ${JSON.stringify(value.ok)}`)
+    })
+
+    api.send("ours", response)
+    await vi.waitFor(() => expect(response).toHaveBeenCalledTimes(2))
+    expect(response).toHaveBeenLastCalledWith({ ok: false, error: {
+      code: "HandlerFailed", message: "TypeError: Could not serialize true"
+    } })
+    expect(onError).toHaveBeenCalledExactlyOnceWith({ code: "HandlerFailed", message: "TypeError: Could not serialize true" })
+    await worker.dispose()
+    expect(response).toHaveBeenCalledTimes(2)
+  })
+
+  it("refuses a worker without exactly one of layer and runtime before registering anything", async () => {
+    const api = setup()
+    const runtime = ManagedRuntime.make(Layer.empty)
+    // SAFETY: deliberately bypasses the layer/runtime union, as an untyped JavaScript caller would.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions
+    const neither = { ...defaults, ...api } as unknown as Parameters<typeof start>[0]
+    // SAFETY: as above, giving both.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions
+    const both = { ...defaults, ...api, layer: Layer.empty, runtime } as unknown as Parameters<typeof start>[0]
+    expect(() => start(neither)).toThrow(new TypeError("Exactly one of layer or runtime must be given"))
+    expect(() => start(both)).toThrow(new TypeError("Exactly one of layer or runtime must be given"))
+    expect(api.chrome.runtime.onMessage.listeners.size).toBe(0)
+    expect(await runtime.runPromise(Effect.succeed(42))).toBe(42)
+    await runtime.dispose()
   })
 
   it("disposes before initialization, drains pending responses, and removes generic listeners", async () => {
@@ -619,5 +707,415 @@ describe("ChromeServiceWorker", () => {
     captured()
     expect(onError).toHaveBeenCalledWith({ code: "HandlerFailed", message: expect.stringContaining("native removal failed") })
     expect(onError).toHaveBeenCalledWith({ code: "Disposed", message: "Service worker disposed" })
+  })
+
+  it("installs no message listener when the worker answers only ports", async () => {
+    const api = setup()
+    const worker = start({ chrome: api.chrome, layer: Layer.empty, onConnect: () => Effect.void })
+    expect(api.chrome.runtime.onMessage.listeners.size).toBe(0)
+    expect(api.chrome.runtime.onConnect.listeners.size).toBe(1)
+    await worker.dispose()
+  })
+
+  it("refuses a message selector without a handler", () => {
+    const api = setup()
+    expect(() => start({ chrome: api.chrome, layer: Layer.empty, selectMessage: () => true })).toThrow(
+      "selectMessage and onMessage must be configured together"
+    )
+    expect(api.chrome.runtime.onMessage.listeners.size).toBe(0)
+  })
+
+  describe("listeners", () => {
+    it("installs listen() entries with the named ones, before initialization, passing filters only when given", async () => {
+      const api = setup()
+      const clicked = event<(tab: chrome.tabs.Tab) => void>()
+      const committed = filteredEvent<(details: { readonly url: string }) => void>()
+      const unfiltered = filteredEvent<(details: { readonly url: string }) => void>()
+      const hydrated = gate()
+      const seen: Array<string> = []
+      const filter: UrlFilter = { url: [{ hostEquals: "example.com" }] }
+
+      const layer = Layer.effectDiscard(Effect.gen(function*() {
+        expect(clicked.listeners.size).toBe(1)
+        expect(committed.listeners.size).toBe(1)
+        yield* hydrated.effect
+      }))
+
+      const worker = start({
+        ...api, layer,
+        listeners: [
+          listen(clicked, (tab) => Effect.sync(() => { seen.push(`clicked ${tab.id}`) })),
+          listen(committed, (details) => Effect.sync(() => { seen.push(`committed ${details.url}`) }), filter),
+          listen(unfiltered, () => Effect.void)
+        ]
+      })
+
+      expect(committed.calls).toEqual([[expect.any(Function), filter]])
+      expect(unfiltered.calls).toEqual([[expect.any(Function)]])
+
+      // SAFETY: the handler only reads tab.id.
+      const tab = { id: 7 } as chrome.tabs.Tab
+
+      for (const listener of clicked.listeners) listener(tab)
+
+      for (const listener of committed.listeners) listener({ url: "https://example.com/" })
+
+      expect(seen).toEqual([])
+
+      hydrated.release()
+      await worker.ready
+      await vi.waitFor(() => expect(seen).toEqual(["clicked 7", "committed https://example.com/"]))
+      await worker.dispose()
+      expect(clicked.listeners.size + committed.listeners.size + unfiltered.listeners.size).toBe(0)
+    })
+
+    it("accepts Chrome's own filtered events, with and without a filter", () => {
+      const listeners = (onCommitted: typeof chrome.webNavigation.onCommitted) => [
+        listen(onCommitted, (details) => Effect.sync(() => details.url)),
+        listen(onCommitted, (details) => Effect.sync(() => details.url), { url: [{ hostEquals: "example.com" }] })
+      ]
+
+      const required: FilteredChromeEvent<(url: string) => void, UrlFilter> = { addListener: () => {}, removeListener: () => {} }
+
+      expect(listeners).toBeTypeOf("function")
+      expect(listen(required, () => Effect.void, { url: [] })).toHaveProperty("attach")
+    })
+
+    it("rolls back every listener when one cannot be added", () => {
+      const api = setup()
+      const first = event<() => void>()
+
+      const failing: ChromeEvent<() => void> = {
+        addListener: () => { throw new Error("no such event") },
+        removeListener: () => {}
+      }
+
+      expect(() => start({
+        ...api, layer: Layer.empty,
+        onStartup: () => Effect.void,
+        listeners: [listen(first, () => Effect.void), listen(failing, () => Effect.void)]
+      })).toThrow("no such event")
+
+      expect(first.listeners.size).toBe(0)
+      expect(api.chrome.runtime.onStartup.listeners.size).toBe(0)
+    })
+
+    it("registers a filtered event after start and reports handler failures", async () => {
+      const api = setup()
+      const onError = vi.fn()
+      const worker = start({ ...api, layer: Layer.empty, onError })
+      const committed = filteredEvent<(url: string) => void>()
+      const filter: UrlFilter = { url: [{ hostEquals: "example.com" }] }
+      const unregister = worker.register(committed, (url) => Effect.fail(`failed ${url}`), filter)
+
+      expect(committed.calls).toEqual([[expect.any(Function), filter]])
+
+      await worker.ready
+
+      for (const listener of committed.listeners) listener("https://example.com/")
+      await vi.waitFor(() => expect(onError).toHaveBeenCalledWith(expect.objectContaining({ code: "HandlerFailed" })))
+
+      unregister()
+      expect(committed.listeners.size).toBe(0)
+      await worker.dispose()
+    })
+
+    it("passes every extra addListener argument exactly as given, at start and through register", async () => {
+      const api = setup()
+      const onCompleted = recordingEvent<(details: { readonly url: string }) => void, [RequestFilter, ReadonlyArray<string>?]>()
+      const filter: RequestFilter = { urls: ["https://example.com/*"] }
+      const worker = start({ ...api, layer: Layer.empty, listeners: [listen(onCompleted, () => Effect.void, filter, ["responseHeaders"])] })
+      worker.register(onCompleted, () => Effect.void, filter)
+      worker.register(onCompleted, () => Effect.void, filter, ["extraHeaders"])
+      expect(onCompleted.calls).toEqual([
+        [expect.any(Function), filter, ["responseHeaders"]],
+        [expect.any(Function), filter],
+        [expect.any(Function), filter, ["extraHeaders"]]
+      ])
+      await worker.dispose()
+      expect(onCompleted.listeners.size).toBe(0)
+    })
+
+    it("types Chrome's own events: required filters, extraInfoSpec, reply callbacks and ports", () => {
+      const listeners = (chromeApi: typeof chrome) => [
+        listen(chromeApi.webRequest.onCompleted, (details) => Effect.sync(() => details.statusCode),
+          { urls: ["<all_urls>"] }, ["responseHeaders"]),
+        // @ts-expect-error webRequest events require a RequestFilter.
+        listen(chromeApi.webRequest.onCompleted, () => Effect.void),
+        // @ts-expect-error runtime.onStartup takes no filter.
+        listen(chromeApi.runtime.onStartup, () => Effect.void, { url: [] }),
+        listenReply(chromeApi.runtime.onMessageExternal, {
+          select: (_message, sender) => sender.id === "trusted",
+          handler: (message, sender) => Effect.succeed({ message, from: sender.id })
+        }),
+        listenReply(chromeApi.runtime.onUserScriptMessage, { handler: (message: unknown) => Effect.succeed(message) }),
+        listenReply(chromeApi.downloads.onDeterminingFilename, {
+          handler: (item) => Effect.succeed(`renamed/${item.filename}`),
+          reply: (response) => response.ok ? { filename: response.value, conflictAction: "uniquify" as const } : undefined
+        }),
+        listenReply(chromeApi.webRequest.onAuthRequired, {
+          handler: (details) => Effect.succeed(details.isProxy),
+          reply: (response): chrome.webRequest.BlockingResponse => response.ok && response.value ? { cancel: true } : {}
+        }, { urls: ["<all_urls>"] }, ["asyncBlocking"]),
+        // @ts-expect-error suggest takes a FilenameSuggestion, not the envelope.
+        listenReply(chromeApi.downloads.onDeterminingFilename, { handler: (item) => Effect.succeed(item.filename) }),
+        // @ts-expect-error a handler cannot declare more arguments than the event gives.
+        listenReply(chromeApi.runtime.onMessageExternal, { handler: (_message: unknown, _sender: chrome.runtime.MessageSender, extra: number) => Effect.succeed(extra) }),
+        listenPort(chromeApi.runtime.onConnectExternal, (port) => Effect.sync(() => port.name)),
+        listenPort(chromeApi.runtime.onUserScriptConnect, (port) => Effect.sync(() => port.sender))
+      ]
+
+      expect(listeners).toBeTypeOf("function")
+    })
+  })
+
+  describe("listenReply", () => {
+    type Sender = chrome.runtime.MessageSender
+
+    const external = () => event<(message: unknown, sender: Sender, sendResponse: (response?: Response) => void) => boolean>()
+
+    type ExternalListener = (message: unknown, sender: Sender, sendResponse: (response?: Response) => void) => boolean
+
+    const deliverTo = (listener: ExternalListener, message: unknown, sendResponse = vi.fn<(response?: Response) => void>()) =>
+      ({ claimed: listener(message, { id: "other" }, sendResponse), sendResponse })
+
+    const deliver = (target: ReturnType<typeof external>, message: unknown, sendResponse?: Mock<(response?: Response) => void>) =>
+      deliverTo([...target.listeners][0]!, message, sendResponse)
+
+    it("claims selected events, answers each once after initialization, and declines the rest", async () => {
+      const onMessageExternal = external()
+      const initialized = gate()
+      const onError = vi.fn()
+      const handled = vi.fn()
+
+      const worker = start({ ...setup(), layer: Layer.empty, initialize: initialized.effect, onError, listeners: [
+        listenReply(onMessageExternal, {
+          select: (message, sender) => {
+            if (message === "throw") throw new Error("selector failure")
+
+            return sender.id === "other" && message !== "ignored"
+          },
+          handler: (message, sender) => Effect.sync(() => {
+            handled(message)
+
+            return `${String(message)} from ${sender.id}`
+          })
+        })
+      ] })
+
+      const accepted = deliver(onMessageExternal, "hello")
+      const ignored = deliver(onMessageExternal, "ignored")
+      const thrown = deliver(onMessageExternal, "throw")
+      expect([accepted.claimed, ignored.claimed, thrown.claimed]).toEqual([true, false, false])
+      expect(accepted.sendResponse).not.toHaveBeenCalled()
+      expect(onError).toHaveBeenCalledExactlyOnceWith({ code: "HandlerFailed", message: "Error: selector failure" })
+      initialized.release()
+      await worker.ready
+      await vi.waitFor(() => expect(accepted.sendResponse).toHaveBeenCalledWith({ ok: true, value: "hello from other" }))
+      await worker.dispose()
+      expect(accepted.sendResponse).toHaveBeenCalledTimes(1)
+      expect(ignored.sendResponse).not.toHaveBeenCalled()
+      expect(thrown.sendResponse).not.toHaveBeenCalled()
+      expect(handled.mock.calls).toEqual([["hello"]])
+      expect(onMessageExternal.listeners.size).toBe(0)
+    })
+
+    it("answers handler failures, defects and construction throws as HandlerFailed envelopes", async () => {
+      const onMessageExternal = external()
+      const onError = vi.fn()
+
+      const worker = start({ ...setup(), layer: Layer.empty, onError, listeners: [
+        listenReply(onMessageExternal, {
+          handler: (message) => {
+            if (message === "throw") throw new Error("construction")
+
+            return message === "fail" ? Effect.fail("typed") : Effect.die("defect")
+          }
+        })
+      ] })
+
+      await worker.ready
+      const results = ["fail", "defect", "throw"].map((message) => deliver(onMessageExternal, message))
+      await vi.waitFor(() => { for (const result of results) expect(result.sendResponse).toHaveBeenCalledTimes(1) })
+
+      for (const [index, expected] of ["typed", "defect", "construction"].entries()) {
+        expect(results[index]!.sendResponse).toHaveBeenCalledWith({ ok: false, error: {
+          code: "HandlerFailed", message: expect.stringContaining(expected)
+        } })
+      }
+
+      expect(onError).not.toHaveBeenCalled()
+      await worker.dispose()
+    })
+
+    it.each(["Overflow", "InitializationFailed", "Disposed"] as const)("answers %s without running the handler", async (code) => {
+      const onMessageExternal = external()
+      const initialized = gate()
+      const handler = vi.fn(() => Effect.succeed("unreachable"))
+      const onError = vi.fn()
+
+      const worker = start({ ...setup(), layer: Layer.empty, onError, maxPending: 0,
+        initialize: code === "InitializationFailed" ? Effect.fail("boom") : initialized.effect,
+        listeners: [listenReply(onMessageExternal, { handler })] })
+
+      const listener = [...onMessageExternal.listeners][0]!
+
+      if (code === "InitializationFailed") await worker.ready
+
+      if (code === "Disposed") await worker.dispose()
+      const result = deliverTo(listener, "late")
+      expect(result.claimed).toBe(true)
+      expect(result.sendResponse).toHaveBeenCalledExactlyOnceWith({ ok: false, error: {
+        code, message: code === "InitializationFailed" ? expect.stringContaining("boom") : expect.any(String)
+      } })
+      expect(handler).not.toHaveBeenCalled()
+      await worker.dispose()
+    })
+
+    it("builds the native answer with reply, calling the callback with no argument for undefined", async () => {
+      const onDeterminingFilename = event<
+        (item: { readonly filename: string }, suggest: (suggestion?: { readonly filename: string }) => void) => boolean
+      >()
+
+      const replies = vi.fn((response: Response<string>) => response.ok ? { filename: response.value } : undefined)
+
+      const worker = start({ ...setup(), layer: Layer.empty, listeners: [
+        listenReply(onDeterminingFilename, {
+          handler: (item) => item.filename === "bad" ? Effect.fail("rejected") : Effect.succeed(`renamed/${item.filename}`),
+          reply: replies
+        })
+      ] })
+
+      await worker.ready
+      const listener = [...onDeterminingFilename.listeners][0]!
+      const good = vi.fn<(suggestion?: { readonly filename: string }) => void>()
+      const bad = vi.fn<(suggestion?: { readonly filename: string }) => void>()
+      expect(listener({ filename: "a.txt" }, good)).toBe(true)
+      expect(listener({ filename: "bad" }, bad)).toBe(true)
+      await vi.waitFor(() => expect(good.mock.calls.length + bad.mock.calls.length).toBe(2))
+      expect(good.mock.calls).toEqual([[{ filename: "renamed/a.txt" }]])
+      expect(bad.mock.calls).toEqual([[]])
+      expect(replies).toHaveBeenCalledWith({ ok: false, error: { code: "HandlerFailed", message: expect.stringContaining("rejected") } })
+      await worker.dispose()
+    })
+
+    it("reports an answer that cannot be built or delivered and answers a success once more as a failure", async () => {
+      const onMessageExternal = external()
+      const onError = vi.fn()
+      let failBuild = true
+
+      const worker = start({ ...setup(), layer: Layer.empty, onError, listeners: [
+        listenReply(onMessageExternal, {
+          handler: (message) => message === "fail" ? Effect.fail("handler") : Effect.succeed(message),
+          reply: (response) => {
+            if (response.ok && failBuild) {
+              failBuild = false
+              throw new Error("cannot build")
+            }
+
+            return response
+          }
+        })
+      ] })
+
+      await worker.ready
+      const built = deliver(onMessageExternal, "value")
+      const closed = deliver(onMessageExternal, "fail", vi.fn(() => { throw new Error("closed") }))
+      const missing = [...onMessageExternal.listeners][0]!
+
+      // Chrome always passes the callback; without one, the failure is reported, not thrown.
+      // SAFETY: deliberately omits the native callback to exercise the defensive path.
+      expect((missing as (...args: ReadonlyArray<unknown>) => boolean)("orphan", { id: "other" })).toBe(true)
+      await vi.waitFor(() => expect(onError).toHaveBeenCalledTimes(4))
+      expect(built.sendResponse.mock.calls).toEqual([[{ ok: false, error: { code: "HandlerFailed", message: "Error: cannot build" } }]])
+      expect(closed.sendResponse).toHaveBeenCalledTimes(1)
+      expect(onError).toHaveBeenCalledWith({ code: "HandlerFailed", message: "Error: cannot build" })
+      expect(onError).toHaveBeenCalledWith({ code: "HandlerFailed", message: "Error: closed" })
+      expect(onError).toHaveBeenCalledWith({ code: "HandlerFailed", message: expect.stringContaining("TypeError") })
+      await worker.dispose()
+    })
+
+    it("stops claiming once unregistered but still answers events it already claimed", async () => {
+      const onMessageExternal = external()
+      const initialized = gate()
+      const worker = start({ ...setup(), layer: Layer.empty, initialize: initialized.effect })
+      const unregister = worker.register(listenReply(onMessageExternal, { handler: (message) => Effect.succeed(message) }))
+      const listener = [...onMessageExternal.listeners][0]!
+      const accepted = deliver(onMessageExternal, "before")
+      unregister()
+      unregister()
+      expect(onMessageExternal.listeners.size).toBe(0)
+      const late = vi.fn()
+      expect(listener("after", { id: "other" }, late)).toBe(false)
+      initialized.release()
+      await worker.ready
+      await vi.waitFor(() => expect(accepted.sendResponse).toHaveBeenCalledWith({ ok: true, value: "before" }))
+      await worker.dispose()
+      expect(late).not.toHaveBeenCalled()
+    })
+  })
+
+  describe("ports", () => {
+    const port = (name: string) => {
+      const disconnect = vi.fn()
+
+      // SAFETY: the worker only calls disconnect, and handlers here read only name.
+      // oxlint-disable-next-line anti-slop/no-chained-type-assertions
+      return { native: { name, disconnect } as unknown as chrome.runtime.Port, disconnect }
+    }
+
+    it.each(["Overflow", "InitializationFailed", "Disposed"] as const)(
+      "disconnects an onConnect port whose handler never starts (%s)", async (code) => {
+        const api = setup()
+        const onError = vi.fn()
+        const onConnect = vi.fn(() => Effect.void)
+
+        const worker = start({ chrome: api.chrome, layer: Layer.empty, onError, onConnect, maxPending: 0,
+          initialize: code === "InitializationFailed" ? Effect.fail("boom") : Effect.never })
+
+        const listener = [...api.chrome.runtime.onConnect.listeners][0]!
+
+        if (code === "InitializationFailed") await worker.ready
+
+        if (code === "Disposed") await worker.dispose()
+        const rejected = port("rejected")
+        listener(rejected.native)
+        expect(rejected.disconnect).toHaveBeenCalledTimes(1)
+        expect(onError).toHaveBeenCalledWith(expect.objectContaining({ code }))
+        expect(onConnect).not.toHaveBeenCalled()
+        await worker.dispose()
+      }
+    )
+
+    it("leaves a started handler's port open and reports a failing disconnect", async () => {
+      const api = setup()
+      const onError = vi.fn()
+      const onConnectExternal = event<(port: chrome.runtime.Port) => void>()
+      const handled = vi.fn()
+
+      const worker = start({ chrome: api.chrome, layer: Layer.empty, onError, maxPending: 0,
+        initialize: Effect.never,
+        listeners: [listenPort(onConnectExternal, (native) => Effect.sync(() => handled(native.name)))] })
+
+      const failing = port("failing")
+      failing.disconnect.mockImplementation(() => { throw new Error("already gone") })
+
+      for (const listener of onConnectExternal.listeners) listener(failing.native)
+      expect(onError).toHaveBeenCalledWith({ code: "Overflow", message: "Startup queue is full" })
+      expect(onError).toHaveBeenCalledWith({ code: "HandlerFailed", message: "Error: already gone" })
+      await worker.dispose()
+
+      const ready = start({ chrome: api.chrome, layer: Layer.empty,
+        listeners: [listenPort(onConnectExternal, (native) => Effect.sync(() => handled(native.name)))] })
+
+      await ready.ready
+      const accepted = port("accepted")
+
+      for (const listener of onConnectExternal.listeners) listener(accepted.native)
+      await vi.waitFor(() => expect(handled).toHaveBeenCalledWith("accepted"))
+      await ready.dispose()
+      expect(accepted.disconnect).not.toHaveBeenCalled()
+      expect(onConnectExternal.listeners.size).toBe(0)
+    })
   })
 })

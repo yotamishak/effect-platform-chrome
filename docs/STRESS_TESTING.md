@@ -1,5 +1,61 @@
 # Stress testing
 
+## Deterministic module stress — `test/stress/`
+
+`test/stress/<Module>.stress.test.ts` holds the conventions' stress cases for Alarms,
+Storage, SchemaStorage, Runtime and Port, with shared helpers in `test/stress/support.ts`.
+They synchronize on explicit gates (an event that completes a `Deferred` once N listeners
+are registered at once; native calls held pending until N have arrived), never on sleeps,
+and the whole directory runs in well under a second.
+
+| Module | Cases |
+| --- | --- |
+| Alarms | 4,096-alarm burst keeps the newest 64 and removes its listener; 4 rounds of 512 concurrent subscriptions with 128 events each, interrupted odd-then-even (2,048 listeners added and removed); 1,024 concurrent calls across all five operations, every 7th throwing synchronously and the rest settled newest first with every other one rejected, each failure naming its operation; 512 calls interrupted mid-flight, then settled late |
+| Storage | 4,096 local changes interleaved with 4,096 sync changes: `local.onChanged` keeps the newest 64 local ones (filtered events take no slot), the global stream the newest 64 of both; 4 rounds of 512 subscriptions spread over the four areas and the global stream; 1,024 concurrent calls over every area and operation, failures keeping `area` and `operation` |
+| SchemaStorage | A 4,096-change burst (plus 8,192 unrelated key/area changes) coalesces to exactly `[initial, newest]` and removes the listener; 512 observers registered before their initial reads, half interrupted with the read still in flight; 512 concurrent `get`/`set`/`remove` with interleaved rejections keeping `area` and `operation` |
+| Runtime | 4,096-event bursts on `onInstalled` and the three-argument `onMessageExternal` keep the newest 64; 4 rounds of 512 subscriptions across all six events; 1,024 concurrent calls over six Promise operations with interleaved rejections; 512 `sendMessage` calls interrupted mid-flight |
+| Port | A 4,096-message burst drains its newest 64 after a clean disconnect; 512 concurrent adopt cycles (owned and borrowed) gated so all are open at once, ending by explicit disconnect, clean host disconnect, host `lastError` or scope close, with no listener left and owned ports disconnected exactly once unless Chrome reported the disconnect; 1,024 concurrent connects and sends, every 3rd connect and every other send failing, each failure keeping its operation |
+
+## Limits runner — 2026-10-22
+
+`examples/wxt` gained a limits runner (`popup/limits.ts`, `popup/limits-modules.ts`) that
+drives every module, including the five added for extension adopters, to the Chrome
+limit it meets in practice. It ran in two places:
+
+- headless Chrome for Testing (Playwright, which passes `--disable-ipc-flooding-protection`)
+  with a local stand-in for example.com: 27 of 29 stages passed, 2 skipped;
+- a real Chrome 155 profile on macOS, driven over its debugging connection: 27 passed,
+  0 failed, 2 skipped (capture without an `activeTab` grant, scripting without the optional
+  example.com access), in 22.5 s. The original stress runner passed alongside it with zero
+  errors.
+
+What Chrome itself turned out to enforce, as observed in that real profile:
+
+| Area | Observed |
+| --- | --- |
+| History updates | About 200 `pushState` calls per 10 s per frame; Chrome ignores the rest (one 500-call burst applied 98 to 298, depending on what the window had already used). Every applied update reached `onHistoryStateUpdated`, in order. Headless automation lifts the cap and delivers about 23 events/s. |
+| Cookies | 400 cookies on one host kept 152, including the newest |
+| Alarms | `An extension cannot have more than 500 active alarms.` |
+| Storage | `local`: `Resource::kQuotaBytes quota exceeded` at the 11th 1 MB item; `session`: `Session storage quota bytes exceeded`; `sync`: `Resource::kQuotaBytesPerItem quota exceeded` for a 9000-character item |
+| Capture | `captureVisibleTab` needs `<all_urls>` or `activeTab`, even on the extension's own pages |
+| webNavigation | Reports nothing for `chrome-extension://` pages, so frame targets have to be web pages |
+| Hidden pages | Chrome throttles a hidden runner page's timers: 10,000 redirect-URL lookups went from 29 ms to 2.2 s, and RPC readiness timeouts fired up to 3 s late |
+
+And what the library did at those limits:
+
+- `readyTimeout` (300 ms) failed every port that only an unrelated listener received, at
+  302–314 ms; a port to a frame with no listener failed in under 15 ms.
+- `finishAccepted`: 40 callers disconnected mid-call; all 40 wrapped handlers finished and
+  all 40 plain ones were interrupted.
+- RPC: 2048 concurrent calls on one port; a 1,000,000-character payload round-tripped and a
+  1,100,000-character one was refused before sending (`Invalid or oversized outbound RPC frame`).
+- Ports: 50 ports × 200 echoes with no loss under flow control; a 2000-message blast at one
+  port lost 120 (and 1060 on a throttled page) to the documented 64-message sliding
+  buffers, with what arrived in order and unduplicated.
+- Runtime messaging: 10,000 concurrent `sendMessage` round trips in about 1.4 s.
+- Schema storage: 256 subscribers all reached the last of 100 writes.
+
+
 ## Live Chrome observations — 2026-10-13
 
 Tested the WXT development extension through `agent-browser`, connected to the

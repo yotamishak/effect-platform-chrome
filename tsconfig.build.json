@@ -8,7 +8,8 @@
     "declaration": true,
     "sourceMap": true,
     "declarationMap": true,
-    "tsBuildInfoFile": "./node_modules/.cache/build.tsbuildinfo",
+    "incremental": false,
+    "tsBuildInfoFile": null,
     "noEmitOnError": true
   },
   "include": ["src/**/*.ts"],

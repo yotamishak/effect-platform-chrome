@@ -1,8 +1,11 @@
 # ChromeTesting
 
-Import `effect-platform-chrome/ChromeTesting`. These injected fixtures have no
-Vitest runtime dependency and never access Chrome globals. They cover the
-existing `ChromeStorage` and `ChromePort` adapters, not every Chrome service.
+Import `effect-platform-chrome/ChromeTesting` for every fixture, or one adapter's
+module from `effect-platform-chrome/testing/<Name>` (see [Fixture modules](#fixture-modules)).
+A fixture for a new adapter goes in its own `testing/` module and is re-exported
+from `ChromeTesting`. These injected fixtures have no
+Vitest runtime dependency and never access Chrome globals. They do not cover every
+Chrome service; the others take a plain object through `make(api)` or `layer(api)`.
 Create a fixture **inside each test**. Its layer and raw API intentionally share
 that fixture's state; calling the factory again creates independent state.
 
@@ -29,7 +32,9 @@ it.effect("reads configured settings", () => Effect.gen(function*() {
 
 Alternatively use `ChromeStorage.make(fixture.api)` directly. The raw API is a
 structural Promise-based subset, **not** `typeof chrome.storage`: callback
-overloads, access levels and quota constants are absent.
+overloads and quota constants are absent. Access levels are recorded per area,
+starting from Chrome's defaults (`session` trusted contexts only, the others open);
+`controls.accessLevel(area)` reads the current one.
 
 - `local`, `sync`, `session` support `get`, `set`, `remove`, `clear`,
   `getBytesInUse` and per-area `onChanged`. `managed` exposes only reads/events.
@@ -130,3 +135,65 @@ callback-scoped `lastError`; throwing/reentrant listeners do not leak it. Storag
 tests check duplicate selectors, prototype-like keys, defaults, and nested cloning
 at synchronous get/set boundaries. These are deterministic fixture contracts,
 not claims about native browser scheduling or serialization fidelity.
+
+## Tabs
+
+`makeTabs(overrides?)` is an in-memory tab strip behind `ChromeTabs.layer`. Tabs
+keep the properties they were created, seeded or updated with, are ordered per window,
+and their `index` follows that order. `query` matches the common fields and exact
+`url`s (no match patterns), returning results by window, then index. `create`,
+`update`, `remove`, `duplicate`, `move` (onMoved, or onDetached then onAttached across
+windows), `reload` (loading, then complete), `discard`, `group`/`ungroup` and zoom
+update the strip and emit the matching events synchronously. Calls that default to
+the current tab use the first active one. `get`, `update` and `remove` reject an
+unknown id as Chrome does, and `sendMessage` rejects as Chrome does with no receiver.
+`goBack`/`goForward` reject (no history is modelled) and `detectLanguage` returns
+`"und"`.
+
+- `controls.seed(properties)` adds a tab and returns it with its id;
+  `controls.tab(id)` reads the live record.
+- `connect` returns one end of a `makePortPair`, and records the connection in
+  `controls.connections` with the pair, so a test can serve the other end
+  (`ChromeRpc.serve` on `pair.right.port`) or leave it unanswered.
+- `captureVisibleTab` resolves to an empty JPEG data URL.
+- `overrides` replaces any member, for behaviour the strip does not model, such as a
+  `get` that reports `about:blank` until a navigation commits.
+
+## Fixture modules
+
+Every adapter fixture returns `{ api, layer, controls }`: `api` fits the module's
+`make(api)`, `layer` provides its service over the same state, and most factories take
+`overrides` to replace any member. `makeEvent` returns `{ api, controls }` and
+`makePortPair` returns `{ left, right, controls }`. Each module's doc comment states exactly what it models.
+
+| Module | Factory | Models |
+| --- | --- | --- |
+| `testing/Event` | `makeEvent` | A typed Chrome event with emission and registration-failure controls. |
+| `testing/Storage` | `makeStorage` | All storage areas, `getKeys`, access levels and change events (above). |
+| `testing/Port` | `makePortPair` | Two connected ports with manual delivery (above). |
+| `testing/Tabs` | `makeTabs` | An in-memory tab strip (above). |
+| `testing/Windows` | `makeWindows` | A window list with focus tracking and `windowTypes` filters; removing or unfocusing the focused window refocuses the previous one (or reports -1). Tabs, urls and `populate` are not modelled. |
+| `testing/Action` | `makeAction` | Per-tab badge, title, popup and enabled state falling back to defaults; `controls.click(tab)` opens the popup or fires `onClicked`. |
+| `testing/ContextMenus` | `makeContextMenus` | A menu tree; `create` reports duplicate ids and unknown parents through `lastError` like Chrome; `controls.click`. |
+| `testing/Omnibox` | `makeOmnibox` | A keyword session; `controls.change(text)` returns the suggestion batches listeners send. |
+| `testing/Offscreen` | `makeOffscreen` | Chrome's single-document rule, `getContexts`, and gates to hold or fail the next creation. |
+| `testing/Cookies` | `makeCookies` | A cookie jar keyed like Chrome's (store, name, domain, path, partition) emitting `onChanged`. |
+| `testing/Identity` | `makeIdentity` | Scripted web auth flows, a scope-keyed token cache, and sign-in changes. |
+| `testing/WebNavigation` | `makeWebNavigation`, `matchesNavigationFilter` | Frames per tab, simulated navigations emitting Chrome's event sequence, and URL filters (host, URL, path and query keys; RE2 and CIDR keys are rejected). |
+| `testing/Notifications` | `makeNotifications` | Showing notifications, the permission level, and simulated clicks, button clicks and closes. |
+| `testing/DeclarativeNetRequest` | `makeDeclarativeNetRequest` | Dynamic and session rule sets with Chrome's atomic updates and id collisions; requests are never matched. |
+| `testing/Bookmarks` | `makeBookmarks` | A bookmark tree with the permanent folders, Chrome's errors and events. |
+| `testing/Alarms` | `makeAlarms` | Alarms on a virtual clock with Chrome's validation messages, the 500-alarm cap and once-a-second polls; `controls.advance(ms)` fires due alarms as one Chrome poll does, `controls.restart()` drops non-persistent ones. |
+| `testing/Commands` | `makeCommands` | Manifest commands; `controls.setShortcut` edits a shortcut and `controls.press` fires `onCommand` only for bound, non-reserved commands. |
+| `testing/Debugger` | `makeDebugger` | Targets, one attachment per target, protocol versions, scripted command handlers (`controls.respond`), recorded commands, detach and target events. |
+| `testing/History` | `makeHistory` | Pages and visits keyed by canonical URL, Chrome's search window and text matching, the deletion policy, visit and removal events. |
+| `testing/I18n` | `makeI18n`, `replacePlaceholders` | Validated message catalogs with Chrome's placeholder substitution, case folding, `@@` predefined messages and language detection post-processing. |
+| `testing/Idle` | `makeIdle` | Idle time and lock state, Chrome's interval validation, and `onStateChanged` sampled the way Chrome samples it (`controls.poll`). |
+| `testing/Management` | `makeManagement` | The calling extension and other items, Chrome's refusal messages, and gesture-only calls modelled exactly (`controls.withUserGesture`), with confirmation dialogs. |
+| `testing/Scripting` | `makeScripting` | Tabs, frames and packaged files; Chrome's target validation, per-frame results, CSS insertion and dynamic content-script registration. |
+| `testing/Sessions` | `makeSessions` | Recently closed tabs and windows (newest 25), synced devices, and `restore` as Chrome does it. |
+| `testing/TabCapture` | `makeTabCapture`, `makeCaptureStream` | Capture stream ids, captured tabs and status events, plus simulated media streams with live tracks. |
+| `testing/TabGroups` | `makeTabGroups` | Groups across simulated windows with Chrome's query order, index rules for `move`, and created/updated/moved/removed events. |
+| `testing/UserScripts` | `makeUserScripts` | Registration, update and unregistration with Chrome's validation and defaults, world configurations, and `execute` through a scripted responder. |
+| `testing/WebRequest` | `makeWebRequest`, `matchesRequestFilter`, `matchesUrlPattern` | Listener registrations matched like Chrome's (URL patterns, types, tabs, windows), per-listener detail copies by `extraInfoSpec`, and simulated requests. |
+
