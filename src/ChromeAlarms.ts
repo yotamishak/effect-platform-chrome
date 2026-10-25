@@ -1,4 +1,6 @@
-import { Context, Effect, Layer, Queue, Schema, Stream } from "effect"
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { invoker, liveLayer } from "./internal/api.js"
+import { observe, type EventSource } from "./internal/event.js"
 
 export type Alarm = chrome.alarms.Alarm
 
@@ -15,11 +17,12 @@ export interface ChromeAlarmsApi {
   get(name?: string): Promise<Alarm | undefined>
   getAll(): Promise<Array<Alarm>>
   clear(name?: string): Promise<boolean>
-  clearAll(): Promise<boolean>
-  readonly onAlarm: {
-    addListener(listener: (alarm: Alarm) => void): void
-    removeListener(listener: (alarm: Alarm) => void): void
-  }
+  /**
+   * Resolves to `true`, or to nothing where Chrome's `ApiAlarmsClearAllReturnUndefined`
+   * feature is on; it carries no information either way.
+   */
+  clearAll(): Promise<boolean | undefined>
+  readonly onAlarm: EventSource<[alarm: Alarm]>
 }
 
 export class ChromeAlarmsError extends Schema.TaggedError<ChromeAlarmsError>()("ChromeAlarmsError", {
@@ -28,16 +31,34 @@ export class ChromeAlarmsError extends Schema.TaggedError<ChromeAlarmsError>()("
 }) {}
 
 export interface ChromeAlarmsService {
+  /**
+   * Schedules an alarm, replacing any alarm of the same name (the empty string when no name
+   * is given). The name goes either in the first argument or, from Chrome 152, in
+   * `info.name`; Chrome rejects both at once. `persistAcrossSessions` is Chrome 150+ and
+   * defaults to true. The first firing comes from exactly one of `when` or `delayInMinutes`,
+   * or from `periodInMinutes` when neither is set. Chrome fails the call when the extension
+   * already has 500 alarms (even when this one would replace one of them) or the name exceeds
+   * 1,024 bytes. An extension's alarms fire at most once a second; before Chrome 153 a packed
+   * MV3 extension's fire at most every 30 seconds. Shorter delays only warn. From Chrome 157,
+   * re-creating an identical alarm (same name, scheduled time, period and persistence) leaves
+   * it in place; earlier versions replace it. Any present `periodInMinutes` repeats, and `0`
+   * keeps the alarm due so it fires on every poll: omit the field for a one-shot alarm.
+   * Interrupting the Effect does not cancel a create Chrome has already started.
+   */
   create(info: AlarmCreateInfo): Effect.Effect<void, ChromeAlarmsError>
   create(name: undefined, info: AlarmCreateInfo): Effect.Effect<void, ChromeAlarmsError>
   create<T extends AlarmCreateInfo>(
     name: string,
     info: T & (T extends { name: string } ? never : unknown)
   ): Effect.Effect<void, ChromeAlarmsError>
-  get(name?: string): Effect.Effect<Alarm | undefined, ChromeAlarmsError>
+  /** The named alarm, or the unnamed one when `name` is omitted; None when no such alarm exists. */
+  get(name?: string): Effect.Effect<Option.Option<Alarm>, ChromeAlarmsError>
+  /** Every alarm of this extension; empty when there are none. */
   readonly getAll: Effect.Effect<Array<Alarm>, ChromeAlarmsError>
+  /** Whether the named alarm (the unnamed one when `name` is omitted) existed and is now cleared. */
   clear(name?: string): Effect.Effect<boolean, ChromeAlarmsError>
-  readonly clearAll: Effect.Effect<boolean, ChromeAlarmsError>
+  /** Clears every alarm of this extension. */
+  readonly clearAll: Effect.Effect<void, ChromeAlarmsError>
   /**
    * Observational only: each running subscription owns a listener, removed when
    * its scope closes. A bounded sliding buffer retains the newest 64 events,
@@ -52,13 +73,9 @@ export class ChromeAlarms extends Context.Service<ChromeAlarms, ChromeAlarmsServ
   "effect-platform-chrome/ChromeAlarms"
 ) {}
 
-const operation = <A>(name: string, run: () => Promise<A>): Effect.Effect<A, ChromeAlarmsError> =>
-  Effect.tryPromise({
-    try: run,
-    catch: (cause) => new ChromeAlarmsError({ operation: name, cause })
-  })
+const invoke = invoker((operation, cause) => new ChromeAlarmsError({ operation, cause }))
 
-/** Creates an injectable implementation without reading browser globals. */
+/** Creates the service without reading browser globals or registering listeners. */
 export const make = (api: ChromeAlarmsApi): ChromeAlarmsService => {
   function create(info: AlarmCreateInfo): Effect.Effect<void, ChromeAlarmsError>
   function create(name: undefined, info: AlarmCreateInfo): Effect.Effect<void, ChromeAlarmsError>
@@ -67,58 +84,36 @@ export const make = (api: ChromeAlarmsApi): ChromeAlarmsService => {
     info: T & (T extends { name: string } ? never : unknown)
   ): Effect.Effect<void, ChromeAlarmsError>
   function create(
-    nameOrInfo: string | undefined | AlarmCreateInfo,
-    info?: AlarmCreateInfo
+    ...args: [info: AlarmCreateInfo] | [name: string | undefined, info: AlarmCreateInfo]
   ): Effect.Effect<void, ChromeAlarmsError> {
-    return operation("create", () => {
-      // Already typed by the public overloads; this dispatches Chrome's object/name overloads.
-      // oxlint-disable-next-line anti-slop/no-runtime-typeof
-      if (typeof nameOrInfo === "object") return api.create(nameOrInfo)
+    // Forward exactly the arity the caller used: Chrome distinguishes `create(info)` from
+    // `create(undefined, info)` only by its own argument matching.
+    return invoke("create", () => {
+      if (args.length === 1) return api.create(args[0])
 
-      // The public overloads guarantee that the second argument is present.
-      if (nameOrInfo === undefined) return api.create(undefined, info!)
+      const [name, info] = args
 
-      return api.create(nameOrInfo, info!)
+      return name === undefined ? api.create(undefined, info) : api.create(name, info)
     })
   }
 
   return ChromeAlarms.of({
     create,
-    get: (name) => operation("get", () => api.get(name)),
-    getAll: operation("getAll", () => api.getAll()),
-    clear: (name) => operation("clear", () => api.clear(name)),
-    clearAll: operation("clearAll", () => api.clearAll()),
-    onAlarm: Stream.callback<Alarm, ChromeAlarmsError>((queue) => Effect.gen(function*() {
-      const listener = (alarm: Alarm): void => { Queue.offerUnsafe(queue, alarm) }
-
-      // Install cleanup before registration, which may partially succeed then throw.
-      yield* Effect.acquireRelease(
-        Effect.succeed(listener),
-        () => Effect.sync(() => api.onAlarm.removeListener(listener))
-      )
-      yield* Effect.try({
-        try: () => api.onAlarm.addListener(listener),
-        catch: (cause) => new ChromeAlarmsError({ operation: "onAlarm.addListener", cause })
-      })
-    }),
-    { bufferSize: 64, strategy: "sliding" })
+    get: (name) => invoke("get", () => name === undefined ? api.get() : api.get(name)).pipe(
+      Effect.map(Option.fromNullishOr)
+    ),
+    getAll: invoke("getAll", () => api.getAll()),
+    clear: (name) => invoke("clear", () => name === undefined ? api.clear() : api.clear(name)),
+    clearAll: Effect.asVoid(invoke("clearAll", () => api.clearAll())),
+    onAlarm: observe(() => api.onAlarm, (alarm) => alarm,
+      (cause) => new ChromeAlarmsError({ operation: "onAlarm", cause }))
   })
 }
 
-/** Resolves chrome.alarms only when the layer is built, never at import time. */
-export const layer: Layer.Layer<ChromeAlarms, ChromeAlarmsError> = Layer.effect(
-  ChromeAlarms,
-  Effect.try({
-    try: () => {
-      if (typeof chrome === "undefined" || chrome.alarms === undefined) {
-        throw new Error("chrome.alarms is unavailable")
-      }
+export const layer = (api: ChromeAlarmsApi): Layer.Layer<ChromeAlarms> => Layer.succeed(ChromeAlarms, make(api))
 
-      return make(chrome.alarms)
-    },
-    catch: (cause) => new ChromeAlarmsError({ operation: "initialize", cause })
-  })
+/** The global is read only when the layer is built, never at import time. */
+export const layerLive: Layer.Layer<ChromeAlarms, ChromeAlarmsError> = liveLayer(
+  ChromeAlarms, "alarms", (chrome) => chrome.alarms, make,
+  (cause) => new ChromeAlarmsError({ operation: "initialize", cause })
 )
-
-/** The same live layer as `layer`, under the name the other modules use. */
-export const layerLive = layer

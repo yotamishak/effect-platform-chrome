@@ -1,10 +1,57 @@
-:root { font-family: system-ui, sans-serif; color: #172235; background: #f6f8fc; }
-body { display: flex; flex-direction: row; flex-wrap: wrap; align-items: stretch; gap: 12px; box-sizing: border-box; min-width: min(780px, 100vw); margin: 0; padding: 16px; }
-body > h1, body > p, body > pre { flex: 0 0 100%; box-sizing: border-box; min-width: 0; }
-h1 { font-size: 20px; margin: 0; } h2 { font-size: 15px; margin: 0 0 8px; }
-section { flex: 1 1 300px; min-width: 0; box-sizing: border-box; padding: 12px; margin: 0; border: 1px solid #ccd5e4; border-radius: 8px; background: white; }
-p { font-size: 12px; line-height: 1.4; color: #43536c; }
-button, input { padding: 6px 8px; margin: 3px; border: 1px solid #a9b8cc; border-radius: 4px; }
-button { cursor: pointer; background: #edf3ff; } button:disabled { cursor: wait; opacity: .5; }
-label { display: block; font-size: 13px; }
-pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow-y: auto; font-size: 11px; background: #172235; color: #e3efff; padding: 10px; border-radius: 6px; }
+:root {
+  font-family: system-ui, sans-serif;
+  color: #172235;
+  background: #f3f6fb;
+  color-scheme: light;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+body:not(.sidepanel) { width: 780px; max-width: 100vw; }
+#app { max-width: 1440px; margin: auto; padding: 20px; }
+.page-header, .header-actions, .toolbar, .card-actions, .log-heading { display: flex; gap: 10px; }
+.page-header { justify-content: space-between; align-items: flex-start; margin-bottom: 18px; }
+.header-actions, .card-actions { flex-wrap: wrap; align-items: center; }
+.header-actions { flex-shrink: 0; }
+h1 { font-size: 24px; letter-spacing: -.6px; margin: 0; }
+h2 { font-size: 15px; margin: 0; overflow-wrap: anywhere; }
+p { margin: 8px 0 12px; font-size: 13px; line-height: 1.5; color: #52617a; }
+.eyebrow { color: #3558af; font-size: 11px; font-weight: 750; letter-spacing: 1.4px; text-transform: uppercase; margin: 0 0 6px; }
+.toolbar { align-items: end; flex-wrap: wrap; padding: 14px; margin-bottom: 16px; background: #e9eef8; border-radius: 12px; }
+.toolbar label { flex: 1 1 180px; }
+.toolbar input { display: block; width: 100%; margin-top: 5px; }
+#module-count { margin: 0 0 7px; font-variant-numeric: tabular-nums; }
+.module-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 310px), 1fr)); gap: 14px; }
+.module-card, .suite-card, .event-log { min-width: 0; padding: 16px; border: 1px solid #d7dfed; border-radius: 12px; background: white; }
+.module-card { display: flex; flex-direction: column; align-items: stretch; }
+.module-card[hidden], [hidden] { display: none !important; }
+.card-actions { margin-bottom: 10px; }
+.module-stress { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: auto; padding-top: 12px; border-top: 1px solid #edf0f6; }
+.module-status { font-size: 12px; color: #52617a; }
+.module-card[data-state="passed"] { border-color: #91c8aa; }
+.module-card[data-state="failed"] { border-color: #e6a0a0; }
+.module-card[data-state="running"] { border-color: #678bdd; }
+.module-card[data-state="failed"] .module-status { color: #a12727; }
+.module-card[data-state="passed"] .module-status { color: #22633e; }
+button, input { font: inherit; font-size: 12px; border: 1px solid #b9c6dc; border-radius: 7px; padding: 8px 10px; }
+input { background: #fff; min-width: 0; }
+input[type="checkbox"] { accent-color: #3558af; }
+button { cursor: pointer; background: #f2f5fd; color: #244688; line-height: 1.3; }
+button:hover:not(:disabled) { background: #e2eafb; border-color: #8ca5d6; }
+button:disabled { cursor: default; opacity: .55; }
+button:focus-visible, input:focus-visible, summary:focus-visible { outline: 3px solid #8baaf1; outline-offset: 2px; }
+label { font-size: 12px; color: #43536c; }
+details { margin-top: 10px; }
+summary { color: #52617a; cursor: pointer; font-size: 12px; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow-y: auto; font: 11px/1.55 ui-monospace, monospace; background: #172235; color: #e3efff; padding: 12px; border-radius: 8px; margin-bottom: 0; }
+.suite-card, .event-log { margin-top: 18px; }
+.log-heading { align-items: center; justify-content: space-between; }
+@media (min-width: 900px) { body:not(.sidepanel) { width: auto; } }
+@media (max-width: 600px) {
+  #app { padding: 12px; }
+  .page-header { flex-direction: column; }
+  .header-actions { width: 100%; }
+  .module-grid { grid-template-columns: 1fr; }
+  h1 { font-size: 22px; }
+}

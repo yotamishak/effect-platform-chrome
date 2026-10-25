@@ -1,5 +1,21 @@
 # Stress testing
 
+## Deterministic module stress — `test/stress/`
+
+`test/stress/<Module>.stress.test.ts` holds the conventions' stress cases for Alarms,
+Storage, SchemaStorage, Runtime and Port, with shared helpers in `test/stress/support.ts`.
+They synchronize on explicit gates (an event that completes a `Deferred` once N listeners
+are registered at once; native calls held pending until N have arrived), never on sleeps,
+and the whole directory runs in well under a second.
+
+| Module | Cases |
+| --- | --- |
+| Alarms | 4,096-alarm burst keeps the newest 64 and removes its listener; 4 rounds of 512 concurrent subscriptions with 128 events each, interrupted odd-then-even (2,048 listeners added and removed); 1,024 concurrent calls across all five operations, every 7th throwing synchronously and the rest settled newest first with every other one rejected, each failure naming its operation; 512 calls interrupted mid-flight, then settled late |
+| Storage | 4,096 local changes interleaved with 4,096 sync changes: `local.onChanged` keeps the newest 64 local ones (filtered events take no slot), the global stream the newest 64 of both; 4 rounds of 512 subscriptions spread over the four areas and the global stream; 1,024 concurrent calls over every area and operation, failures keeping `area` and `operation` |
+| SchemaStorage | A 4,096-change burst (plus 8,192 unrelated key/area changes) coalesces to exactly `[initial, newest]` and removes the listener; 512 observers registered before their initial reads, half interrupted with the read still in flight; 512 concurrent `get`/`set`/`remove` with interleaved rejections keeping `area` and `operation` |
+| Runtime | 4,096-event bursts on `onInstalled` and the three-argument `onMessageExternal` keep the newest 64; 4 rounds of 512 subscriptions across all six events; 1,024 concurrent calls over six Promise operations with interleaved rejections; 512 `sendMessage` calls interrupted mid-flight |
+| Port | A 4,096-message burst drains its newest 64 after a clean disconnect; 512 concurrent adopt cycles (owned and borrowed) gated so all are open at once, ending by explicit disconnect, clean host disconnect, host `lastError` or scope close, with no listener left and owned ports disconnected exactly once unless Chrome reported the disconnect; 1,024 concurrent connects and sends, every 3rd connect and every other send failing, each failure keeping its operation |
+
 ## Limits runner — 2026-10-22
 
 `examples/wxt` gained a limits runner (`popup/limits.ts`, `popup/limits-modules.ts`) that

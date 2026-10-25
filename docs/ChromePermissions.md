@@ -10,7 +10,10 @@ typed initialization error boundary.
 - `getAll` is an Effect value: each execution queries fresh permissions.
 - `contains(permissions)`, `request(permissions)`, and `remove(permissions)` are
   lazy Effects returning Chrome's boolean unchanged. Missing access, user denial,
-  or unsuccessful removal (`false`) is not an exception.
+  or unsuccessful removal (`false`) is not an exception. Chrome rejects removing
+  required permissions, and rejects `request` outside a user gesture.
+- `ChromePermissionsApi` types `onAdded` / `onRemoved` as `EventSource`s, so injected
+  events need only `addListener` and `removeListener`.
 - API synchronous throws and promise rejections become `ChromePermissionsError`,
   preserving `operation` and the original `cause`; live initialization uses
   `operation: "initialize"`.
@@ -39,7 +42,10 @@ user-activation guarantee.
 Use **`requestFromUserGesture` directly on the synchronous handler stack**, before
 any `await`, timer, message hop, or Effect scheduling. This explicitly imperative
 bridge calls Chrome immediately and returns an Effect for the already-started
-request's outcome. Do not invoke it while composing reusable programs. It does not
+request's outcome. It is the same bridge as `ChromeSidePanel.openFromUserGesture` and
+`ChromeDownloads.openFromUserGesture` / `acceptDangerFromUserGesture`: a synchronous throw,
+a rejection, or a non-Promise result becomes `ChromePermissionsError` with
+`operation: "request"`. Do not invoke it while composing reusable programs. It does not
 create a gesture; Chrome still decides whether the current call is eligible.
 
 ```ts
@@ -69,8 +75,8 @@ Ordinary lazy calls similarly cannot cancel native permission operations.
 ## MV3 worker wakeups
 
 Scoped streams are runtime observations, **not worker wakeup registration**.
-Install wakeup listeners synchronously at worker startup via
-`ChromeServiceWorker.register`, before awaiting `worker.ready`:
+Install wakeup listeners synchronously at worker startup through
+`ChromeServiceWorker.start`'s `listeners`, before awaiting `worker.ready`:
 
 ```ts
 import { Effect } from "effect"
@@ -80,25 +86,66 @@ import * as ChromeServiceWorker from "effect-platform-chrome/ChromeServiceWorker
 const worker = ChromeServiceWorker.start({
   chrome,
   layer: ChromePermissions.layerLive,
-  selectMessage: () => false,
-  onMessage: () => Effect.void
+  listeners: [
+    ChromeServiceWorker.listen(chrome.permissions.onAdded, (added) => Effect.log("Permissions added", added)),
+    ChromeServiceWorker.listen(chrome.permissions.onRemoved, (removed) => Effect.log("Permissions revoked", removed))
+  ]
 })
-
-worker.register(chrome.permissions.onAdded, (added) => Effect.log("Permissions added", added))
-worker.register(chrome.permissions.onRemoved, (removed) => Effect.log("Permissions revoked", removed))
 ```
 
 Worker startup buffering follows `ChromeServiceWorker`'s bounded startup queue,
 not the streams' sliding buffer. Chrome can terminate workers without finalizers;
 these events and buffers are not durable history. Recheck `getAll`/`contains` before
 permission-dependent work, and handle revocation races in the relevant API call.
-No host-access request UI APIs are included.
+
+## Host access requests
+
+`addHostAccessRequest(request)` and `removeHostAccessRequest(request)` (Chrome 133+)
+are lazy Effects over Chrome's host access request UI. Adding a request asks Chrome
+to signal, in the toolbar and extensions menu, that the extension wants access to the
+site in a tab; the user accepting it grants persistent access to that site's top
+origin. Unlike `request`, no user gesture is needed and nothing is granted by the call.
+
+- Address the request with exactly one of `tabId` or `documentId` (a top-level
+  document), and optionally a URL `pattern` limiting where it shows. Chrome rejects both
+  or neither, so `AddHostAccessRequest` / `RemoveHostAccessRequest` (`HostAccessTarget`
+  plus `pattern`) are narrower than `chrome.permissions`' own types and reject them at
+  compile time. A new request for a tab replaces
+  the existing one; Chrome removes it when the tab navigates cross-origin.
+- `removeHostAccessRequest` withdraws a request for the same tab or document; a given
+  `pattern` must match the added one exactly.
+- Chrome only signals hosts the extension can be granted (declared in
+  `host_permissions` or `optional_host_permissions` and currently withheld). Its
+  rejections become `ChromePermissionsError` with the method name as `operation`.
+- Both members are optional in `ChromePermissionsApi` so injected APIs without them
+  still fit. When Chrome (before 133) or an injected API lacks one, calling it fails
+  with a typed `ChromePermissionsError` rather than throwing.
+
+Watch `onAdded` (or recheck `contains`) to learn when the user accepts.
+
+```ts
+import { Effect } from "effect"
+import * as ChromePermissions from "effect-platform-chrome/ChromePermissions"
+
+const askForSite = (tabId: number) => Effect.gen(function*() {
+  const permissions = yield* ChromePermissions.ChromePermissions
+  const granted = yield* permissions.contains({ origins: ["https://example.com/*"] })
+
+  if (!granted) yield* permissions.addHostAccessRequest({ tabId, pattern: "https://example.com/*" })
+})
+```
 
 ## Stress coverage
 
-Injected tests cover each event's newest-64 retention after 4096 synchronous
-startup events, then 16 rounds of 32 concurrent subscriptions with 4096-event
-bursts per round (512 subscriptions and 65536 emissions per event). Registration
-gates and joined interruptions verify cleanup without sleeps. Another test runs
-4096 observers of one immediate gesture outcome and verifies a single native call.
-No test prompts for real permissions.
+`test/stress/ChromePermissions.stress.test.ts` runs without real prompts:
+
+- a 4096-event burst on each event leaves exactly the newest 64, in order, and no listener;
+- 512 concurrent subscriptions per event, each stopped at a seeded stage (interrupted before
+  or after registration, interrupted mid-element, completed, or failed by a partial
+  registration), end with zero listeners and one removal per addition;
+- 1536 concurrent calls across `contains`, `request`, `requestFromUserGesture`, `remove` and
+  both host access request members, with seeded resolutions, rejections and synchronous throws
+  settled in shuffled order, each matched to its own typed error and `operation`;
+- 1024 concurrent `getAll` runs whose failures match the planned causes one to one;
+- 4096 observers of one gesture outcome share a single native request, and 1024 gesture
+  requests interrupted mid-wait still replay their late outcomes.
