@@ -1,8 +1,8 @@
-# WXT example: all seventeen Chrome integrations
+# WXT example: Chrome integrations and isolated module stress
 
 Vanilla TypeScript, WXT **0.21.4**, Effect **4.0.4**, Chrome Manifest V3.
-The popup is example UI, not a library UI abstraction. No Action, SidePanel,
-or other UI-focused library modules are introduced.
+The popup is example UI, not a library UI abstraction. The opt-in module runner also
+exercises Action, SidePanel, and the additional Chrome integrations.
 
 ## Build and load
 
@@ -14,6 +14,7 @@ npm install
 npm run build
 cd examples/wxt
 npm ci
+npm run lint
 npm run typecheck
 npm run build
 ```
@@ -47,7 +48,7 @@ bootstrap deliberately keeps the worker alive.
 | **ChromeSchemaStorage** | **Validated local entry** writes a schema-validated version-1 envelope. **Seed v0 / migrate to v1** deliberately replaces only the demo entry with a legacy envelope, validates/migrates it, and writes back version 1. **Subscribe** observes the initial value and updates; **Stop subscription** interrupts its fiber and removes the listener. Closing the popup also releases it. |
 | **ChromePermissions** | **Contains / getAll** reads permission state. **Request example.com access** alone requests optional host access; its click handler calls `requestFromUserGesture` synchronously using an already-resolved service, before any asynchronous Effect execution. No scripted revocation. |
 | **ChromeScripting** | First request example.com access, activate an example.com tab, then click **Read active example.com title via injection**. A self-contained function returns title/URL from only that active target. It does not modify the page or inject into arbitrary tabs. Chrome remains authoritative if a target navigates between query and injection. |
-| **ChromeTesting** | `development/fixtures.ts` exports `fixtureExample()` with fresh storage/event/port fixtures, a migration, scoped subscription cleanup, and manually flushed port delivery. It is typechecked but not imported by any browser entrypoint. Run it in a development test host with `Effect.runPromise(fixtureExample())`; expected `received:7`, `frames:1`, `listeners:0`, `pendingFrames:0`. |
+| **ChromeTesting** | `development/fixtures.ts` exports `fixtureExample()` with fresh storage/event/port fixtures, a migration, scoped subscription cleanup, and manually flushed port delivery. The isolated module runner invokes 100 fresh examples in the browser; these are fixture checks, not native Chrome tests. Expected `received:7`, `frames:1`, `listeners:0`, `pendingFrames:0`. |
 
 ### Bounded browser stress
 
@@ -122,6 +123,74 @@ stress runner too) and exits non-zero on a failed stage. That run serves example
 locally, and Playwright's `--disable-ipc-flooding-protection` lifts Chrome's history cap,
 so a real profile is still the reference for the history stages.
 
+### Isolated module runner in your existing Chrome
+
+Build and reload this unpacked example after changing the harness. The expanded
+manifest grants the test host access to bookmarks, history, downloads, tab groups,
+sessions, management, context menus, idle, side panels, tab capture, debugger,
+offscreen documents, DNR, web requests, and user scripts. Host access stays limited
+to the reserved cookie host and optional example.com access.
+
+The playground has one card for each of the 37 modules. Use **Find a module** to
+filter the cards, then **Run stress test** on a card. Its status and expandable
+**Last test result** show counts, skips, errors, and cleanup results. Modules with
+targeted regressions also have a **Probe edge cases** button. The automation hook
+is unchanged:
+
+```js
+window.effectChromeModules.names
+await window.effectChromeModules.run("ChromeBookmarks")
+```
+
+Each call runs one module. New harnesses create uniquely named test resources and
+release only resources they own. Management and Sessions use read-only probes.
+Downloads writes a tiny test file and removes its file and download record.
+Gesture-dependent capture/panel operations, native keyboard/omnibox input, and
+unavailable platform APIs are reported explicitly rather than simulated as live
+successes. `ChromeTesting` runs fresh in-browser fixtures, not native Chrome APIs.
+The `-edgecases` runners intentionally report failed invariants when they reproduce
+an adapter defect; they do not hide those outcomes as successful stress tests.
+
+The CLI reuses one named `agent-browser` connection and saves its endpoint and
+extension ID in gitignored `.browser-stress/connection.json`:
+
+```sh
+npm run stress:live -- --port 62939 --extension YOUR_EXTENSION_ID
+# Subsequent runs reuse the saved connection:
+npm run stress:live -- ChromeBookmarks ChromeHistory
+```
+
+Reports are saved in `.browser-stress/report-*.json`. The daemon stays connected
+for subsequent calls. Chrome controls its own approval prompts; saved endpoint
+configuration does not grant or bypass browser permissions. Run this serially,
+with the runner tab open, so another task cannot replace its page mid-run.
+
+### Side-panel playground
+
+Click **Open side panel** in the playground header to keep the same module cards
+beside your active tab. The popup, full-tab view, and `sidepanel.html` share their
+rendering and controllers, with separate runtimes and scoped listeners per view.
+The panel uses a single-column layout at narrow widths.
+
+The **ChromeSidePanel** card provides **Inspect options / layout** and **Close
+side panel**. Opening uses `openFromUserGesture` synchronously from the click
+handler, after the service and current window have been resolved. The manifest
+sets `side_panel.default_path` to `sidepanel.html`; the toolbar action continues
+to open the popup. **Open in a tab** opens a full-size playground.
+
+### Linting the example
+
+`npm run lint` in this directory checks entrypoints, shared code, development
+fixtures, scripts, and WXT configuration with zero tolerated warnings.
+`.oxlintrc.json` extends the root configuration, including the recommended Effect
+preset and both vendored anti-slop plugins. It does not weaken or duplicate those
+rules. Generated output and local browser reports are ignored. The root lint
+command retains its library/test scope, so run both commands when editing both.
+
+Reports have named contracts; native messages are schema-decoded at boundaries.
+Narrow suppressions document actual untyped browser/logging boundaries and the
+pinned Effect 4.0.4 RPC/persistence APIs.
+
 ### Popup ↔ background ↔ content
 
 - Popup → background: `ChromeRuntime.sendMessageSchema`, decoded by the
@@ -193,11 +262,16 @@ named alarm. Sync storage writes remain subject to Chrome's sync quotas.
 
 ## Verification / limitations
 
-`npm run typecheck` and `npm run build` were run successfully. The generated
-manifest contains MV3, its popup, its limited content-script match,
-`storage`, `alarms`, `tabs`, `scripting` permissions and the optional example.com
-host permission. No real-browser automation or
-manual browser run was performed. In particular, actual worker suspension,
+Root validation and WXT typecheck/build passed. The expanded example was exercised
+module-by-module in real Chrome 155; results and confirmed regression failures are
+recorded in `../../docs/STRESS_AUDIT_2026-10-24.md`. Actual worker suspension,
 alarm wake timing, browser-restart startup events, managed enterprise policy,
-and cross-device sync remain **unverified in a real browser**; the steps above
-are a manual checklist, not claimed test results.
+and cross-device sync remain unverified by that run.
+
+After enabling inherited lint rules and adding the shared card/side-panel UI,
+both lint commands passed with zero warnings and the root suite passed all 2,962
+tests. Live verification covered all 41 module/regression runners (the same three
+known regression groups failed; UserScripts correctly skipped with its toggle
+off), the original six-stage stress run, port connect/send/disconnect, card
+filtering/results, and real side-panel open/inspect/close/reopen. Both the tab view
+and the 360px-wide native panel rendered all 37 cards without horizontal overflow.

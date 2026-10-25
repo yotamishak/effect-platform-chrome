@@ -17,15 +17,18 @@ export default defineContentScript({
   main(ctx) {
     const params = new URL(location.href).searchParams
     const role = params.get(roleParam)
+
     if (role === null) return
 
     if (role === "top") {
       const children = Number(params.get("children") ?? "4")
+
       const frame = (query: string) => {
         const element = document.createElement("iframe")
         element.src = `https://example.com/?${roleParam}=${query}`
         document.body.append(element)
       }
+
       for (let index = 0; index < children; index++) frame(`child&index=${index}`)
       frame("other")
       frame("silent")
@@ -37,6 +40,7 @@ export default defineContentScript({
         for (let index = from; index < from + count; index++) {
           history.pushState(null, "", `?${roleParam}=${role}&push=${index}`)
         }
+
         return Number(new URL(location.href).searchParams.get("push") ?? "-1")
       }),
       Where: () => Effect.sync(() => ({ url: location.href, top: window.top === window }))
@@ -48,6 +52,7 @@ export default defineContentScript({
         if (port.name !== framePort) return
         void Effect.runPromise(ChromeRpc.serve(chrome.runtime, port, "owned", FrameRpc).pipe(Effect.provide(handlers)))
       }
+
     if (role !== "silent") {
       chrome.runtime.onConnect.addListener(listener)
       ctx.onInvalidated(() => chrome.runtime.onConnect.removeListener(listener))

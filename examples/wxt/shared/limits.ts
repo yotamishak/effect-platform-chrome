@@ -6,13 +6,21 @@ import * as RpcGroup from "effect/rpc/RpcGroup"
 // script serves FrameRpc in example.com frames opened with `roleParam`; the worker
 // serves WorkRpc twice, once wrapped in ChromeRpc.finishAccepted and once plain.
 export const framePort = "effect-wxt-limits/frame"
+
 export const roleParam = "effect-limits"
+
 export const targetOrigin = "https://example.com/"
+
 export const finishPort = "effect-wxt-limits/work-finish"
+
 export const plainPort = "effect-wxt-limits/work-plain"
+
 export const workPrefix = "effect-wxt-limits/work/"
+
 export const cookieHost = "limits.effect-platform-chrome.test"
 
+// Limits workloads intentionally exercise the RPC API pinned to Effect 4.0.4.
+/* oxlint-disable effecttsgo/unstable-api-usage */
 export const FrameRpc = RpcGroup.make(
   Rpc.make("Echo", { payload: { text: Schema.String }, success: Schema.String }),
   // Synchronous history.pushState calls. Answers the last push index Chrome applied: past its
@@ -25,3 +33,4 @@ export const FrameRpc = RpcGroup.make(
 export const WorkRpc = RpcGroup.make(
   Rpc.make("Work", { payload: { id: Schema.String, millis: Schema.Int }, success: Schema.String })
 )
+/* oxlint-enable effecttsgo/unstable-api-usage */

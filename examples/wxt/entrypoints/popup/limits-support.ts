@@ -1,4 +1,4 @@
-import { Cause, Effect, Layer, Option, type Scope } from "effect"
+import { Cause, Data, Effect, Layer, Option, type Scope } from "effect"
 import * as ChromeAlarms from "effect-platform-chrome/ChromeAlarms"
 import * as ChromeCookies from "effect-platform-chrome/ChromeCookies"
 import * as ChromeIdentity from "effect-platform-chrome/ChromeIdentity"
@@ -22,15 +22,17 @@ export interface LimitStage {
   readonly completed: number
   readonly expected: number
   readonly milliseconds: number
-  readonly details?: Readonly<Record<string, unknown>>
+  readonly details?: Readonly<Record<string, string | number | boolean | ReadonlyArray<string>>>
   readonly error?: string
 }
+
 export interface LimitsReport {
   readonly stages: ReadonlyArray<LimitStage>
   readonly failed: number
   readonly skipped: number
   readonly milliseconds: number
 }
+
 export interface LimitsOptions {
   /** Shows and clears real OS notifications; off by default. */
   readonly notifications?: boolean
@@ -42,7 +44,7 @@ export interface Outcome {
   readonly completed: number
   readonly ok: boolean
   readonly skipped?: string
-  readonly details?: Readonly<Record<string, unknown>>
+  readonly details?: LimitStage["details"]
 }
 
 /** The target tab the runner opens, by frame role. */
@@ -56,6 +58,7 @@ export interface Frames {
 }
 
 const storage = ChromeStorage.layerLive
+
 export const layer = Layer.mergeAll(
   ChromeAlarms.layerLive, ChromeCookies.layerLive, ChromeIdentity.layerLive,
   ChromeKeyValueStore.layerLive({ namespace: "wxt-limits" }), ChromeNotifications.layerLive,
@@ -64,21 +67,30 @@ export const layer = Layer.mergeAll(
   ChromeScripting.layerLive, storage, ChromeTabs.layerLive, ChromeWebNavigation.layerLive,
   ChromeWindows.layerLive
 )
+
 export type Services = Layer.Success<typeof layer>
 
-export type Stage = readonly [name: string, expected: number, effect: Effect.Effect<Outcome, unknown, Services | Scope.Scope>]
+// Negative probes flip successful RPC/auth responses into failures to report unexpected success.
+export type Stage = readonly [name: string, expected: number, effect: Effect.Effect<Outcome, Error | string | Option.Option<string>, Services | Scope.Scope>]
 
-export const errorText = (error: unknown) => Cause.pretty(Cause.fail(error))
+export const errorText = (error: Error) => Cause.pretty(Cause.fail(error))
+
 /** Chrome's own message: the adapters' typed errors keep it on their cause. */
-export const chromeMessage = (error: unknown): string =>
+export const chromeMessage = (error: Error): string =>
   error instanceof Error && error.cause instanceof Error ? error.cause.message : errorText(error).split("\n")[0] ?? ""
+
+class PollTimeout extends Data.TaggedError("PollTimeout") {
+  override readonly message = "Timed out waiting"
+}
 
 export const poll = <A, E, R>(effect: Effect.Effect<Option.Option<A>, E, R>, attempts: number) =>
   Effect.gen(function*() {
     for (let attempt = 0; attempt < attempts; attempt++) {
       const found = yield* effect
+
       if (Option.isSome(found)) return found.value
       yield* Effect.sleep("50 millis")
     }
-    return yield* Effect.fail(new Error("Timed out waiting"))
+
+    return yield* new PollTimeout()
   })

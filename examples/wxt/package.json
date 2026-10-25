@@ -4,11 +4,13 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "lint": "oxlint entrypoints shared development scripts wxt.config.ts --max-warnings=0",
     "dev": "wxt -b chrome",
     "build": "wxt build -b chrome",
     "typecheck": "wxt prepare && tsc --noEmit",
     "postinstall": "wxt prepare",
-    "limits": "node scripts/run-limits.mjs"
+    "limits": "node scripts/run-limits.mjs",
+    "stress:live": "node scripts/run-live-modules.mjs"
   },
   "dependencies": {
     "effect": "4.0.4",

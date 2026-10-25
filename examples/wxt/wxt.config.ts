@@ -10,7 +10,15 @@ export default defineConfig({
   manifest: {
     name: "Effect Chrome: all integrations",
     description: "Vanilla WXT demo of Effect Chrome services and MV3 lifecycle handling",
-    permissions: ["storage", "alarms", "tabs", "scripting", "identity", "webNavigation", "cookies", "notifications", "activeTab"],
+    // This example is also the opt-in live integration stress host.
+    permissions: [
+      "storage", "alarms", "tabs", "scripting", "identity", "webNavigation", "cookies", "notifications", "activeTab",
+      "bookmarks", "history", "downloads", "tabGroups", "sessions", "management", "contextMenus", "idle",
+      "sidePanel", "tabCapture", "debugger", "offscreen", "declarativeNetRequest", "webRequest", "userScripts"
+    ],
+    omnibox: { keyword: "effect-stress" },
+    side_panel: { default_path: "sidepanel.html" },
+    commands: { "stress-command": { description: "Effect Chrome stress command" } },
     // The limits runner sets and evicts cookies only on this reserved test host.
     host_permissions: ["https://limits.effect-platform-chrome.test/*"],
     optional_host_permissions: ["https://example.com/*"],

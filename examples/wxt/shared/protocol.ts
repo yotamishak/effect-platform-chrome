@@ -2,10 +2,15 @@ import { Schema } from "effect"
 import * as ChromeMessage from "effect-platform-chrome/ChromeMessage"
 
 export const channel = "effect-wxt-demo"
+
 export const alarmName = "effect-wxt-demo/wakeup"
+
 export const storageKey = "effect-wxt-demo/value"
+
 export const workerKey = "effect-wxt-demo/worker"
+
 export const alarmKey = "effect-wxt-demo/last-alarm"
+
 export const lifecycleKey = "effect-wxt-demo/lifecycle"
 
 export const Request = Schema.Struct({
