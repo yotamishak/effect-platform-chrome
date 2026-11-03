@@ -13,7 +13,7 @@ New and changed Chrome modules follow `docs/CONVENTIONS.md`.
 Before changing Effect patterns, run `npm run effect-solutions -- list` and
 `npm run effect-solutions -- show basics services-and-layers error-handling testing`.
 Guides are prescriptive context, but some setup instructions target older tools.
-The installed **Effect 4.0.4** source is available at `node_modules/effect/src/`
+The installed **Effect 4.1.2** source is available at `node_modules/effect/src/`
 after `npm ci`; inspect its signatures and implementation rather than guessing
 v3 APIs. In particular, see `Effect.ts`, `Context.ts`, `Layer.ts`, `Stream.ts`,
 `Schema.ts`, and `persistence/KeyValueStore.ts`. The current upstream v4 repository
@@ -24,9 +24,9 @@ No separate reference checkout is required or claimed to exist.
 
 Run `npm run lint`, `npm run typecheck`, `npm run build`, and `npm test`.
 Lint enforces zero warnings as well as zero errors.
-Tests use exact `@effect/vitest@4.0.4`, `vitest@5.0.4`, and `effect@4.0.4` with
+Tests use exact `@effect/vitest@4.1.2`, `vitest@5.0.4`, and `effect@4.1.2` with
 explicit Chrome mocks; do not silently allow missing tests. The integration peers
-require Effect `^4.0.4` and Vitest `>=5 <6`; do not follow stale beta install advice.
+require Effect `^4.1.2` and Vitest `>=5 <6`; do not follow stale beta install advice.
 Return Effects directly from `it.effect`, using `Effect.gen` and `yield*` rather
 than `runPromise` wrappers. Test scope and TestClock are automatic. Use
 `forkScoped` / `forkChild` for owned fibers and join or interrupt before assertions;

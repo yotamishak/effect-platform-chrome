@@ -620,7 +620,7 @@ describe("ChromeWebNavigation stress", () => {
     const exits = [yield* Fiber.join(first), yield* Fiber.join(second)]
     const defects = exits.filter((exit) => Exit.hasDies(exit))
     expect(defects).toHaveLength(1)
-    expect(Exit.findDefect(defects[0] ?? Exit.void)).toEqual(expect.objectContaining({ success: cause }))
+    expect(defects.map((exit) => Exit.findDefect(exit))).toEqual([expect.objectContaining({ success: cause })])
     expect(exits.filter(Exit.isSuccess)).toHaveLength(1)
     // The listener whose removal threw stays registered, as it would in Chrome.
     expect(mock.events.onTabReplaced.count).toBe(1)
