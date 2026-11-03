@@ -81,6 +81,26 @@ const rejected = (part: "namespace" | "key" | "value") => ({
 })
 
 describe("ChromeKeyValueStore", () => {
+  it.effect("lists logical keys and clears only the selected prefix in its namespace", () => Effect.gen(function*() {
+    for (const area of [storageArea(), keyedArea()]) {
+      const store = ChromeKeyValueStore.make(area, { namespace: "app" })
+      const other = ChromeKeyValueStore.make(area, { namespace: "other" })
+      yield* store.set("session:a", "one")
+      yield* store.set("session:b", "two")
+      yield* store.set("settings", "keep")
+      yield* other.set("session:a", "other")
+      area.data.unrelated = "untouched"
+      expect([...(yield* store.keys)].sort()).toEqual(["session:a", "session:b", "settings"])
+      const sessions = KeyValueStore.prefix(store, "session:")
+      expect([...(yield* sessions.keys)].sort()).toEqual(["a", "b"])
+      yield* sessions.clear
+      expect(yield* store.keys).toEqual(["settings"])
+      expect(yield* store.get("settings")).toBe("keep")
+      expect(yield* other.get("session:a")).toBe("other")
+      expect(area.data.unrelated).toBe("untouched")
+    }
+  }))
+
   it.effect("round trips strings and binary with Effect-compatible cross-type reads", () => Effect.gen(function*() {
     const area = storageArea()
     const store = ChromeKeyValueStore.make(area)

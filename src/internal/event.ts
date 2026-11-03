@@ -29,7 +29,16 @@ export const observeSome = <Args extends ReadonlyArray<unknown>, A, E>(
   }
 
   return Effect.gen(function*() {
-    const source = yield* Effect.try({ try: getSource, catch: onError })
+    const source = yield* Effect.try({
+      try: () => {
+        const source = getSource()
+
+        if (source == null) throw new TypeError("Chrome event is unavailable")
+
+        return source
+      },
+      catch: onError
+    })
 
     // Install cleanup before registration, which may partially succeed then throw.
     yield* Effect.acquireRelease(

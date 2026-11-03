@@ -136,6 +136,7 @@ export const make = (api: ChromeKeyValueStoreApi, options: Options = {}): KeyVal
   }
 
   return KeyValueStore.make({
+    keys: Effect.map(namespacedKeys("keys"), (keys) => keys.map((key) => key.slice(prefix.length))),
     get: (key) => Effect.map(read("get", key), (entry) =>
       entry === undefined ? undefined : entry.type === "string" ? entry.value : Base64.encode(entry.value)),
     getUint8Array: (key) => Effect.map(read("getUint8Array", key), (entry) =>

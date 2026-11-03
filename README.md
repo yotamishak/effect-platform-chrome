@@ -24,13 +24,13 @@ npm pack --dry-run
 
 The build produces ESM JavaScript, TypeScript declarations, and source/declaration
 maps in `dist/`; packaged `src/` files provide the corresponding map sources.
-Consumers must provide `effect` compatible with `^4.0.4`; development uses
-`effect@4.0.4`. The library itself does not depend on Node.js at runtime. Bundle
+Consumers must provide `effect` compatible with `^4.1.2`; development uses
+`effect@4.1.2`. The library itself does not depend on Node.js at runtime. Bundle
 integrations into the appropriate extension contexts with an ESM-capable
 bundler; select Manifest V3 permissions according to the APIs used.
 
-Behavior tests in `test/**/*.test.ts` use exact `@effect/vitest@4.0.4` with
-`vitest@5.0.4` and `effect@4.0.4`. The integration's peers are Effect `^4.0.4`
+Behavior tests in `test/**/*.test.ts` use exact `@effect/vitest@4.1.2` with
+`vitest@5.0.4` and `effect@4.1.2`. The integration's peers are Effect `^4.1.2`
 and Vitest `>=5.0.0 <6.0.0`; use this stable release, not the older guide's beta.
 The Node test environment uses explicit Chrome API mocks, not fabricated browser
 globals. Return Effects directly from `it.effect` and compose with `Effect.gen`:

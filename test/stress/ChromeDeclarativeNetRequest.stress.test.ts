@@ -476,6 +476,8 @@ describe("ChromeDeclarativeNetRequest stress", () => {
     const rejected: Array<unknown> = []
     /** The operations whose replacement Chrome has but has not applied yet. */
     const inFlight = new Set<number>()
+    // Force accepted-write interruption independently of Effect's microtask scheduling.
+    const acceptedWrites = range(0, 8).map(() => ({ accepted: gate(), release: gate() }))
     const operationOf = (options: UpdateRuleOptions) => Number(options.addRules?.[0]?.condition.urlFilter?.slice(3) ?? Number.NaN)
     // Chrome applies updates one at a time in call order, each a few hops after the last,
     // but serves reads immediately from the current set.
@@ -486,7 +488,10 @@ describe("ChromeDeclarativeNetRequest stress", () => {
       const operation = operationOf(options)
       inFlight.add(operation)
 
-      const result = tail.then(() => hops(delay)).then(() => apply(options)).finally(() => inFlight.delete(operation)).then(
+      const held = acceptedWrites[operation]
+      held?.accepted.open()
+
+      const result = tail.then(() => held?.release.opened ?? hops(delay)).then(() => apply(options)).finally(() => inFlight.delete(operation)).then(
         () => { applied.push({ scope, options: structuredClone(options) }) },
         (cause: unknown) => {
           rejected.push(cause)
@@ -518,10 +523,16 @@ describe("ChromeDeclarativeNetRequest stress", () => {
         removeDynamic: rules.updateDynamicRules({ removeRuleIds: [1] })
       }
 
-      const kind = pick(random, ["replaceDynamic", "replaceSession", "removeDynamic"] as const)
-      fibers.push(yield* Effect.forkScoped(operations[kind], { startImmediately: true }))
+      const held = acceptedWrites[index]
+      const kind = held === undefined ? pick(random, ["replaceDynamic", "replaceSession", "removeDynamic"] as const) : "replaceDynamic"
+      const fiber = yield* Effect.forkScoped(operations[kind], { startImmediately: true })
+      fibers.push(fiber)
 
-      if (random() < 0.4) {
+      if (held !== undefined) {
+        yield* Effect.promise(() => held.accepted.opened)
+        interrupters.push(yield* Effect.forkScoped(Fiber.interrupt(fiber), { startImmediately: true }))
+        held.release.open()
+      } else if (random() < 0.4) {
         // Half the time, a writer whose update Chrome already holds.
         const writer = inFlight.size > 0 && random() < 0.5 ? fibers[pick(random, Array.from(inFlight))] : undefined
         const target = writer ?? pick(random, fibers)
